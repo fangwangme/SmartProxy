@@ -127,3 +127,11 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+
+data
+
+proxies.txt
+proxy_stats.json
+
+.DS_Store
