@@ -9,6 +9,7 @@ import signal
 import sys
 import os
 from typing import List, Dict, Optional
+from logger import logger
 
 # --- 配置 ---
 PROXY_FILE_PATH = "proxies.txt"
@@ -187,6 +188,9 @@ class ProxyManager:
         proxy_url = feedback_data.get("proxy")
         status = feedback_data.get("status")
         response_time_ms = feedback_data.get("time")
+        logger.info(
+            f"Handled the feedback: source={source}, status={status}, time={response_time_ms}, proxy={proxy_url}"
+        )
 
         if not all([source, proxy_url, status]):
             return False
