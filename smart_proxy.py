@@ -186,10 +186,21 @@ class ProxyManager:
                         if non_cooled_down_proxies
                         else available_proxies
                     )
+
+                    # --- OPTIMIZATION: Instead of picking the best, pick randomly from the best ---
+                    # Sort by performance to identify the best proxies
                     selection_pool.sort(
                         key=lambda p: source_stats[p["url"]]["avg_response_time_ms"]
                     )
-                    chosen_proxy = selection_pool[0]
+
+                    # Create a smaller pool of top performers to choose from
+                    # e.g., top 5 or top 20% of the pool, whichever is smaller
+                    top_n = min(5, len(selection_pool) // 5 + 1)
+                    top_performers_pool = selection_pool[:top_n]
+
+                    # Randomly choose from this high-quality pool
+                    chosen_proxy = random.choice(top_performers_pool)
+                    # --- END OPTIMIZATION ---
 
             # 2. If no proxies are available (all are banned), enter 'revival' mode
             else:
