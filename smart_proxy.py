@@ -230,7 +230,7 @@ class ProxyManager:
         source = feedback_data.get("source")
         proxy_url = feedback_data.get("proxy")
         status = feedback_data.get("status")
-        response_time_ms = feedback_data.get("response_time_ms")
+        response_time_ms = feedback_data.get("time")
 
         logger.info(
             f"Feedback: proxy-[{proxy_url}], status-[{status}], source-[{source}], speed-[{response_time_ms}]"
