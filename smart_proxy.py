@@ -1,5 +1,4 @@
 # smart_proxy_server.py
-import flask
 from flask import Flask, request, jsonify
 import json
 import random
@@ -121,7 +120,10 @@ class ProxyManager:
             print(f"性能统计数据已成功保存到 '{self.stats_file}'。")
 
     def get_proxy_for_source(self, source: str) -> Optional[str]:
-        """为指定的来源获取一个最佳代理。"""
+        """
+        为指定的来源获取一个最佳代理。
+        如果所有代理都被封禁，则会尝试复活一个曾经成功过的代理。
+        """
         if not self.proxies:
             return None
 
@@ -131,9 +133,9 @@ class ProxyManager:
 
             source_stats = self.stats[source]
 
-            available_proxies = []
-            for proxy in self.proxies:
-                proxy_url = proxy["url"]
+            # 确保所有代理都在统计数据中
+            all_proxy_urls = {p["url"] for p in self.proxies}
+            for proxy_url in all_proxy_urls:
                 if proxy_url not in source_stats:
                     source_stats[proxy_url] = {
                         "success_count": 0,
@@ -144,59 +146,97 @@ class ProxyManager:
                         "last_used": 0,
                     }
 
-                if not source_stats[proxy_url]["is_banned"]:
-                    available_proxies.append(proxy)
-
-            if not available_proxies:
-                return None
+            # 1. 尝试从可用的（未被封禁的）代理中选择
+            available_proxies = [
+                p for p in self.proxies if not source_stats[p["url"]]["is_banned"]
+            ]
 
             now = time.time()
+            chosen_proxy = None
 
-            untried_proxies = [
-                p
-                for p in available_proxies
-                if source_stats[p["url"]]["success_count"] == 0
-                and source_stats[p["url"]]["failure_count"] == 0
-            ]
-            if untried_proxies:
-                chosen_proxy = random.choice(untried_proxies)
+            if available_proxies:
+                # 优先选择从未被使用过的代理
+                untried_proxies = [
+                    p
+                    for p in available_proxies
+                    if source_stats[p["url"]]["success_count"] == 0
+                    and source_stats[p["url"]]["failure_count"] == 0
+                ]
+                if untried_proxies:
+                    chosen_proxy = random.choice(untried_proxies)
+                else:
+                    # 从已尝试过的代理中选择，优先考虑不在冷却期的
+                    non_cooled_down_proxies = [
+                        p
+                        for p in available_proxies
+                        if (now - source_stats[p["url"]]["last_used"])
+                        > COOL_DOWN_SECONDS
+                    ]
+
+                    selection_pool = (
+                        non_cooled_down_proxies
+                        if non_cooled_down_proxies
+                        else available_proxies
+                    )
+                    selection_pool.sort(
+                        key=lambda p: source_stats[p["url"]]["avg_response_time_ms"]
+                    )
+                    chosen_proxy = selection_pool[0]
+
+            # 2. 如果没有可用的代理（所有代理都被封禁），则进入“复活”模式
+            else:
+                print(f"警告：来源 '{source}' 的所有代理均被封禁。尝试复活一个...")
+                # 找到所有被封禁但曾经成功过的代理
+                banned_but_successful_proxies = [
+                    p
+                    for p in self.proxies
+                    if source_stats[p["url"]]["is_banned"]
+                    and source_stats[p["url"]]["success_count"] > 0
+                ]
+
+                if banned_but_successful_proxies:
+                    # 从中有过成功历史的代理中随机选择一个来复活
+                    proxy_to_revive = random.choice(banned_but_successful_proxies)
+                    print(f"信息：为来源 '{source}' 复活代理: {proxy_to_revive['url']}")
+
+                    # 解除封禁并重置连续失败次数
+                    source_stats[proxy_to_revive["url"]]["is_banned"] = False
+                    source_stats[proxy_to_revive["url"]]["consecutive_failures"] = 0
+                    chosen_proxy = proxy_to_revive
+                else:
+                    # 如果没有曾经成功过的代理，则随机复活一个（最后的手段）
+                    if self.proxies:
+                        proxy_to_revive = random.choice(self.proxies)
+                        print(
+                            f"警告：没有成功历史的代理可复活。随机为来源 '{source}' 复活一个: {proxy_to_revive['url']}"
+                        )
+                        source_stats[proxy_to_revive["url"]]["is_banned"] = False
+                        source_stats[proxy_to_revive["url"]]["consecutive_failures"] = 0
+                        chosen_proxy = proxy_to_revive
+
+            if chosen_proxy:
                 source_stats[chosen_proxy["url"]]["last_used"] = now
                 return chosen_proxy["url"]
 
-            non_cooled_down_proxies = [
-                p
-                for p in available_proxies
-                if (now - source_stats[p["url"]]["last_used"]) > COOL_DOWN_SECONDS
-            ]
-
-            selection_pool = (
-                non_cooled_down_proxies
-                if non_cooled_down_proxies
-                else available_proxies
-            )
-            selection_pool.sort(
-                key=lambda p: source_stats[p["url"]]["avg_response_time_ms"]
-            )
-
-            chosen_proxy = selection_pool[0]
-            source_stats[chosen_proxy["url"]]["last_used"] = now
-            return chosen_proxy["url"]
+            return None  # 最终如果没有代理可选，返回 None
 
     def process_feedback(self, feedback_data: Dict):
         """处理来自客户端的代理使用反馈。"""
         source = feedback_data.get("source")
         proxy_url = feedback_data.get("proxy")
         status = feedback_data.get("status")
-        response_time_ms = feedback_data.get("time")
-        logger.info(
-            f"Handled the feedback: source={source}, status={status}, time={response_time_ms}, proxy={proxy_url}"
-        )
+        response_time_ms = feedback_data.get("response_time_ms")  # Corrected key
+        # logger.info(
+        #     f"Handled the feedback: source={source}, status={status}, time={response_time_ms}, proxy={proxy_url}"
+        # )
 
         if not all([source, proxy_url, status]):
             return False
 
         with self.lock:
             if source not in self.stats or proxy_url not in self.stats[source]:
+                # This can happen if a proxy was removed from the file but stats still exist.
+                # It's safe to just ignore this feedback.
                 return False
 
             stat = self.stats[source][proxy_url]
@@ -205,6 +245,13 @@ class ProxyManager:
                 stat["success_count"] += 1
                 stat["consecutive_failures"] = 0
                 stat["is_banned"] = False
+
+                # Ensure response_time_ms is a valid number for success feedback
+                if not isinstance(response_time_ms, (int, float)):
+                    print(
+                        f"警告：来源 '{source}' 的成功反馈缺少有效的 'response_time_ms'。"
+                    )
+                    return False
 
                 current_total_time = (
                     stat["avg_response_time_ms"]
@@ -238,6 +285,7 @@ def get_proxy():
     proxy_url = proxy_manager.get_proxy_for_source(source)
 
     if proxy_url:
+        # The request library expects a dictionary with schemes as keys
         return jsonify(
             {
                 "http": proxy_url,
@@ -267,11 +315,23 @@ def feedback():
         return jsonify({"error": "Invalid feedback data provided."}), 400
 
 
-@app.route("/loadproxies", methods=["GET"])
+@app.route(
+    "/load-proxies", methods=["POST"]
+)  # Changed to POST as it modifies server state
 def load_proxies_endpoint():
     """触发重新加载代理文件的端点。"""
     result = proxy_manager.load_proxies(is_reload=True)
     return jsonify(result)
+
+
+@app.route("/export-stats", methods=["GET"])
+def export_stats_endpoint():
+    """手动触发保存 proxy_stats.json 文件的端点。"""
+    try:
+        proxy_manager.save_stats()
+        return jsonify({"message": f"Stats successfully saved to {STATS_FILE_PATH}"})
+    except Exception as e:
+        return jsonify({"error": f"Failed to save stats: {e}"}), 500
 
 
 def handle_shutdown(signal, frame):
