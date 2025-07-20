@@ -14,10 +14,10 @@ from logger import logger
 PROXY_FILE_PATH = "data/proxies.txt"
 STATS_FILE_PATH = "data/proxy_stats.json"
 CONSECUTIVE_FAILURE_THRESHOLD = (
-    10  # Number of consecutive failures before a proxy is banned
+    8  # Number of consecutive failures before a proxy is banned
 )
 COOL_DOWN_SECONDS = 30  # Cooldown in seconds after a proxy is used (not currently used in logic, but kept for future)
-MIN_POOL_SIZE = 300  # Minimum number of proxies in the available pool for a source
+MIN_POOL_SIZE = 200  # Minimum number of proxies in the available pool for a source
 # --- [NEW] Default sources to be initialized on startup ---
 DEFAULT_SOURCES = ["insolvencydirect", "test"]
 
@@ -129,6 +129,8 @@ class ProxyManager:
                         }
 
                     elif len(parts) == 5:  # protocol:host:port:user:pass
+                        continue
+
                         protocol, host, port_str, user, password = (
                             parts[0].lower(),
                             parts[1],
