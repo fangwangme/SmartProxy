@@ -7,19 +7,21 @@ import time
 import signal
 import sys
 import os
-from typing import List, Dict, Optional
+import pickle
+import configparser
+from typing import List, Dict, Optional, Set
 from logger import logger
 
 # --- Configuration ---
-PROXY_FILE_PATH = "data/proxies.txt"
-STATS_FILE_PATH = "data/proxy_stats.json"
+DATA_DIR = "data"
+CONFIG_FILE_PATH = os.path.join(DATA_DIR, "config.ini")
+PROXY_FILE_PATH = os.path.join(DATA_DIR, "proxies.txt")
+PICKLE_FILE_PATH = os.path.join(DATA_DIR, "proxy_manager.pkl")
+
 CONSECUTIVE_FAILURE_THRESHOLD = (
-    8  # Number of consecutive failures before a proxy is banned
+    10  # Number of consecutive failures before a proxy is banned
 )
-COOL_DOWN_SECONDS = 30  # Cooldown in seconds after a proxy is used (not currently used in logic, but kept for future)
 MIN_POOL_SIZE = 200  # Minimum number of proxies in the available pool for a source
-# --- [NEW] Default sources to be initialized on startup ---
-DEFAULT_SOURCES = ["insolvencydirect", "test"]
 
 
 # --- Core Logic: Proxy Manager ---
@@ -29,66 +31,102 @@ class ProxyManager:
     This class is thread-safe.
     """
 
-    def __init__(self, proxy_file: str, stats_file: str):
-        self.proxy_file = proxy_file
-        self.stats_file = stats_file
+    def __init__(self):
         self.proxies: List[Dict] = []
         self.stats: Dict[str, Dict] = {}
-        # A dictionary to hold the list of available proxy URLs for each source
         self.available_pools: Dict[str, List[str]] = {}
+        self.sources: Set[str] = set()
         self.lock = threading.Lock()
-        self.load_proxies()
-        self._load_stats()
-        # --- [MODIFIED] Ensure default sources are initialized ---
-        self._ensure_default_sources()
-        # Initialize available pools based on loaded stats
-        self._initialize_pools()
+        logger.info("ProxyManager initialized an empty instance.")
 
-    def _ensure_default_sources(self):
-        """
-        Ensures that the default sources are present in the stats.
-        """
+    def load_sources_from_config(self, config_path: str):
+        """Loads sources from the configuration file."""
         with self.lock:
-            for source in DEFAULT_SOURCES:
-                if source not in self.stats:
-                    self.stats[source] = {}
-                    logger.info(f"Initialized new default source '{source}' in stats.")
-                    # Initialize stats for all existing proxies for this new default source
-                    for p in self.proxies:
-                        if p["url"] not in self.stats[source]:
-                            self.stats[source][p["url"]] = {
-                                "success_count": 0,
-                                "failure_count": 0,
-                                "consecutive_failures": 0,
-                                "avg_response_time_ms": float("inf"),
-                                "is_banned": False,
-                                "last_used": 0,
-                            }
+            config = configparser.ConfigParser()
+            if os.path.exists(config_path):
+                config.read(config_path)
+                sources_str = config.get(
+                    "sources", "default_sources", fallback="insolvencydirect,test"
+                )
+                self.sources = {s.strip() for s in sources_str.split(",") if s.strip()}
+                logger.info(f"Loaded sources from config: {self.sources}")
+            else:
+                self.sources = {"insolvencydirect", "test"}
+                logger.warning(
+                    f"Config file not found. Using default sources: {self.sources}"
+                )
+            self._ensure_sources_initialized()
 
-    def load_proxies(self, is_reload: bool = False) -> Dict:
-        """
-        Loads and deduplicates the proxy list from a file with enhanced validation.
-        """
-        if not os.path.exists(self.proxy_file):
-            message = f"Warning: Proxy file '{self.proxy_file}' does not exist."
-            logger.info(message)
-            return {
-                "message": message,
-                "added": 0,
-                "skipped_duplicates": 0,
-                "skipped_malformed": 0,
-                "total": len(self.proxies),
+    def save_sources_to_config(self, config_path: str):
+        """Saves the current set of sources to the configuration file."""
+        with self.lock:
+            config = configparser.ConfigParser()
+            config["sources"] = {
+                "default_sources": ",".join(sorted(list(self.sources)))
             }
+            os.makedirs(os.path.dirname(config_path), exist_ok=True)
+            with open(config_path, "w", encoding="utf-8") as configfile:
+                config.write(configfile)
+            logger.info(f"Saved sources to config: {self.sources}")
+
+    def add_source(self, source: str, config_path: str):
+        """Adds a new source to the manager and persists it."""
+        with self.lock:
+            if source in self.sources:
+                logger.info(f"Source '{source}' already exists.")
+                return False
+
+            logger.info(f"Adding new source: {source}")
+            self.sources.add(source)
+            self._ensure_sources_initialized()
+            self.save_sources_to_config(config_path)
+            return True
+
+    def _ensure_sources_initialized(self):
+        """Ensures all current sources are initialized in stats and pools."""
+        for source in self.sources:
+            if source not in self.stats:
+                self.stats[source] = {}
+                self.available_pools[source] = []
+                # Initialize stats for all existing proxies
+                for p in self.proxies:
+                    proxy_url = p["url"]
+                    if proxy_url not in self.stats[source]:
+                        self.stats[source][proxy_url] = self._get_new_proxy_stat()
+                    if not self.stats[source][proxy_url].get("is_banned", False):
+                        if proxy_url not in self.available_pools[source]:
+                            self.available_pools[source].append(proxy_url)
+
+    @staticmethod
+    def _get_new_proxy_stat() -> Dict:
+        """Returns a dictionary for a new proxy's statistics."""
+        return {
+            "success_count": 0,
+            "failure_count": 0,
+            "consecutive_failures": 0,
+            "avg_response_time_ms": float("inf"),
+            "is_banned": False,
+            "last_used": 0,
+        }
+
+    def load_proxies_from_file(self, proxy_file: str) -> Dict:
+        """
+        Loads proxies from a text file and merges them with the existing state.
+        """
+        if not os.path.exists(proxy_file):
+            message = f"Warning: Proxy file '{proxy_file}' does not exist."
+            logger.info(message)
+            return {"message": message, "added": 0, "total": len(self.proxies)}
 
         unique_proxy_lines = set()
         try:
-            with open(self.proxy_file, "r", encoding="utf-8") as f:
+            with open(proxy_file, "r", encoding="utf-8") as f:
                 for line in f:
                     stripped_line = line.strip()
                     if stripped_line and not stripped_line.startswith("#"):
                         unique_proxy_lines.add(stripped_line)
         except Exception as e:
-            logger.error(f"Failed to read proxy file {self.proxy_file}: {e}")
+            logger.error(f"Failed to read proxy file {proxy_file}: {e}")
             return {"message": f"Error reading proxy file: {e}"}
 
         added_count = 0
@@ -99,6 +137,8 @@ class ProxyManager:
             existing_proxy_urls = {p["url"] for p in self.proxies}
 
             for line in unique_proxy_lines:
+                if not line:
+                    continue
                 try:
                     parts = line.split(":")
                     proxy_info = {}
@@ -106,19 +146,16 @@ class ProxyManager:
 
                     if len(parts) == 3:  # protocol:host:port
                         protocol, host, port_str = parts[0].lower(), parts[1], parts[2]
-
-                        if protocol not in ["http", "https", "socks4", "socks5"]:
+                        if (
+                            protocol not in ["http", "https", "socks4", "socks5"]
+                            or not host
+                        ):
                             skipped_malformed_count += 1
                             continue
-                        if not host:
-                            skipped_malformed_count += 1
-                            continue
-
                         port = int(port_str)
                         if not (1 <= port <= 65535):
                             skipped_malformed_count += 1
                             continue
-
                         url = f"{protocol}://{host}:{port}"
                         proxy_info = {
                             "protocol": protocol,
@@ -127,10 +164,7 @@ class ProxyManager:
                             "auth": None,
                             "url": url,
                         }
-
                     elif len(parts) == 5:  # protocol:host:port:user:pass
-                        continue
-
                         protocol, host, port_str, user, password = (
                             parts[0].lower(),
                             parts[1],
@@ -138,19 +172,16 @@ class ProxyManager:
                             parts[3],
                             parts[4],
                         )
-
-                        if protocol not in ["http", "https", "socks4", "socks5"]:
+                        if (
+                            protocol not in ["http", "https", "socks4", "socks5"]
+                            or not host
+                        ):
                             skipped_malformed_count += 1
                             continue
-                        if not host:
-                            skipped_malformed_count += 1
-                            continue
-
                         port = int(port_str)
                         if not (1 <= port <= 65535):
                             skipped_malformed_count += 1
                             continue
-
                         url = f"{protocol}://{user}:{password}@{host}:{port}"
                         proxy_info = {
                             "protocol": protocol,
@@ -166,28 +197,9 @@ class ProxyManager:
                     if url not in existing_proxy_urls:
                         self.proxies.append(proxy_info)
                         existing_proxy_urls.add(url)
-
-                        # --- [MODIFIED] Initialize stats for the new proxy across all known sources ---
-                        for source in self.stats:
-                            if url not in self.stats[source]:
-                                self.stats[source][url] = {
-                                    "success_count": 0,
-                                    "failure_count": 0,
-                                    "consecutive_failures": 0,
-                                    "avg_response_time_ms": float("inf"),
-                                    "is_banned": False,
-                                    "last_used": 0,
-                                }
-                            # Add to available pool if not banned
-                            if not self.stats[source][url].get("is_banned", False):
-                                if (
-                                    source in self.available_pools
-                                    and url not in self.available_pools[source]
-                                ):
-                                    self.available_pools[source].append(url)
-                                elif source not in self.available_pools:
-                                    self.available_pools[source] = [url]
-
+                        for source in self.sources:
+                            self.stats[source][url] = self._get_new_proxy_stat()
+                            self.available_pools[source].append(url)
                         added_count += 1
                     else:
                         skipped_duplicates_count += 1
@@ -195,125 +207,54 @@ class ProxyManager:
                     skipped_malformed_count += 1
                     continue
 
-        load_type = "reload" if is_reload else "load"
         message = (
-            f"Proxy {load_type} finished. Added: {added_count}, "
+            f"Proxy loading finished. Added: {added_count}, "
             f"Skipped (duplicates): {skipped_duplicates_count}, "
             f"Skipped (malformed): {skipped_malformed_count}, Total: {len(self.proxies)}"
         )
         logger.info(message)
-        return {
-            "message": message,
-            "added": added_count,
-            "skipped_duplicates": skipped_duplicates_count,
-            "skipped_malformed": skipped_malformed_count,
-            "total": len(self.proxies),
-        }
+        return {"message": message, "added": added_count, "total": len(self.proxies)}
 
-    def _load_stats(self):
-        """
-        Loads historical performance statistics from the JSON file.
-        """
-        if os.path.exists(self.stats_file):
-            with self.lock:
-                try:
-                    with open(self.stats_file, "r", encoding="utf-8") as f:
-                        self.stats = json.load(f)
-                    logger.info(
-                        f"Successfully loaded performance stats from '{self.stats_file}'."
-                    )
-                except json.JSONDecodeError:
-                    logger.error(
-                        f"Error decoding JSON from {self.stats_file}. Starting with empty stats."
-                    )
-                    self.stats = {}
-                except Exception as e:
-                    logger.error(f"Failed to load stats file {self.stats_file}: {e}")
-                    self.stats = {}
-
-    def _initialize_pools(self):
-        """
-        Initializes the available proxy pools based on loaded stats.
-        """
+    def save_state_to_pickle(self, pickle_path: str):
+        """Saves the entire ProxyManager object state to a pickle file."""
         with self.lock:
-            all_proxy_urls = {p["url"] for p in self.proxies}
-            for source, source_stats in self.stats.items():
-                self.available_pools[source] = [
-                    url
-                    for url in all_proxy_urls
-                    if url in source_stats
-                    and not source_stats.get(url, {}).get("is_banned", False)
-                ]
-            logger.info("Initialized available proxy pools for all sources.")
-
-    def save_stats(self):
-        """
-        Saves the current performance statistics to the JSON file.
-        """
-        with self.lock:
-            stats_dir = os.path.dirname(self.stats_file)
-            if stats_dir:
-                os.makedirs(stats_dir, exist_ok=True)
+            os.makedirs(os.path.dirname(pickle_path), exist_ok=True)
             try:
-                with open(self.stats_file, "w", encoding="utf-8") as f:
-                    json.dump(self.stats, f, indent=4)
-                logger.info(
-                    f"Performance stats successfully saved to '{self.stats_file}'."
-                )
+                with open(pickle_path, "wb") as f:
+                    pickle.dump(self, f)
+                logger.info(f"Successfully saved manager state to '{pickle_path}'.")
             except Exception as e:
-                logger.error(f"Failed to save stats to {self.stats_file}: {e}")
+                logger.error(f"Failed to save state to pickle file: {e}")
 
     def get_proxy_for_source(self, source: str) -> Optional[str]:
-        """
-        Gets a random proxy from the source's available pool.
-        If the pool is too small, it attempts to revive a banned proxy using enhanced logic.
-        """
-        if not self.proxies:
-            return None
-
+        """Gets a random proxy from the source's available pool."""
         with self.lock:
-            if source not in self.stats:
-                self.stats[source] = {}
-                self.available_pools[source] = []
-                for p in self.proxies:
-                    self.stats[source][p["url"]] = {
-                        "success_count": 0,
-                        "failure_count": 0,
-                        "consecutive_failures": 0,
-                        "avg_response_time_ms": float("inf"),
-                        "is_banned": False,
-                        "last_used": 0,
-                    }
-                self.available_pools[source] = [p["url"] for p in self.proxies]
-                logger.info(
-                    f"Initialized new pool for source '{source}' with {len(self.proxies)} proxies."
+            if source not in self.sources:
+                logger.warning(
+                    f"Requested source '{source}' is unknown. Add it first via the API."
                 )
+                return None
 
             source_pool = self.available_pools.get(source, [])
             source_stats = self.stats.get(source, {})
 
-            # --- [MODIFIED] Enhanced revival logic ---
             if len(source_pool) < MIN_POOL_SIZE:
                 logger.warning(
                     f"Pool for '{source}' has {len(source_pool)} proxies, below threshold {MIN_POOL_SIZE}. Attempting revival."
                 )
-
                 proxy_to_revive_url = None
 
-                # 1. Try to find a banned proxy with a history of success
                 successful_revival_candidates = [
                     p_url
                     for p_url, p_stat in source_stats.items()
                     if p_stat.get("is_banned") and p_stat.get("success_count", 0) > 0
                 ]
-
                 if successful_revival_candidates:
                     proxy_to_revive_url = random.choice(successful_revival_candidates)
                     logger.info(
                         f"Reviving historically successful proxy for '{source}': {proxy_to_revive_url}"
                     )
                 else:
-                    # 2. If none found, find any banned proxy as a last resort
                     all_banned_proxies = [
                         p_url
                         for p_url, p_stat in source_stats.items()
@@ -325,7 +266,6 @@ class ProxyManager:
                             f"No successful proxies to revive. Reviving random banned proxy for '{source}': {proxy_to_revive_url}"
                         )
 
-                # If a proxy was chosen for revival, update its status
                 if proxy_to_revive_url:
                     source_stats[proxy_to_revive_url]["is_banned"] = False
                     source_stats[proxy_to_revive_url]["consecutive_failures"] = 0
@@ -343,17 +283,11 @@ class ProxyManager:
             return chosen_proxy_url
 
     def process_feedback(self, feedback_data: Dict):
-        """
-        Processes feedback and updates the proxy's status and the available pool.
-        """
+        """Processes feedback and updates the proxy's status."""
         source = feedback_data.get("source")
         proxy_url = feedback_data.get("proxy")
         status = feedback_data.get("status")
         response_time_ms = feedback_data.get("response_time_ms")
-
-        logger.info(
-            f"Feedback: proxy-[{proxy_url}], status-[{status}], source-[{source}], speed-[{response_time_ms}]"
-        )
 
         if not all([source, proxy_url, status]):
             return False
@@ -375,26 +309,19 @@ class ProxyManager:
                     if proxy_url not in self.available_pools.get(source, []):
                         self.available_pools.setdefault(source, []).append(proxy_url)
                         logger.info(
-                            f"Info: Reinstated proxy {proxy_url} for source '{source}' after success."
+                            f"Reinstated proxy {proxy_url} for source '{source}' after success."
                         )
 
-                if (
-                    not isinstance(response_time_ms, (int, float))
-                    or response_time_ms < 0
-                ):
-                    logger.warning(
-                        f"Warning: Success feedback for '{source}' is missing valid 'response_time_ms'."
+                if isinstance(response_time_ms, (int, float)) and response_time_ms >= 0:
+                    current_total_time = (
+                        stat["avg_response_time_ms"]
+                        if stat["avg_response_time_ms"] != float("inf")
+                        else 0
+                    ) * (stat["success_count"] - 1)
+                    new_total_time = current_total_time + response_time_ms
+                    stat["avg_response_time_ms"] = (
+                        new_total_time / stat["success_count"]
                     )
-                    return False
-
-                current_total_time = (
-                    stat["avg_response_time_ms"]
-                    if stat["avg_response_time_ms"] != float("inf")
-                    else 0
-                ) * (stat["success_count"] - 1)
-                new_total_time = current_total_time + response_time_ms
-                stat["avg_response_time_ms"] = new_total_time / stat["success_count"]
-
             elif status == "failure":
                 stat["failure_count"] += 1
                 stat["consecutive_failures"] += 1
@@ -404,23 +331,17 @@ class ProxyManager:
                 ):
                     stat["is_banned"] = True
                     logger.info(
-                        f"Info: Proxy {proxy_url} has been banned for source '{source}'."
+                        f"Proxy {proxy_url} has been banned for source '{source}'."
                     )
                     if proxy_url in self.available_pools.get(source, []):
                         self.available_pools[source].remove(proxy_url)
-                        logger.info(
-                            f"Info: Removed {proxy_url} from '{source}' available pool."
-                        )
             return True
 
     def get_source_stats(self, source: str) -> Optional[Dict]:
-        """
-        Gets statistics for a given source, including available proxy count and list.
-        """
+        """Gets statistics for a given source."""
         with self.lock:
-            if source not in self.available_pools:
-                self.get_proxy_for_source(source)
-
+            if source not in self.sources:
+                return None
             source_pool = self.available_pools.get(source, [])
             return {
                 "source": source,
@@ -429,9 +350,33 @@ class ProxyManager:
             }
 
 
+def load_proxy_manager(pickle_path, config_path, proxy_path) -> ProxyManager:
+    """Factory function to load or create a ProxyManager instance."""
+    manager = None
+    if os.path.exists(pickle_path):
+        logger.info(f"Attempting to load state from pickle file: {pickle_path}")
+        try:
+            with open(pickle_path, "rb") as f:
+                manager = pickle.load(f)
+            logger.info("Successfully loaded manager state from pickle file.")
+        except Exception as e:
+            logger.error(f"Failed to load from pickle file: {e}. Creating new manager.")
+            manager = None
+
+    if manager is None:
+        manager = ProxyManager()
+        manager.load_sources_from_config(config_path)
+
+    # Always load/merge from proxies.txt to catch updates
+    logger.info(f"Loading/merging proxies from text file: {proxy_path}")
+    manager.load_proxies_from_file(proxy_path)
+
+    return manager
+
+
 # --- HTTP Server ---
 app = Flask(__name__)
-proxy_manager = ProxyManager(PROXY_FILE_PATH, STATS_FILE_PATH)
+proxy_manager = load_proxy_manager(PICKLE_FILE_PATH, CONFIG_FILE_PATH, PROXY_FILE_PATH)
 
 
 @app.route("/get-proxy", methods=["GET"])
@@ -439,16 +384,9 @@ def get_proxy():
     source = request.args.get("source")
     if not source:
         return jsonify({"error": "Query parameter 'source' is required."}), 400
-
     proxy_url = proxy_manager.get_proxy_for_source(source)
-
     if proxy_url:
-        return jsonify(
-            {
-                "http": proxy_url,
-                "https": proxy_url,
-            }
-        )
+        return jsonify({"http": proxy_url, "https": proxy_url})
     else:
         return (
             jsonify(
@@ -461,57 +399,43 @@ def get_proxy():
 @app.route("/feedback", methods=["POST"])
 def feedback():
     data = request.json
-    if not data:
-        return jsonify({"error": "Invalid JSON body."}), 400
-
-    success = proxy_manager.process_feedback(data)
-
-    if success:
-        return jsonify({"message": "Feedback received and processed."})
-    else:
+    if not data or not proxy_manager.process_feedback(data):
         return jsonify({"error": "Invalid or incomplete feedback data provided."}), 400
+    return jsonify({"message": "Feedback received and processed."})
 
 
-@app.route("/load-proxies", methods=["POST"])
-def load_proxies_endpoint():
-    """Endpoint to trigger a reload of the proxy file."""
-    result = proxy_manager.load_proxies(is_reload=True)
-    return jsonify(result)
+@app.route("/add-source", methods=["POST"])
+def add_source():
+    data = request.json
+    source = data.get("source")
+    if not source:
+        return jsonify({"error": "JSON body must contain a 'source' key."}), 400
+
+    if proxy_manager.add_source(source, CONFIG_FILE_PATH):
+        return jsonify({"message": f"Source '{source}' added successfully."})
+    else:
+        return jsonify({"message": f"Source '{source}' already exists."}), 200
 
 
 @app.route("/export-stats", methods=["GET"])
 def export_stats_endpoint():
-    """Endpoint to manually trigger saving the proxy_stats.json file."""
-    try:
-        proxy_manager.save_stats()
-        return jsonify({"message": f"Stats successfully saved to {STATS_FILE_PATH}"})
-    except Exception as e:
-        return jsonify({"error": f"Failed to save stats: {e}"}), 500
+    """Manually triggers saving the current manager state to a pickle file."""
+    proxy_manager.save_state_to_pickle(PICKLE_FILE_PATH)
+    return jsonify({"message": f"Manager state saved to {PICKLE_FILE_PATH}"})
 
 
 @app.route("/stats/<string:source>", methods=["GET"])
 def get_source_stats_endpoint(source: str):
-    """
-    Endpoint to get statistics for a specific source, including
-    the number of available proxies and a list of them.
-    """
     stats = proxy_manager.get_source_stats(source)
-
     if stats:
         return jsonify(stats)
     else:
-        return (
-            jsonify({"error": f"No statistics found for source '{source}'."}),
-            404,
-        )
+        return jsonify({"error": f"No statistics found for source '{source}'."}), 404
 
 
 def handle_shutdown(signal, frame):
-    """
-    Saves statistics upon receiving a shutdown signal.
-    """
-    logger.info("\nShutdown signal received, saving statistics...")
-    proxy_manager.save_stats()
+    logger.info("\nShutdown signal received, saving state...")
+    proxy_manager.save_state_to_pickle(PICKLE_FILE_PATH)
     sys.exit(0)
 
 
@@ -519,20 +443,10 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, handle_shutdown)
     signal.signal(signal.SIGTERM, handle_shutdown)
 
-    proxy_dir = os.path.dirname(PROXY_FILE_PATH)
-    if proxy_dir:
-        os.makedirs(proxy_dir, exist_ok=True)
-
+    os.makedirs(DATA_DIR, exist_ok=True)
     if not os.path.exists(PROXY_FILE_PATH):
-        logger.info(
-            f"Creating a dummy proxy file at '{PROXY_FILE_PATH}'. Please populate it."
-        )
+        logger.info(f"Creating a dummy proxy file at '{PROXY_FILE_PATH}'.")
         with open(PROXY_FILE_PATH, "w", encoding="utf-8") as f:
-            f.write(
-                "# Add proxies here in the format: protocol:host:port or protocol:host:port:user:pass\n"
-            )
-            f.write("# Example:\n")
-            f.write("# http:127.0.0.1:8080\n")
-            f.write("# socks5:user:password@proxy.example.com:1080\n")
+            f.write("# Add proxies here in the format: protocol:host:port\n")
 
     app.run(host="0.0.0.0", port=6942, debug=True, use_reloader=False)
