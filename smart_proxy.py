@@ -19,7 +19,7 @@ PROXY_FILE_PATH = os.path.join(DATA_DIR, "proxies.txt")
 PICKLE_FILE_PATH = os.path.join(DATA_DIR, "proxy_manager.pkl")
 
 CONSECUTIVE_FAILURE_THRESHOLD = (
-    10  # Number of consecutive failures before a proxy is banned
+    6  # Number of consecutive failures before a proxy is banned
 )
 MIN_POOL_SIZE = 200  # Minimum number of proxies in the available pool for a source
 
@@ -288,6 +288,9 @@ class ProxyManager:
         proxy_url = feedback_data.get("proxy")
         status = feedback_data.get("status")
         response_time_ms = feedback_data.get("response_time_ms")
+        logger.info(
+            f"Handled feedback: proxy-[{proxy_url}], source-[{source}], status-[{status}], time-[{response_time_ms}]"
+        )
 
         if not all([source, proxy_url, status]):
             return False
