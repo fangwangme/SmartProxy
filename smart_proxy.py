@@ -35,6 +35,7 @@ class ProxyManager:
         # Default settings, will be overwritten by config file
         self.consecutive_failure_threshold = 5
         self.min_pool_size = 100
+        self.use_authenticated_proxies = False
         logger.info("ProxyManager initialized an empty instance.")
 
     def load_config(self, config_path: str):
@@ -58,8 +59,12 @@ class ProxyManager:
                 self.min_pool_size = config.getint(
                     "settings", "min_pool_size", fallback=100
                 )
+                # --- [NEW] Load setting for authenticated proxies ---
+                self.use_authenticated_proxies = config.getboolean(
+                    "settings", "use_authenticated_proxies", fallback=True
+                )
                 logger.info(
-                    f"Loaded settings: FailureThreshold={self.consecutive_failure_threshold}, MinPoolSize={self.min_pool_size}"
+                    f"Loaded settings: FailureThreshold={self.consecutive_failure_threshold}, MinPoolSize={self.min_pool_size}, UseAuthProxies={self.use_authenticated_proxies}"
                 )
             else:
                 logger.warning(
@@ -67,10 +72,8 @@ class ProxyManager:
                 )
 
             self._ensure_sources_initialized()
-            # --- [FIXED] Call private save method to avoid deadlock ---
             self._save_config(config_path)
 
-    # --- [MODIFIED] Made private and removed lock to prevent deadlock ---
     def _save_config(self, config_path: str):
         """Saves the current sources and settings. MUST be called within a locked context."""
         config = configparser.ConfigParser()
@@ -78,6 +81,8 @@ class ProxyManager:
         config["settings"] = {
             "consecutive_failure_threshold": str(self.consecutive_failure_threshold),
             "min_pool_size": str(self.min_pool_size),
+            # --- [NEW] Save setting for authenticated proxies ---
+            "use_authenticated_proxies": str(self.use_authenticated_proxies),
         }
         os.makedirs(os.path.dirname(config_path), exist_ok=True)
         with open(config_path, "w", encoding="utf-8") as configfile:
@@ -94,7 +99,6 @@ class ProxyManager:
             logger.info(f"Adding new source: {source}")
             self.sources.add(source)
             self._ensure_sources_initialized()
-            # --- [FIXED] Call private save method to avoid deadlock ---
             self._save_config(config_path)
             return True
 
@@ -148,6 +152,7 @@ class ProxyManager:
         added_count = 0
         skipped_duplicates_count = 0
         skipped_malformed_count = 0
+        skipped_auth_count = 0
 
         with self.lock:
             existing_proxy_urls = {p["url"] for p in self.proxies}
@@ -181,6 +186,11 @@ class ProxyManager:
                             "url": url,
                         }
                     elif len(parts) == 5:  # protocol:host:port:user:pass
+                        # --- [NEW] Skip authenticated proxies if disabled in config ---
+                        if not self.use_authenticated_proxies:
+                            skipped_auth_count += 1
+                            continue
+
                         protocol, host, port_str, user, password = (
                             parts[0].lower(),
                             parts[1],
@@ -226,7 +236,8 @@ class ProxyManager:
         message = (
             f"Proxy loading finished. Added: {added_count}, "
             f"Skipped (duplicates): {skipped_duplicates_count}, "
-            f"Skipped (malformed): {skipped_malformed_count}, Total: {len(self.proxies)}"
+            f"Skipped (malformed): {skipped_malformed_count}, "
+            f"Skipped (auth disabled): {skipped_auth_count}, Total: {len(self.proxies)}"
         )
         logger.info(message)
         return {"message": message, "added": added_count, "total": len(self.proxies)}
@@ -483,5 +494,4 @@ if __name__ == "__main__":
         # This will call _save_config within load_config, creating the file
         proxy_manager.load_config(CONFIG_FILE_PATH)
 
-    # --- [MODIFIED] Added use_reloader=False to prevent double execution in debug mode ---
     app.run(host="0.0.0.0", port=6942, debug=True, use_reloader=False)
