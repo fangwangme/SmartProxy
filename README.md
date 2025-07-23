@@ -79,14 +79,21 @@ pip install Flask
        \-d '{"source": "new-api-service"}' \\  
        http://127.0.0.1:6942/add-source
 
-### **4\. Get Source Statistics**
+### **4\. Reload Proxies**
+
+* **Endpoint**: POST /load-proxies 
+* **Description**: Triggers a hot reload of the `data/proxies.txt` file. The server will read the file and merge any new, unique proxies into its memory.  
+* **Example Request**:  
+  curl -X POST http://127.0.0.1:6942/load-proxies
+
+### **5\. Get Source Statistics**
 
 * **Endpoint**: GET /stats/\<source\>  
 * **Description**: Retrieves the count and list of available proxies for a specific source.  
 * **Example Request**:  
   curl http://127.0.0.1:6942/stats/insolvencydirect
 
-### **5\. Export State (Updated)**
+### **6\. Export State (Updated)**
 
 * **Endpoint**: GET /export-stats  
 * **Description**: Manually triggers the saving of the entire current application state to data/proxy\_manager.pkl. This also happens automatically on graceful shutdown (Ctrl+C).  
