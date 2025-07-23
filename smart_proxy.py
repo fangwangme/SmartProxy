@@ -12,16 +12,11 @@ import configparser
 from typing import List, Dict, Optional, Set
 from logger import logger
 
-# --- Configuration ---
+# --- Configuration File Paths ---
 DATA_DIR = "data"
 CONFIG_FILE_PATH = os.path.join(DATA_DIR, "config.ini")
 PROXY_FILE_PATH = os.path.join(DATA_DIR, "proxies.txt")
 PICKLE_FILE_PATH = os.path.join(DATA_DIR, "proxy_manager.pkl")
-
-CONSECUTIVE_FAILURE_THRESHOLD = (
-    6  # Number of consecutive failures before a proxy is banned
-)
-MIN_POOL_SIZE = 200  # Minimum number of proxies in the available pool for a source
 
 
 # --- Core Logic: Proxy Manager ---
@@ -37,37 +32,57 @@ class ProxyManager:
         self.available_pools: Dict[str, List[str]] = {}
         self.sources: Set[str] = set()
         self.lock = threading.Lock()
+        # Default settings, will be overwritten by config file
+        self.consecutive_failure_threshold = 5
+        self.min_pool_size = 100
         logger.info("ProxyManager initialized an empty instance.")
 
-    def load_sources_from_config(self, config_path: str):
-        """Loads sources from the configuration file."""
+    def load_config(self, config_path: str):
+        """Loads sources and settings from the configuration file."""
         with self.lock:
             config = configparser.ConfigParser()
+            # Set default values first
+            self.sources = {"insolvencydirect", "test"}
+
             if os.path.exists(config_path):
-                config.read(config_path)
+                config.read(config_path, encoding="utf-8")
                 sources_str = config.get(
                     "sources", "default_sources", fallback="insolvencydirect,test"
                 )
                 self.sources = {s.strip() for s in sources_str.split(",") if s.strip()}
                 logger.info(f"Loaded sources from config: {self.sources}")
-            else:
-                self.sources = {"insolvencydirect", "test"}
-                logger.warning(
-                    f"Config file not found. Using default sources: {self.sources}"
-                )
-            self._ensure_sources_initialized()
 
-    def save_sources_to_config(self, config_path: str):
-        """Saves the current set of sources to the configuration file."""
-        with self.lock:
-            config = configparser.ConfigParser()
-            config["sources"] = {
-                "default_sources": ",".join(sorted(list(self.sources)))
-            }
-            os.makedirs(os.path.dirname(config_path), exist_ok=True)
-            with open(config_path, "w", encoding="utf-8") as configfile:
-                config.write(configfile)
-            logger.info(f"Saved sources to config: {self.sources}")
+                self.consecutive_failure_threshold = config.getint(
+                    "settings", "consecutive_failure_threshold", fallback=5
+                )
+                self.min_pool_size = config.getint(
+                    "settings", "min_pool_size", fallback=100
+                )
+                logger.info(
+                    f"Loaded settings: FailureThreshold={self.consecutive_failure_threshold}, MinPoolSize={self.min_pool_size}"
+                )
+            else:
+                logger.warning(
+                    f"Config file not found. Using default sources and settings."
+                )
+
+            self._ensure_sources_initialized()
+            # --- [FIXED] Call private save method to avoid deadlock ---
+            self._save_config(config_path)
+
+    # --- [MODIFIED] Made private and removed lock to prevent deadlock ---
+    def _save_config(self, config_path: str):
+        """Saves the current sources and settings. MUST be called within a locked context."""
+        config = configparser.ConfigParser()
+        config["sources"] = {"default_sources": ",".join(sorted(list(self.sources)))}
+        config["settings"] = {
+            "consecutive_failure_threshold": str(self.consecutive_failure_threshold),
+            "min_pool_size": str(self.min_pool_size),
+        }
+        os.makedirs(os.path.dirname(config_path), exist_ok=True)
+        with open(config_path, "w", encoding="utf-8") as configfile:
+            config.write(configfile)
+        logger.info(f"Saved config to {config_path}")
 
     def add_source(self, source: str, config_path: str):
         """Adds a new source to the manager and persists it."""
@@ -79,7 +94,8 @@ class ProxyManager:
             logger.info(f"Adding new source: {source}")
             self.sources.add(source)
             self._ensure_sources_initialized()
-            self.save_sources_to_config(config_path)
+            # --- [FIXED] Call private save method to avoid deadlock ---
+            self._save_config(config_path)
             return True
 
     def _ensure_sources_initialized(self):
@@ -238,9 +254,9 @@ class ProxyManager:
             source_pool = self.available_pools.get(source, [])
             source_stats = self.stats.get(source, {})
 
-            if len(source_pool) < MIN_POOL_SIZE:
+            if len(source_pool) < self.min_pool_size:
                 logger.warning(
-                    f"Pool for '{source}' has {len(source_pool)} proxies, below threshold {MIN_POOL_SIZE}. Attempting revival."
+                    f"Pool for '{source}' has {len(source_pool)} proxies, below threshold {self.min_pool_size}. Attempting revival."
                 )
                 proxy_to_revive_url = None
 
@@ -329,7 +345,7 @@ class ProxyManager:
                 stat["failure_count"] += 1
                 stat["consecutive_failures"] += 1
                 if (
-                    stat["consecutive_failures"] >= CONSECUTIVE_FAILURE_THRESHOLD
+                    stat["consecutive_failures"] >= self.consecutive_failure_threshold
                     and not stat["is_banned"]
                 ):
                     stat["is_banned"] = True
@@ -362,13 +378,15 @@ def load_proxy_manager(pickle_path, config_path, proxy_path) -> ProxyManager:
             with open(pickle_path, "rb") as f:
                 manager = pickle.load(f)
             logger.info("Successfully loaded manager state from pickle file.")
+            # Always reload config on start to apply changes
+            manager.load_config(config_path)
         except Exception as e:
             logger.error(f"Failed to load from pickle file: {e}. Creating new manager.")
             manager = None
 
     if manager is None:
         manager = ProxyManager()
-        manager.load_sources_from_config(config_path)
+        manager.load_config(config_path)
 
     # Always load/merge from proxies.txt to catch updates
     logger.info(f"Loading/merging proxies from text file: {proxy_path}")
@@ -420,6 +438,14 @@ def add_source():
         return jsonify({"message": f"Source '{source}' already exists."}), 200
 
 
+@app.route("/load-proxies", methods=["POST"])
+def load_proxies_endpoint():
+    """Manually triggers a hot-reload of the proxies.txt file."""
+    logger.info("Hot-reload of proxies triggered via API.")
+    result = proxy_manager.load_proxies_from_file(PROXY_FILE_PATH)
+    return jsonify(result)
+
+
 @app.route("/export-stats", methods=["GET"])
 def export_stats_endpoint():
     """Manually triggers saving the current manager state to a pickle file."""
@@ -452,4 +478,10 @@ if __name__ == "__main__":
         with open(PROXY_FILE_PATH, "w", encoding="utf-8") as f:
             f.write("# Add proxies here in the format: protocol:host:port\n")
 
+    # Initialize config if it doesn't exist
+    if not os.path.exists(CONFIG_FILE_PATH):
+        # This will call _save_config within load_config, creating the file
+        proxy_manager.load_config(CONFIG_FILE_PATH)
+
+    # --- [MODIFIED] Added use_reloader=False to prevent double execution in debug mode ---
     app.run(host="0.0.0.0", port=6942, debug=True, use_reloader=False)
