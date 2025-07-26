@@ -376,7 +376,7 @@ class ProxyManager:
             return {
                 "source": source,
                 "available_proxies_count": len(source_pool),
-                "available_proxies_list": source_pool,
+                "available_proxies_list": source_pool[:10],
             }
 
 
