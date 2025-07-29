@@ -504,5 +504,10 @@ def handle_shutdown(signal, frame):
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, handle_shutdown)
     signal.signal(signal.SIGTERM, handle_shutdown)
+
+    config = configparser.ConfigParser()
+    config.read(CONFIG_FILE_PATH, encoding="utf-8")
+    server_port = config.getint("server", "port", fallback=6942)
+
     proxy_manager.start_scheduler()
-    app.run(host="0.0.0.0", port=6952, debug=False)
+    app.run(host="0.0.0.0", port=server_port, debug=False)

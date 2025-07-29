@@ -2,6 +2,10 @@
 # Intelligent Proxy Service V3.0 Configuration
 # ===================================================================
 
+[server]
+port = 6942
+
+
 [database]
 host = localhost
 port = 5432
