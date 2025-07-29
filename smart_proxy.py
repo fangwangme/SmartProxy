@@ -63,7 +63,7 @@ class DatabaseManager:
                 self.pool.putconn(conn)
 
     def insert_proxies(self, proxies: List[Tuple[str, str, int]]):
-        """Inserts a list of proxies, ignoring duplicates."""
+        """Inserts a list of proxies, ignoring duplicates, and logs the actual count."""
         if not proxies:
             return
         query = """
@@ -71,13 +71,19 @@ class DatabaseManager:
             ON CONFLICT (protocol, ip, port) DO NOTHING;
         """
         conn = None
+        inserted_count = 0
         try:
             conn = self.pool.getconn()
             with conn.cursor() as cur:
                 psycopg2.extras.execute_values(cur, query, proxies)
+                inserted_count = (
+                    cur.rowcount
+                )  # Get the number of rows actually inserted
                 conn.commit()
             logger.info(
-                f"Attempted to insert {len(proxies)} proxies. Duplicates were ignored."
+                f"Attempted to insert {len(proxies)} proxies. "
+                f"Successfully inserted {inserted_count} new proxies. "
+                f"{len(proxies) - inserted_count} were duplicates."
             )
         except psycopg2.Error as e:
             logger.error(f"Database batch insert failed: {e}")
@@ -148,7 +154,6 @@ class ProxyManager:
         self.validation_target = self.config.get(
             "validator", "validation_target", fallback="http://httpbin.org/get"
         )
-        # --- [NEW] State flag to prevent overlapping validation cycles ---
         self.is_validating = False
 
     def _load_fetcher_jobs(self) -> List[Dict]:
@@ -175,7 +180,7 @@ class ProxyManager:
     def _fetch_and_parse_source(self, job: Dict):
         """Fetches a source, parses proxies, and inserts them into the DB."""
         url = job["url"]
-        logger.info(f"Fetching proxy source: {job['name']}")
+        logger.info(f"Fetching proxy source: {job['name']} from {url}")
         try:
             response = requests.get(url, timeout=15)
             response.raise_for_status()
@@ -189,23 +194,26 @@ class ProxyManager:
                     continue
 
                 protocol, ip, port = None, None, None
-                if "://" in line:
-                    parts = line.split("://")
-                    protocol = parts[0]
-                    ip_port = parts[1]
-                elif job["default_protocol"]:
-                    protocol = job["default_protocol"]
-                    ip_port = line
 
-                if protocol and ":" in ip_port:
-                    ip_port_parts = ip_port.rsplit(":", 1)
-                    ip, port_str = ip_port_parts[0], ip_port_parts[1]
-                    try:
+                try:
+                    if "://" in line:
+                        protocol, rest = line.split("://", 1)
+                        ip, port_str = rest.rsplit(":", 1)
                         port = int(port_str)
-                        proxies_to_insert.append((protocol, ip, port))
-                    except ValueError:
-                        logger.warning(f"Skipping malformed proxy line: {line}")
-                        continue
+                        proxies_to_insert.append((protocol.lower(), ip, port))
+                    elif job["default_protocol"]:
+                        ip, port_str = line.rsplit(":", 1)
+                        port = int(port_str)
+                        proxies_to_insert.append(
+                            (job["default_protocol"].lower(), ip, port)
+                        )
+                    else:
+                        logger.warning(
+                            f"Skipping proxy line due to unknown format (no '://' and no default_protocol): {line}"
+                        )
+                except ValueError:
+                    logger.warning(f"Skipping malformed proxy line: {line}")
+                    continue
 
             logger.info(
                 f"Parsed {len(proxies_to_insert)} valid proxies from {job['name']}."
@@ -253,40 +261,41 @@ class ProxyManager:
             proxies_to_validate = self.db.get_proxies_to_validate()
             if not proxies_to_validate:
                 logger.info("Validation cycle skipped: no proxies to validate.")
-                return
+            else:
+                total_to_validate = len(proxies_to_validate)
+                logger.info(f"Starting validation for {total_to_validate} proxies...")
 
-            total_to_validate = len(proxies_to_validate)
-            logger.info(f"Starting validation for {total_to_validate} proxies...")
+                success_count = 0
+                processed_count = 0
 
-            success_count = 0
-            processed_count = 0
+                with ThreadPoolExecutor(
+                    max_workers=self.validation_workers
+                ) as executor:
+                    future_to_proxy = {
+                        executor.submit(
+                            self._validate_proxy, proxy_id, f"{protocol}://{ip}:{port}"
+                        ): proxy_id
+                        for proxy_id, protocol, ip, port in proxies_to_validate
+                    }
 
-            with ThreadPoolExecutor(max_workers=self.validation_workers) as executor:
-                future_to_proxy = {
-                    executor.submit(
-                        self._validate_proxy, proxy_id, f"{protocol}://{ip}:{port}"
-                    ): proxy_id
-                    for proxy_id, protocol, ip, port in proxies_to_validate
-                }
+                    for future in as_completed(future_to_proxy):
+                        processed_count += 1
+                        result = future.result()
+                        if result:
+                            success_count += 1
 
-                for future in as_completed(future_to_proxy):
-                    processed_count += 1
-                    result = future.result()
-                    if result:
-                        success_count += 1
+                        if (
+                            processed_count % 100 == 0
+                            or processed_count == total_to_validate
+                        ):
+                            logger.info(
+                                f"Validation progress: {processed_count}/{total_to_validate} proxies checked."
+                            )
 
-                    if (
-                        processed_count % 100 == 0
-                        or processed_count == total_to_validate
-                    ):
-                        logger.info(
-                            f"Validation progress: {processed_count}/{total_to_validate} proxies checked."
-                        )
-
-            logger.info(
-                f"Validation cycle finished. Success: {success_count}, Failed: {total_to_validate - success_count}."
-            )
-            self._sync_active_proxies_from_db()
+                logger.info(
+                    f"Validation cycle finished. Success: {success_count}, Failed: {total_to_validate - success_count}."
+                )
+                self._sync_active_proxies_from_db()
         finally:
             with self.lock:
                 self.is_validating = False
@@ -316,18 +325,15 @@ class ProxyManager:
         while not self.stop_scheduler_event.is_set():
             now = time.time()
             try:
-                # Check and run fetcher jobs
                 for job in self.fetcher_jobs:
                     if now - job["last_run"] >= job["interval_minutes"] * 60:
                         logger.info(f"Scheduler triggering fetch job: {job['name']}")
                         job["last_run"] = now
                         self.fetch_executor.submit(self._fetch_and_parse_source, job)
 
-                # Check and run validation cycle at a fixed rate
                 if now - last_validation_run >= validation_interval:
                     logger.info("Scheduler triggering validation cycle.")
                     last_validation_run = now
-                    # Run validation in a separate thread to not block the scheduler loop
                     threading.Thread(target=self._run_validation_cycle).start()
 
                 self.stop_scheduler_event.wait(5)
