@@ -135,3 +135,6 @@ proxies.txt
 proxy_stats.json
 
 .DS_Store
+
+
+*.ini
