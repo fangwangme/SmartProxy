@@ -1,6 +1,6 @@
 # smart_proxy_server.py
 from flask import Flask, request, jsonify
-import json
+import requests
 import random
 import threading
 import time
@@ -15,7 +15,9 @@ from logger import logger
 # --- Configuration File Paths ---
 DATA_DIR = "data"
 CONFIG_FILE_PATH = os.path.join(DATA_DIR, "config.ini")
-PROXY_FILE_PATH = os.path.join(DATA_DIR, "proxies.txt")
+PROXY_FILE_PATH = os.path.join(
+    DATA_DIR, "proxies.txt"
+)  # Still used for initial manual load
 PICKLE_FILE_PATH = os.path.join(DATA_DIR, "proxy_manager.pkl")
 
 
@@ -36,13 +38,19 @@ class ProxyManager:
         self.consecutive_failure_threshold = 5
         self.min_pool_size = 100
         self.use_authenticated_proxies = False
+
+        # --- [NEW] Scheduler components ---
+        self.scheduler_thread = None
+        self.stop_scheduler_event = threading.Event()
+        self.proxy_source_urls = {}
+        self.update_interval_seconds = 300
+
         logger.info("ProxyManager initialized an empty instance.")
 
     def load_config(self, config_path: str):
         """Loads sources and settings from the configuration file."""
         with self.lock:
             config = configparser.ConfigParser()
-            # Set default values first
             self.sources = {"insolvencydirect", "test"}
 
             if os.path.exists(config_path):
@@ -59,12 +67,26 @@ class ProxyManager:
                 self.min_pool_size = config.getint(
                     "settings", "min_pool_size", fallback=100
                 )
-                # --- [NEW] Load setting for authenticated proxies ---
                 self.use_authenticated_proxies = config.getboolean(
-                    "settings", "use_authenticated_proxies", fallback=True
+                    "settings", "use_authenticated_proxies", fallback=False
+                )
+
+                # --- [NEW] Load auto-fetch settings ---
+                self.update_interval_seconds = config.getint(
+                    "proxy_sources", "update_interval_seconds", fallback=300
+                )
+                self.proxy_source_urls["http"] = config.get(
+                    "proxy_sources", "http_url", fallback=None
+                )
+                self.proxy_source_urls["socks5"] = config.get(
+                    "proxy_sources", "socks5_url", fallback=None
+                )
+
+                logger.info(
+                    f"Loaded settings: FailureThreshold={self.consecutive_failure_threshold}, MinPoolSize={self.min_pool_size}"
                 )
                 logger.info(
-                    f"Loaded settings: FailureThreshold={self.consecutive_failure_threshold}, MinPoolSize={self.min_pool_size}, UseAuthProxies={self.use_authenticated_proxies}"
+                    f"Auto-fetch enabled for URLs with interval {self.update_interval_seconds}s."
                 )
             else:
                 logger.warning(
@@ -81,13 +103,127 @@ class ProxyManager:
         config["settings"] = {
             "consecutive_failure_threshold": str(self.consecutive_failure_threshold),
             "min_pool_size": str(self.min_pool_size),
-            # --- [NEW] Save setting for authenticated proxies ---
             "use_authenticated_proxies": str(self.use_authenticated_proxies),
+        }
+        # --- [NEW] Save auto-fetch settings ---
+        config["proxy_sources"] = {
+            "update_interval_seconds": str(self.update_interval_seconds),
+            "http_url": self.proxy_source_urls.get("http", ""),
+            "socks5_url": self.proxy_source_urls.get("socks5", ""),
         }
         os.makedirs(os.path.dirname(config_path), exist_ok=True)
         with open(config_path, "w", encoding="utf-8") as configfile:
             config.write(configfile)
         logger.info(f"Saved config to {config_path}")
+
+    # --- [NEW] The main loop for the background scheduler thread ---
+    def _auto_fetch_loop(self):
+        logger.info("Auto-fetch scheduler thread started.")
+        while not self.stop_scheduler_event.is_set():
+            try:
+                self._fetch_and_merge_proxies()
+            except Exception as e:
+                logger.error(f"Error in auto-fetch loop: {e}", exc_info=True)
+
+            # Wait for the next interval
+            self.stop_scheduler_event.wait(self.update_interval_seconds)
+        logger.info("Auto-fetch scheduler thread stopped.")
+
+    # --- [NEW] The core logic for fetching and merging proxies ---
+    def _fetch_and_merge_proxies(self):
+        logger.info("Starting automatic proxy fetch cycle...")
+        new_proxies = set()
+
+        # Fetch and format HTTP proxies
+        http_url = self.proxy_source_urls.get("http")
+        if http_url:
+            try:
+                response = requests.get(http_url, timeout=15)
+                response.raise_for_status()
+                for line in response.text.splitlines():
+                    if line.strip():
+                        new_proxies.add(f"http://{line.strip()}")
+                logger.info(
+                    f"Fetched {len(response.text.splitlines())} lines from HTTP source."
+                )
+            except requests.RequestException as e:
+                logger.error(f"Failed to fetch HTTP proxies: {e}")
+
+        # Fetch and format SOCKS5 proxies
+        socks5_url = self.proxy_source_urls.get("socks5")
+        if socks5_url:
+            try:
+                response = requests.get(socks5_url, timeout=15)
+                response.raise_for_status()
+                for line in response.text.splitlines():
+                    if line.strip():
+                        new_proxies.add(f"socks5://{line.strip()}")
+                logger.info(
+                    f"Fetched {len(response.text.splitlines())} lines from SOCKS5 source."
+                )
+            except requests.RequestException as e:
+                logger.error(f"Failed to fetch SOCKS5 proxies: {e}")
+
+        if not new_proxies:
+            logger.warning(
+                "Auto-fetch cycle completed, but no new proxies were fetched."
+            )
+            return
+
+        # Merge the newly fetched proxies into the manager
+        self._add_new_proxies_to_memory(list(new_proxies))
+
+    # --- [NEW] Helper to add a list of formatted proxies directly to memory ---
+    def _add_new_proxies_to_memory(self, proxy_lines: List[str]):
+        added_count = 0
+        with self.lock:
+            existing_proxy_urls = {p["url"] for p in self.proxies}
+            for line in proxy_lines:
+                try:
+                    # Simplified parsing since we've already formatted the lines
+                    protocol, rest = line.split("://", 1)
+                    host, port_str = rest.rsplit(":", 1)
+                    port = int(port_str)
+
+                    if not (1 <= port <= 65535):
+                        continue  # Invalid port
+
+                    url = f"{protocol}://{host}:{port}"
+                    if url not in existing_proxy_urls:
+                        proxy_info = {
+                            "protocol": protocol,
+                            "host": host,
+                            "port": port,
+                            "auth": None,
+                            "url": url,
+                        }
+                        self.proxies.append(proxy_info)
+                        existing_proxy_urls.add(url)
+                        for source in self.sources:
+                            self.stats[source][url] = self._get_new_proxy_stat()
+                            self.available_pools[source].append(url)
+                        added_count += 1
+                except (ValueError, IndexError):
+                    continue  # Skip malformed lines
+
+        logger.info(
+            f"Auto-fetch merge complete. Added {added_count} new unique proxies. Total proxies: {len(self.proxies)}"
+        )
+
+    # --- [NEW] Methods to start and stop the scheduler ---
+    def start_scheduler(self):
+        if self.scheduler_thread is None or not self.scheduler_thread.is_alive():
+            self.stop_scheduler_event.clear()
+            self.scheduler_thread = threading.Thread(
+                target=self._auto_fetch_loop, daemon=True
+            )
+            self.scheduler_thread.start()
+
+    def stop_scheduler(self):
+        if self.scheduler_thread and self.scheduler_thread.is_alive():
+            self.stop_scheduler_event.set()
+            self.scheduler_thread.join(timeout=5)  # Wait for thread to finish
+            logger.info("Scheduler stopped.")
 
     def add_source(self, source: str, config_path: str):
         """Adds a new source to the manager and persists it."""
@@ -108,7 +244,6 @@ class ProxyManager:
             if source not in self.stats:
                 self.stats[source] = {}
                 self.available_pools[source] = []
-                # Initialize stats for all existing proxies
                 for p in self.proxies:
                     proxy_url = p["url"]
                     if proxy_url not in self.stats[source]:
@@ -134,113 +269,19 @@ class ProxyManager:
         Loads proxies from a text file and merges them with the existing state.
         """
         if not os.path.exists(proxy_file):
-            message = f"Warning: Proxy file '{proxy_file}' does not exist."
-            logger.info(message)
-            return {"message": message, "added": 0, "total": len(self.proxies)}
+            return {
+                "message": f"Warning: Proxy file '{proxy_file}' does not exist.",
+                "added": 0,
+                "total": len(self.proxies),
+            }
 
-        unique_proxy_lines = set()
-        try:
-            with open(proxy_file, "r", encoding="utf-8") as f:
-                for line in f:
-                    stripped_line = line.strip()
-                    if stripped_line and not stripped_line.startswith("#"):
-                        unique_proxy_lines.add(stripped_line)
-        except Exception as e:
-            logger.error(f"Failed to read proxy file {proxy_file}: {e}")
-            return {"message": f"Error reading proxy file: {e}"}
+        with open(proxy_file, "r", encoding="utf-8") as f:
+            unique_proxy_lines = {
+                line.strip() for line in f if line.strip() and not line.startswith("#")
+            }
 
-        added_count = 0
-        skipped_duplicates_count = 0
-        skipped_malformed_count = 0
-        skipped_auth_count = 0
-
-        with self.lock:
-            existing_proxy_urls = {p["url"] for p in self.proxies}
-
-            for line in unique_proxy_lines:
-                if not line:
-                    continue
-                try:
-                    parts = line.split(":")
-                    proxy_info = {}
-                    url = ""
-
-                    if len(parts) == 3:  # protocol:host:port
-                        protocol, host, port_str = parts[0].lower(), parts[1], parts[2]
-                        if (
-                            protocol not in ["http", "https", "socks4", "socks5"]
-                            or not host
-                        ):
-                            skipped_malformed_count += 1
-                            continue
-                        port = int(port_str)
-                        if not (1 <= port <= 65535):
-                            skipped_malformed_count += 1
-                            continue
-                        url = f"{protocol}://{host}:{port}"
-                        proxy_info = {
-                            "protocol": protocol,
-                            "host": host,
-                            "port": port,
-                            "auth": None,
-                            "url": url,
-                        }
-                    elif len(parts) == 5:  # protocol:host:port:user:pass
-                        # --- [NEW] Skip authenticated proxies if disabled in config ---
-                        if not self.use_authenticated_proxies:
-                            skipped_auth_count += 1
-                            continue
-
-                        protocol, host, port_str, user, password = (
-                            parts[0].lower(),
-                            parts[1],
-                            parts[2],
-                            parts[3],
-                            parts[4],
-                        )
-                        if (
-                            protocol not in ["http", "https", "socks4", "socks5"]
-                            or not host
-                        ):
-                            skipped_malformed_count += 1
-                            continue
-                        port = int(port_str)
-                        if not (1 <= port <= 65535):
-                            skipped_malformed_count += 1
-                            continue
-                        url = f"{protocol}://{user}:{password}@{host}:{port}"
-                        proxy_info = {
-                            "protocol": protocol,
-                            "host": host,
-                            "port": port,
-                            "auth": (user, password),
-                            "url": url,
-                        }
-                    else:
-                        skipped_malformed_count += 1
-                        continue
-
-                    if url not in existing_proxy_urls:
-                        self.proxies.append(proxy_info)
-                        existing_proxy_urls.add(url)
-                        for source in self.sources:
-                            self.stats[source][url] = self._get_new_proxy_stat()
-                            self.available_pools[source].append(url)
-                        added_count += 1
-                    else:
-                        skipped_duplicates_count += 1
-                except (ValueError, IndexError):
-                    skipped_malformed_count += 1
-                    continue
-
-        message = (
-            f"Proxy loading finished. Added: {added_count}, "
-            f"Skipped (duplicates): {skipped_duplicates_count}, "
-            f"Skipped (malformed): {skipped_malformed_count}, "
-            f"Skipped (auth disabled): {skipped_auth_count}, Total: {len(self.proxies)}"
-        )
-        logger.info(message)
-        return {"message": message, "added": added_count, "total": len(self.proxies)}
+        self._add_new_proxies_to_memory(list(unique_proxy_lines))
+        return {"message": "Proxies loaded successfully.", "total": len(self.proxies)}
 
     def save_state_to_pickle(self, pickle_path: str):
         """Saves the entire ProxyManager object state to a pickle file."""
@@ -257,20 +298,11 @@ class ProxyManager:
         """Gets a random proxy from the source's available pool."""
         with self.lock:
             if source not in self.sources:
-                logger.warning(
-                    f"Requested source '{source}' is unknown. Add it first via the API."
-                )
                 return None
-
             source_pool = self.available_pools.get(source, [])
             source_stats = self.stats.get(source, {})
-
             if len(source_pool) < self.min_pool_size:
-                logger.warning(
-                    f"Pool for '{source}' has {len(source_pool)} proxies, below threshold {self.min_pool_size}. Attempting revival."
-                )
                 proxy_to_revive_url = None
-
                 successful_revival_candidates = [
                     p_url
                     for p_url, p_stat in source_stats.items()
@@ -278,9 +310,6 @@ class ProxyManager:
                 ]
                 if successful_revival_candidates:
                     proxy_to_revive_url = random.choice(successful_revival_candidates)
-                    logger.info(
-                        f"Reviving historically successful proxy for '{source}': {proxy_to_revive_url}"
-                    )
                 else:
                     all_banned_proxies = [
                         p_url
@@ -289,48 +318,35 @@ class ProxyManager:
                     ]
                     if all_banned_proxies:
                         proxy_to_revive_url = random.choice(all_banned_proxies)
-                        logger.warning(
-                            f"No successful proxies to revive. Reviving random banned proxy for '{source}': {proxy_to_revive_url}"
-                        )
-
                 if proxy_to_revive_url:
                     source_stats[proxy_to_revive_url]["is_banned"] = False
                     source_stats[proxy_to_revive_url]["consecutive_failures"] = 0
                     if proxy_to_revive_url not in source_pool:
                         source_pool.append(proxy_to_revive_url)
-
             if not source_pool:
-                logger.error(
-                    f"No available proxies for source '{source}' after revival attempt."
-                )
                 return None
-
             chosen_proxy_url = random.choice(source_pool)
             source_stats[chosen_proxy_url]["last_used"] = time.time()
             return chosen_proxy_url
 
     def process_feedback(self, feedback_data: Dict):
         """Processes feedback and updates the proxy's status."""
-        source = feedback_data.get("source")
-        proxy_url = feedback_data.get("proxy")
-        status = feedback_data.get("status")
-        response_time_ms = feedback_data.get("response_time_ms")
+        source, proxy_url, status, resp_time = (
+            feedback_data.get("source"),
+            feedback_data.get("proxy"),
+            feedback_data.get("status"),
+            feedback_data.get("response_time_ms"),
+        )
         logger.info(
-            f"Handled feedback: proxy-[{proxy_url}], source-[{source}], status-[{status}], time-[{response_time_ms}]"
+            f"Handled feedback: source={source}, proxy={proxy_url}, status={status}, resp_time={resp_time}"
         )
 
         if not all([source, proxy_url, status]):
             return False
-
         with self.lock:
             if source not in self.stats or proxy_url not in self.stats[source]:
-                logger.warning(
-                    f"Feedback for unknown proxy or source ignored: {source} - {proxy_url}"
-                )
                 return False
-
             stat = self.stats[source][proxy_url]
-
             if status == "success":
                 stat["success_count"] += 1
                 stat["consecutive_failures"] = 0
@@ -338,20 +354,6 @@ class ProxyManager:
                     stat["is_banned"] = False
                     if proxy_url not in self.available_pools.get(source, []):
                         self.available_pools.setdefault(source, []).append(proxy_url)
-                        logger.info(
-                            f"Reinstated proxy {proxy_url} for source '{source}' after success."
-                        )
-
-                if isinstance(response_time_ms, (int, float)) and response_time_ms >= 0:
-                    current_total_time = (
-                        stat["avg_response_time_ms"]
-                        if stat["avg_response_time_ms"] != float("inf")
-                        else 0
-                    ) * (stat["success_count"] - 1)
-                    new_total_time = current_total_time + response_time_ms
-                    stat["avg_response_time_ms"] = (
-                        new_total_time / stat["success_count"]
-                    )
             elif status == "failure":
                 stat["failure_count"] += 1
                 stat["consecutive_failures"] += 1
@@ -360,9 +362,6 @@ class ProxyManager:
                     and not stat["is_banned"]
                 ):
                     stat["is_banned"] = True
-                    logger.info(
-                        f"Proxy {proxy_url} has been banned for source '{source}'."
-                    )
                     if proxy_url in self.available_pools.get(source, []):
                         self.available_pools[source].remove(proxy_url)
             return True
@@ -384,25 +383,19 @@ def load_proxy_manager(pickle_path, config_path, proxy_path) -> ProxyManager:
     """Factory function to load or create a ProxyManager instance."""
     manager = None
     if os.path.exists(pickle_path):
-        logger.info(f"Attempting to load state from pickle file: {pickle_path}")
         try:
             with open(pickle_path, "rb") as f:
                 manager = pickle.load(f)
             logger.info("Successfully loaded manager state from pickle file.")
-            # Always reload config on start to apply changes
             manager.load_config(config_path)
         except Exception as e:
             logger.error(f"Failed to load from pickle file: {e}. Creating new manager.")
             manager = None
-
     if manager is None:
         manager = ProxyManager()
         manager.load_config(config_path)
-
-    # Always load/merge from proxies.txt to catch updates
     logger.info(f"Loading/merging proxies from text file: {proxy_path}")
     manager.load_proxies_from_file(proxy_path)
-
     return manager
 
 
@@ -442,7 +435,6 @@ def add_source():
     source = data.get("source")
     if not source:
         return jsonify({"error": "JSON body must contain a 'source' key."}), 400
-
     if proxy_manager.add_source(source, CONFIG_FILE_PATH):
         return jsonify({"message": f"Source '{source}' added successfully."})
     else:
@@ -451,7 +443,6 @@ def add_source():
 
 @app.route("/load-proxies", methods=["POST"])
 def load_proxies_endpoint():
-    """Manually triggers a hot-reload of the proxies.txt file."""
     logger.info("Hot-reload of proxies triggered via API.")
     result = proxy_manager.load_proxies_from_file(PROXY_FILE_PATH)
     return jsonify(result)
@@ -459,7 +450,6 @@ def load_proxies_endpoint():
 
 @app.route("/export-stats", methods=["GET"])
 def export_stats_endpoint():
-    """Manually triggers saving the current manager state to a pickle file."""
     proxy_manager.save_state_to_pickle(PICKLE_FILE_PATH)
     return jsonify({"message": f"Manager state saved to {PICKLE_FILE_PATH}"})
 
@@ -474,7 +464,8 @@ def get_source_stats_endpoint(source: str):
 
 
 def handle_shutdown(signal, frame):
-    logger.info("\nShutdown signal received, saving state...")
+    logger.info("\nShutdown signal received, saving state and stopping scheduler...")
+    proxy_manager.stop_scheduler()
     proxy_manager.save_state_to_pickle(PICKLE_FILE_PATH)
     sys.exit(0)
 
@@ -488,10 +479,10 @@ if __name__ == "__main__":
         logger.info(f"Creating a dummy proxy file at '{PROXY_FILE_PATH}'.")
         with open(PROXY_FILE_PATH, "w", encoding="utf-8") as f:
             f.write("# Add proxies here in the format: protocol:host:port\n")
-
-    # Initialize config if it doesn't exist
     if not os.path.exists(CONFIG_FILE_PATH):
-        # This will call _save_config within load_config, creating the file
         proxy_manager.load_config(CONFIG_FILE_PATH)
+
+    # --- [NEW] Start the background scheduler ---
+    proxy_manager.start_scheduler()
 
     app.run(host="0.0.0.0", port=6942, debug=True, use_reloader=False)
