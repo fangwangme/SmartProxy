@@ -1,0 +1,42 @@
+# ===================================================================
+# Intelligent Proxy Service V3.0 Configuration
+# ===================================================================
+
+[database]
+host = localhost
+port = 5432
+dbname = proxy_db
+user = proxy_user
+password = proxy_password
+
+[validator]
+# Target website for validating proxy liveness and anonymity.
+validation_target = http://httpbin.org/ip
+# Validation request timeout in seconds.
+validation_timeout_s = 10
+# Number of concurrent threads for the validation task.
+validation_workers = 150
+
+[scheduler]
+# The fixed interval in seconds at which the validation task is triggered.
+validation_interval_seconds = 100
+
+[source_pool]
+# A proxy's score for a source will be banned if it drops to or below this value.
+score_threshold_ban = -15
+# The cooldown period in minutes before a banned proxy can be used again for a source.
+cooldown_minutes = 30
+
+# ===================================================================
+# Dynamic Proxy Source Definitions
+# ===================================================================
+# You can add any number of proxy sources. Follow the [proxy_source_NAME] format.
+# Each source will be fetched automatically based on its independent update interval.
+
+[proxy_source_http_list_A]
+# The URL of the proxy list.
+url = https://raw.githubusercontent.com/tuanminpay/live-proxy/master/http.txt
+# The update interval for this specific source in minutes.
+update_interval_minutes = 10
+# (Optional) If the file contains ip:port format, this protocol will be prepended.
+default_protocol = http
