@@ -12,8 +12,6 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import psycopg2
 import psycopg2.pool
-
-# --- [FIXED] Missing import for extras module ---
 import psycopg2.extras
 import requests
 from flask import Flask, jsonify, request
@@ -68,7 +66,6 @@ class DatabaseManager:
         """Inserts a list of proxies, ignoring duplicates."""
         if not proxies:
             return
-        # --- [OPTIMIZED] Using execute_values for better performance ---
         query = """
             INSERT INTO proxies (protocol, ip, port) VALUES %s
             ON CONFLICT (protocol, ip, port) DO NOTHING;
@@ -151,6 +148,8 @@ class ProxyManager:
         self.validation_target = self.config.get(
             "validator", "validation_target", fallback="http://httpbin.org/get"
         )
+        # --- [NEW] State flag to prevent overlapping validation cycles ---
+        self.is_validating = False
 
     def _load_fetcher_jobs(self) -> List[Dict]:
         """Loads proxy source jobs from the config file."""
@@ -241,42 +240,57 @@ class ProxyManager:
             return False
 
     def _run_validation_cycle(self):
-        """Runs a full validation cycle on proxies from the database."""
-        proxies_to_validate = self.db.get_proxies_to_validate()
-        if not proxies_to_validate:
-            logger.info("Validation cycle skipped: no proxies to validate.")
-            return
+        """Runs a full validation cycle, ensuring no overlap with a previous run."""
+        with self.lock:
+            if self.is_validating:
+                logger.warning(
+                    "Validation cycle is already in progress. Skipping this scheduled run."
+                )
+                return
+            self.is_validating = True
 
-        total_to_validate = len(proxies_to_validate)
-        logger.info(f"Starting validation for {total_to_validate} proxies...")
+        try:
+            proxies_to_validate = self.db.get_proxies_to_validate()
+            if not proxies_to_validate:
+                logger.info("Validation cycle skipped: no proxies to validate.")
+                return
 
-        success_count = 0
-        processed_count = 0
+            total_to_validate = len(proxies_to_validate)
+            logger.info(f"Starting validation for {total_to_validate} proxies...")
 
-        with ThreadPoolExecutor(max_workers=self.validation_workers) as executor:
-            future_to_proxy = {
-                executor.submit(
-                    self._validate_proxy, proxy_id, f"{protocol}://{ip}:{port}"
-                ): proxy_id
-                for proxy_id, protocol, ip, port in proxies_to_validate
-            }
+            success_count = 0
+            processed_count = 0
 
-            for future in as_completed(future_to_proxy):
-                processed_count += 1
-                result = future.result()
-                if result:
-                    success_count += 1
+            with ThreadPoolExecutor(max_workers=self.validation_workers) as executor:
+                future_to_proxy = {
+                    executor.submit(
+                        self._validate_proxy, proxy_id, f"{protocol}://{ip}:{port}"
+                    ): proxy_id
+                    for proxy_id, protocol, ip, port in proxies_to_validate
+                }
 
-                # --- [NEW] Added progress logging ---
-                if processed_count % 100 == 0 or processed_count == total_to_validate:
-                    logger.info(
-                        f"Validation progress: {processed_count}/{total_to_validate} proxies checked."
-                    )
+                for future in as_completed(future_to_proxy):
+                    processed_count += 1
+                    result = future.result()
+                    if result:
+                        success_count += 1
 
-        logger.info(
-            f"Validation cycle finished. Success: {success_count}, Failed: {total_to_validate - success_count}."
-        )
-        self._sync_active_proxies_from_db()
+                    if (
+                        processed_count % 100 == 0
+                        or processed_count == total_to_validate
+                    ):
+                        logger.info(
+                            f"Validation progress: {processed_count}/{total_to_validate} proxies checked."
+                        )
+
+            logger.info(
+                f"Validation cycle finished. Success: {success_count}, Failed: {total_to_validate - success_count}."
+            )
+            self._sync_active_proxies_from_db()
+        finally:
+            with self.lock:
+                self.is_validating = False
+            logger.info("Validation cycle lock released.")
 
     def _sync_active_proxies_from_db(self):
         """Updates the in-memory set of active proxies from the database."""
@@ -417,24 +431,20 @@ def load_proxy_manager(config_path: str) -> ProxyManager:
     logger.info("Initializing ProxyManager...")
     manager = ProxyManager(config_path)
 
-    # --- [MODIFIED] Simplified startup: always sync from DB ---
     manager._sync_active_proxies_from_db()
 
-    # --- [MODIFIED] Cold start is now determined by whether the DB has active proxies ---
     if not manager.active_proxies:
         logger.warning(
             "Cold start detected (no active proxies in DB). Running initial synchronous fetch and validation..."
         )
-        # Run fetch jobs synchronously first
         fetch_futures = [
             manager.fetch_executor.submit(manager._fetch_and_parse_source, job)
             for job in manager.fetcher_jobs
         ]
         for future in as_completed(fetch_futures):
-            pass  # Wait for all fetchers to finish
+            pass
         logger.info("Initial fetch complete.")
 
-        # Then run validation
         manager._run_validation_cycle()
         logger.info("Initial validation complete. Service is ready.")
 
@@ -443,7 +453,6 @@ def load_proxy_manager(config_path: str) -> ProxyManager:
 
 # --- Flask API Server ---
 app = Flask(__name__)
-# --- [MODIFIED] Removed pickle path from load function call ---
 proxy_manager = load_proxy_manager(CONFIG_FILE_PATH)
 
 
@@ -481,7 +490,6 @@ def feedback():
 def handle_shutdown(signal, frame):
     logger.info("Shutdown signal received. Stopping scheduler...")
     proxy_manager.stop_scheduler()
-    # --- [REMOVED] No longer saving stats to pickle on shutdown ---
     sys.exit(0)
 
 
@@ -489,5 +497,4 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, handle_shutdown)
     signal.signal(signal.SIGTERM, handle_shutdown)
     proxy_manager.start_scheduler()
-    # --- [FIXED] Changed port back to 6942 for consistency ---
     app.run(host="0.0.0.0", port=6952, debug=False)
