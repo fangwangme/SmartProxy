@@ -296,6 +296,8 @@ class ProxyManager:
                     f"Validation cycle finished. Success: {success_count}, Failed: {total_to_validate - success_count}."
                 )
                 self._sync_active_proxies_from_db()
+        except Exception as e:
+            logger.warning(f"Failed to validate proxies due to {e}", exc_info=True)
         finally:
             with self.lock:
                 self.is_validating = False
