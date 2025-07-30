@@ -100,7 +100,6 @@ class DatabaseManager:
         """
         return self._execute(query, (interval_minutes,), fetch="all") or []
 
-    # --- [NEW] Method to get recent failed proxies for re-validation ---
     def get_recent_failed_proxies(self, limit: int) -> List[Tuple[int, str]]:
         """Selects the most recently inserted proxies that are currently inactive."""
         query = """
@@ -146,7 +145,10 @@ class ProxyManager:
 
         # --- In-Memory State ---
         self.active_proxies: Set[str] = set()
+        # [MODIFIED] Full stats pool for all proxies
         self.source_stats: Dict[str, Dict[str, Dict]] = {}
+        # [NEW] Top-K available proxy pool for fast retrieval
+        self.available_proxies: Dict[str, List[str]] = {}
 
         # --- Load Configurable Settings ---
         self._load_config()
@@ -198,10 +200,6 @@ class ProxyManager:
         self.max_pool_size = self.config.getint(
             "source_pool", "max_pool_size", fallback=500
         )
-        self.cooldown_minutes = self.config.getint(
-            "source_pool", "cooldown_minutes", fallback=30
-        )
-        # Penalties are stored as a list of integers
         penalties_str = self.config.get(
             "source_pool", "failure_penalties", fallback="-1, -10, -100"
         )
@@ -209,24 +207,22 @@ class ProxyManager:
         logger.info("Configuration loaded.")
 
     def _initialize_source_pools(self):
-        """Initializes in-memory stats for all predefined sources."""
+        """Initializes in-memory stats and available pools for all predefined sources."""
         with self.lock:
             for source in self.predefined_sources:
                 if source not in self.source_stats:
                     self.source_stats[source] = {}
+                    self.available_proxies[source] = []
             logger.info(
                 f"Initialized in-memory pools for sources: {self.predefined_sources}"
             )
 
-    # --- [NEW] Method to dynamically reload sources ---
     def reload_sources_from_config(self) -> Dict:
         """
         Reloads the predefined sources from the config file, adding new ones
         and removing deprecated ones from the in-memory state.
         """
         logger.info(f"Attempting to hot-reload sources from {self.config_path}...")
-
-        # Read the new configuration
         new_config = configparser.ConfigParser()
         new_config.read(self.config_path, encoding="utf-8")
         new_sources_str = new_config.get(
@@ -241,26 +237,27 @@ class ProxyManager:
 
         with self.lock:
             current_sources_set = self.predefined_sources
-
             added_sources = new_sources_set - current_sources_set
             removed_sources = current_sources_set - new_sources_set
 
-            # Remove deprecated sources
             for source in removed_sources:
                 if source in self.source_stats:
                     del self.source_stats[source]
+                if source in self.available_proxies:
+                    del self.available_proxies[source]
                 logger.info(f"Removed deprecated source from memory: {source}")
 
-            # Add new sources
             for source in added_sources:
-                self.source_stats[source] = {
-                    url: self._get_new_source_stat() for url in self.active_proxies
-                }
-                logger.info(
-                    f"Added new source to memory: {source}, initialized with {len(self.source_stats[source])} active proxies."
-                )
+                self.source_stats[source] = {}
+                self.available_proxies[source] = []
+                # Immediately populate with existing active proxies
+                for url in self.active_proxies:
+                    self.source_stats[source][url] = self._get_new_proxy_stat()
+                logger.info(f"Added new source to memory: {source}")
 
-            # Update the main configuration
+            # After adding/removing, re-sync and select top K
+            self._sync_and_select_top_proxies()
+
             self.predefined_sources = new_sources_set
             self.default_source = new_default_source
 
@@ -361,20 +358,16 @@ class ProxyManager:
 
         try:
             proxies_to_validate = self.db.get_proxies_to_validate()
-
-            # --- [NEW] Smart supplementation logic ---
             if len(proxies_to_validate) < self.validation_supplement_threshold:
                 supplement_needed = self.validation_supplement_threshold - len(
                     proxies_to_validate
                 )
                 logger.info(
-                    f"Validation pool is below threshold. Supplementing with {supplement_needed} recent failed proxies."
+                    f"Validation pool below threshold. Supplementing with {supplement_needed} recent failed proxies."
                 )
                 recent_failed = self.db.get_recent_failed_proxies(
                     limit=supplement_needed
                 )
-
-                # Avoid duplicates
                 existing_ids = {p[0] for p in proxies_to_validate}
                 for p in recent_failed:
                     if p[0] not in existing_ids:
@@ -388,59 +381,68 @@ class ProxyManager:
             logger.info(f"Starting validation for {total_to_validate} proxies...")
 
             success_count = 0
-            processed_count = 0
             with ThreadPoolExecutor(max_workers=self.validation_workers) as executor:
                 future_to_proxy = {
                     executor.submit(
                         self._validate_proxy, p[0], f"{p[1]}://{p[2]}:{p[3]}"
-                    ): p[0]
+                    ): p
                     for p in proxies_to_validate
                 }
                 for future in as_completed(future_to_proxy):
-                    processed_count += 1
                     try:
                         if future.result():
                             success_count += 1
                     except Exception as exc:
                         logger.error(f"Proxy validation generated an exception: {exc}")
-                    if (
-                        processed_count % 100 == 0
-                        or processed_count == total_to_validate
-                    ):
-                        logger.info(
-                            f"Validation progress: {processed_count}/{total_to_validate} proxies checked."
-                        )
 
             logger.info(
                 f"Validation cycle finished. Success: {success_count}, Failed: {total_to_validate - success_count}."
             )
-            self._sync_source_pools_after_validation()
+            # [MODIFIED] Call the new sync and select method
+            self._sync_and_select_top_proxies()
         finally:
             with self.lock:
                 self.is_validating = False
             logger.info("Validation cycle lock released.")
 
-    def _sync_source_pools_after_validation(self):
-        """Adds new active proxies to source pools and truncates to max size."""
-        logger.info("Syncing source pools after validation...")
+    # [REPLACED] Replaced _sync_source_pools_after_validation with this new method
+    def _sync_and_select_top_proxies(self):
+        """
+        Syncs stats with all active proxies, resets stats for new ones,
+        then sorts and selects the top K proxies for the available pool.
+        """
+        logger.info("Syncing and selecting Top-K proxies for all sources...")
         newly_active_proxies = self.db.get_active_proxies()
+
         with self.lock:
             self.active_proxies = newly_active_proxies
-            for source in self.predefined_sources:
-                pool = self.source_stats[source]
-                # Add new proxies
-                for proxy_url in self.active_proxies:
-                    if proxy_url not in pool:
-                        pool[proxy_url] = self._get_new_source_stat()
 
-                # Sort by score and truncate
+            for source in self.predefined_sources:
+                stats_pool = self.source_stats.get(source, {})
+
+                # 1. Add all active proxies to the stats pool and reset their stats
+                for proxy_url in self.active_proxies:
+                    # Whether it's new or existing, reset its stats to give it a fresh start
+                    stats_pool[proxy_url] = self._get_new_proxy_stat()
+
+                # 2. Sort the entire stats pool by score
+                # Items are (proxy_url, stat_dict)
                 sorted_proxies = sorted(
-                    pool.items(), key=lambda item: item[1]["score"], reverse=True
+                    stats_pool.items(), key=lambda item: item[1]["score"], reverse=True
                 )
-                self.source_stats[source] = dict(sorted_proxies[: self.max_pool_size])
+
+                # 3. Select the Top K proxies and update the available pool
+                top_k_proxies = [
+                    proxy_url for proxy_url, _ in sorted_proxies[: self.max_pool_size]
+                ]
+                self.available_proxies[source] = top_k_proxies
+
+                # Optional: Trim the main stats pool to save memory, though not strictly necessary
+                self.source_stats[source] = dict(sorted_proxies)
 
                 logger.info(
-                    f"Source '{source}' synced. New pool size: {len(self.source_stats[source])}"
+                    f"Source '{source}' synced. Total proxies in stats: {len(self.source_stats[source])}. "
+                    f"Selected Top {len(self.available_proxies[source])} for active pool."
                 )
 
     def _scheduler_loop(self):
@@ -477,83 +479,72 @@ class ProxyManager:
             self.scheduler_thread.join(timeout=10)
             logger.info("Background scheduler stopped.")
 
-    def _get_new_source_stat(self) -> Dict:
+    # [MODIFIED] Renamed from _get_new_source_stat
+    def _get_new_proxy_stat(self) -> Dict:
+        """Returns a clean, default state for a proxy."""
         return {
             "score": 0,
             "success_count": 0,
             "failure_count": 0,
             "consecutive_failures": 0,
-            "is_banned": False,
-            "banned_until": None,
         }
 
     def _get_source_or_default(self, source: str) -> str:
         """Returns the source if predefined, otherwise returns the default source."""
         return source if source in self.predefined_sources else self.default_source
 
+    # [MODIFIED] Get proxy logic is now much simpler
     def get_proxy(self, source: str) -> Optional[str]:
-        """Gets a high-scoring proxy for a specific source from in-memory stats."""
+        """Gets a random proxy from the pre-selected available pool for a source."""
         source = self._get_source_or_default(source)
         with self.lock:
-            stats = self.source_stats.get(source, {})
-            now = time.time()
-            available_proxies = []
-            for proxy_url, stat_data in stats.items():
-                if stat_data["is_banned"]:
-                    if stat_data["banned_until"] and now > stat_data["banned_until"]:
-                        stat_data.update(
-                            {
-                                "is_banned": False,
-                                "banned_until": None,
-                                "score": 0,
-                                "consecutive_failures": 0,
-                            }
-                        )
-                        available_proxies.append({"url": proxy_url, **stat_data})
-                else:
-                    available_proxies.append({"url": proxy_url, **stat_data})
-            if not available_proxies:
+            proxy_pool = self.available_proxies.get(source)
+            if not proxy_pool:
                 return None
-            weights = [max(p["score"], 0) + 1 for p in available_proxies]
-            return random.choices(available_proxies, weights=weights, k=1)[0]["url"]
+            return random.choice(proxy_pool)
 
+    # [MODIFIED] Feedback logic with score reset
     def process_feedback(self, source: str, proxy_url: str, status: str):
-        """Processes feedback in-memory with exponential penalties."""
+        """Processes feedback, updating scores in the main stats pool."""
         source = self._get_source_or_default(source)
         with self.lock:
+            # Feedback always updates the main stats pool, not the available pool
             stat = self.source_stats.get(source, {}).get(proxy_url)
             if not stat:
                 return
+
             if status == "success":
                 stat["success_count"] += 1
-                stat["score"] += 1
+                # [NEW] If it was failing before, a single success resets its score to 1
+                if stat["consecutive_failures"] > 0:
+                    stat["score"] = 1
+                else:
+                    stat["score"] += 1
                 stat["consecutive_failures"] = 0  # Reset on success
+
             elif status == "failure":
                 stat["failure_count"] += 1
                 stat["consecutive_failures"] += 1
-                # --- [NEW] Exponential penalty logic ---
+
                 penalty_index = min(
                     stat["consecutive_failures"] - 1, len(self.failure_penalties) - 1
                 )
                 penalty = self.failure_penalties[penalty_index]
                 stat["score"] += penalty
                 logger.info(
-                    f"Proxy {proxy_url} failed consecutively {stat['consecutive_failures']} times for source '{source}'. Applying penalty: {penalty}. New score: {stat['score']}"
+                    f"Proxy {proxy_url} failed for source '{source}'. "
+                    f"Penalty: {penalty}. New score: {stat['score']}"
                 )
-
-                if stat["score"] <= self.config.getint(
-                    "source_pool", "score_threshold_ban", fallback=-15
-                ):
-                    stat["is_banned"] = True
-                    stat["banned_until"] = time.time() + (self.cooldown_minutes * 60)
-                    logger.warning(f"Proxy {proxy_url} banned for source '{source}'.")
+        # Note: We do not re-sort the available_proxies pool on every feedback call.
+        # It is only updated after the next validation cycle. This is more efficient.
 
 
 def load_proxy_manager(config_path: str) -> ProxyManager:
     """Loads ProxyManager and initializes its state."""
     logger.info("Initializing ProxyManager...")
     manager = ProxyManager(config_path)
-    manager._sync_source_pools_after_validation()
+    # [MODIFIED] Initial sync logic
+    manager._sync_and_select_top_proxies()
     if not manager.active_proxies:
         logger.warning(
             "Cold start detected. Running initial synchronous fetch and validation..."
@@ -564,6 +555,7 @@ def load_proxy_manager(config_path: str) -> ProxyManager:
         ]
         for future in as_completed(fetch_futures):
             pass
+        # This will run validation and then the new _sync_and_select_top_proxies method
         manager._run_validation_cycle()
         logger.info("Initial validation complete.")
     return manager
@@ -607,7 +599,6 @@ def feedback():
     return jsonify({"message": "Feedback received."})
 
 
-# --- [NEW] Endpoint to dynamically reload sources ---
 @app.route("/reload-sources", methods=["POST"])
 def reload_sources():
     """Dynamically reloads the source configuration from the config file."""
