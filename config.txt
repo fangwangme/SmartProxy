@@ -37,8 +37,6 @@ default_source = default
 [source_pool]
 # [NEW] The maximum number of proxies to keep in the in-memory pool for each source.
 max_pool_size = 500
-score_threshold_ban = -15
-cooldown_minutes = 30
 # The Nth penalty is used for N consecutive failures.
 # The last penalty is used for all subsequent failures.
 failure_penalties = -1, -10, -100
