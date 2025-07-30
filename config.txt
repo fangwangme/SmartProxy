@@ -5,13 +5,12 @@
 [server]
 port = 6942
 
-
 [database]
 host = localhost
 port = 5432
 dbname = proxy_db
 user = proxy_user
-password = proxy_password
+password = hell02025
 
 [validator]
 # Target website for validating proxy liveness and anonymity.
@@ -20,16 +19,29 @@ validation_target = http://httpbin.org/ip
 validation_timeout_s = 10
 # Number of concurrent threads for the validation task.
 validation_workers = 150
+# supplement with recent failed proxies.
+validation_supplement_threshold = 2000
 
 [scheduler]
 # The fixed interval in seconds at which the validation task is triggered.
-validation_interval_seconds = 100
+validation_interval_seconds = 120
+
+
+[sources]
+# [NEW] A comma-separated list of all predefined, valid source names.
+predefined_sources = insolvencydirect, localch, tripadvisor, default
+# [NEW] If a request uses a source not in the list above, it will be mapped to this one.
+default_source = default
+
 
 [source_pool]
-# A proxy's score for a source will be banned if it drops to or below this value.
+# [NEW] The maximum number of proxies to keep in the in-memory pool for each source.
+max_pool_size = 500
 score_threshold_ban = -15
-# The cooldown period in minutes before a banned proxy can be used again for a source.
 cooldown_minutes = 30
+# The Nth penalty is used for N consecutive failures.
+# The last penalty is used for all subsequent failures.
+failure_penalties = -1, -10, -100
 
 # ===================================================================
 # Dynamic Proxy Source Definitions
