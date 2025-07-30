@@ -137,6 +137,7 @@ class ProxyManager:
     """Manages the proxy lifecycle, state, and business logic."""
 
     def __init__(self, config_path):
+        self.config_path = config_path
         self.config = configparser.ConfigParser()
         self.config.read(config_path, encoding="utf-8")
 
@@ -216,6 +217,58 @@ class ProxyManager:
             logger.info(
                 f"Initialized in-memory pools for sources: {self.predefined_sources}"
             )
+
+    # --- [NEW] Method to dynamically reload sources ---
+    def reload_sources_from_config(self) -> Dict:
+        """
+        Reloads the predefined sources from the config file, adding new ones
+        and removing deprecated ones from the in-memory state.
+        """
+        logger.info(f"Attempting to hot-reload sources from {self.config_path}...")
+
+        # Read the new configuration
+        new_config = configparser.ConfigParser()
+        new_config.read(self.config_path, encoding="utf-8")
+        new_sources_str = new_config.get(
+            "sources", "predefined_sources", fallback="default"
+        )
+        new_sources_set = {s.strip() for s in new_sources_str.split(",") if s.strip()}
+        new_default_source = new_config.get(
+            "sources", "default_source", fallback="default"
+        )
+        if new_default_source not in new_sources_set:
+            new_sources_set.add(new_default_source)
+
+        with self.lock:
+            current_sources_set = self.predefined_sources
+
+            added_sources = new_sources_set - current_sources_set
+            removed_sources = current_sources_set - new_sources_set
+
+            # Remove deprecated sources
+            for source in removed_sources:
+                if source in self.source_stats:
+                    del self.source_stats[source]
+                logger.info(f"Removed deprecated source from memory: {source}")
+
+            # Add new sources
+            for source in added_sources:
+                self.source_stats[source] = {
+                    url: self._get_new_source_stat() for url in self.active_proxies
+                }
+                logger.info(
+                    f"Added new source to memory: {source}, initialized with {len(self.source_stats[source])} active proxies."
+                )
+
+            # Update the main configuration
+            self.predefined_sources = new_sources_set
+            self.default_source = new_default_source
+
+        result = {"added": list(added_sources), "removed": list(removed_sources)}
+        logger.info(
+            f"Source reload complete. Added: {len(added_sources)}, Removed: {len(removed_sources)}."
+        )
+        return result
 
     def _load_fetcher_jobs(self) -> List[Dict]:
         """Loads proxy source jobs from the config file."""
@@ -552,6 +605,14 @@ def feedback():
         return jsonify({"error": "Invalid feedback data."}), 400
     proxy_manager.process_feedback(source, proxy_url, status)
     return jsonify({"message": "Feedback received."})
+
+
+# --- [NEW] Endpoint to dynamically reload sources ---
+@app.route("/reload-sources", methods=["POST"])
+def reload_sources():
+    """Dynamically reloads the source configuration from the config file."""
+    result = proxy_manager.reload_sources_from_config()
+    return jsonify(result)
 
 
 def handle_shutdown(signal, frame):
