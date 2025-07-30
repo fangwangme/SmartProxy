@@ -471,7 +471,7 @@ def get_proxy():
         return jsonify({"error": "Query parameter 'source' is required."}), 400
     proxy_url = proxy_manager.get_proxy(source)
     if proxy_url:
-        return jsonify({"proxy": proxy_url})
+        return jsonify({"http": proxy_url, "https": proxy_url})
     else:
         return (
             jsonify(
@@ -484,11 +484,13 @@ def get_proxy():
 @app.route("/feedback", methods=["POST"])
 def feedback():
     data = request.json
-    source, proxy_url, status = (
+    source, proxy_url, status, resp_time = (
         data.get("source"),
         data.get("proxy"),
         data.get("status"),
+        data.get("response_time_ms"),
     )
+    logger.info(f"Handled feedback: {source} - {status} - {proxy_url} - {resp_time}")
     if not all([source, proxy_url, status]) or status not in ["success", "failure"]:
         return jsonify({"error": "Invalid feedback data."}), 400
     proxy_manager.process_feedback(source, proxy_url, status)
