@@ -218,7 +218,9 @@ class ProxyManager:
             logger.info(
                 f"Parsed {len(proxies_to_insert)} valid proxies from {job['name']}."
             )
-            self.db.insert_proxies(proxies_to_insert)
+            # --- [FIXED] Acquire lock before writing to the database to prevent deadlock ---
+            with self.lock:
+                self.db.insert_proxies(proxies_to_insert)
         except requests.RequestException as e:
             logger.error(f"Failed to fetch from {job['name']} ({url}): {e}")
 
@@ -280,9 +282,14 @@ class ProxyManager:
 
                     for future in as_completed(future_to_proxy):
                         processed_count += 1
-                        result = future.result()
-                        if result:
-                            success_count += 1
+                        try:
+                            result = future.result()
+                            if result:
+                                success_count += 1
+                        except Exception as exc:
+                            logger.error(
+                                f"Proxy validation generated an exception: {exc}"
+                            )
 
                         if (
                             processed_count % 100 == 0
@@ -296,8 +303,6 @@ class ProxyManager:
                     f"Validation cycle finished. Success: {success_count}, Failed: {total_to_validate - success_count}."
                 )
                 self._sync_active_proxies_from_db()
-        except Exception as e:
-            logger.warning(f"Failed to validate proxies due to {e}", exc_info=True)
         finally:
             with self.lock:
                 self.is_validating = False
