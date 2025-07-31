@@ -1,407 +1,569 @@
-# smart_proxy_server.py
-from flask import Flask, request, jsonify
-import requests
+# -*- coding: utf-8 -*-
+import configparser
+import json
+import os
 import random
-import threading
-import time
 import signal
 import sys
-import os
-import pickle
-import configparser
-from typing import List, Dict, Optional, Set
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Dict, List, Optional, Set, Tuple
+
+import psycopg2
+import psycopg2.pool
+import psycopg2.extras
+import requests
+from flask import Flask, jsonify, request
+
 from logger import logger
 
-# --- Configuration File Paths ---
-DATA_DIR = "data"
-CONFIG_FILE_PATH = os.path.join(DATA_DIR, "config.ini")
-PROXY_FILE_PATH = os.path.join(
-    DATA_DIR, "proxies.txt"
-)  # Still used for initial manual load
-PICKLE_FILE_PATH = os.path.join(DATA_DIR, "proxy_manager.pkl")
+# --- Configuration & Constants ---
+CONFIG_FILE_PATH = os.path.join("./", "config.ini")
 
 
-# --- Core Logic: Proxy Manager ---
+class DatabaseManager:
+    """Handles all interactions with the PostgreSQL database."""
+
+    def __init__(self, config):
+        try:
+            self.pool = psycopg2.pool.SimpleConnectionPool(
+                minconn=1,
+                maxconn=10,
+                host=config.get("database", "host"),
+                port=config.get("database", "port"),
+                dbname=config.get("database", "dbname"),
+                user=config.get("database", "user"),
+                password=config.get("database", "password"),
+            )
+            logger.info("Database connection pool created successfully.")
+        except (configparser.NoSectionError, psycopg2.OperationalError) as e:
+            logger.error(f"Database configuration error or connection failed: {e}")
+            sys.exit(1)
+
+    def _execute(self, query, params=None, fetch=None):
+        """A helper to execute queries using a connection from the pool."""
+        conn = None
+        try:
+            conn = self.pool.getconn()
+            with conn.cursor() as cur:
+                cur.execute(query, params)
+                if fetch == "one":
+                    return cur.fetchone()
+                if fetch == "all":
+                    return cur.fetchall()
+                conn.commit()
+        except psycopg2.Error as e:
+            logger.error(f"Database query failed: {e}")
+            if conn:
+                conn.rollback()
+            return None
+        finally:
+            if conn:
+                self.pool.putconn(conn)
+
+    def insert_proxies(self, proxies: List[Tuple[str, str, int]]):
+        """Inserts a list of proxies, ignoring duplicates, and logs the actual count."""
+        if not proxies:
+            return
+        query = """
+            INSERT INTO proxies (protocol, ip, port) VALUES %s
+            ON CONFLICT (protocol, ip, port) DO NOTHING;
+        """
+        conn = None
+        inserted_count = 0
+        try:
+            conn = self.pool.getconn()
+            with conn.cursor() as cur:
+                psycopg2.extras.execute_values(cur, query, proxies)
+                inserted_count = cur.rowcount
+                conn.commit()
+            logger.info(
+                f"Attempted to insert {len(proxies)} proxies. "
+                f"Successfully inserted {inserted_count} new proxies. "
+                f"{len(proxies) - inserted_count} were duplicates."
+            )
+        except psycopg2.Error as e:
+            logger.error(f"Database batch insert failed: {e}")
+            if conn:
+                conn.rollback()
+        finally:
+            if conn:
+                self.pool.putconn(conn)
+
+    def get_proxies_to_validate(self, interval_minutes=30) -> List[Tuple[int, str]]:
+        """Selects proxies that need validation (unvalidated or previously active)."""
+        query = """
+            SELECT id, protocol, ip, port FROM proxies
+            WHERE last_validated_at IS NULL 
+            OR (is_active = true AND last_validated_at < NOW() - INTERVAL '%s minutes');
+        """
+        return self._execute(query, (interval_minutes,), fetch="all") or []
+
+    def get_recent_failed_proxies(self, limit: int) -> List[Tuple[int, str]]:
+        """Selects the most recently inserted proxies that are currently inactive."""
+        query = """
+            SELECT id, protocol, ip, port FROM proxies
+            WHERE is_active = false
+            ORDER BY created_at DESC
+            LIMIT %s;
+        """
+        return self._execute(query, (limit,), fetch="all") or []
+
+    def update_proxy_validation_result(
+        self,
+        proxy_id: int,
+        is_active: bool,
+        latency: Optional[int],
+        anonymity: Optional[str],
+    ):
+        """Updates a proxy's record after a validation attempt."""
+        query = """
+            UPDATE proxies 
+            SET is_active = %s, latency_ms = %s, anonymity_level = %s, last_validated_at = NOW()
+            WHERE id = %s;
+        """
+        self._execute(query, (is_active, latency, anonymity, proxy_id))
+
+    def get_active_proxies(self) -> Set[str]:
+        """Gets the set of all currently active proxy URLs."""
+        query = "SELECT protocol, ip, port FROM proxies WHERE is_active = true;"
+        rows = self._execute(query, fetch="all")
+        return {f"{row[0]}://{row[1]}:{row[2]}" for row in rows} if rows else set()
+
+
 class ProxyManager:
-    """
-    Manages proxy loading, selection, and performance statistics.
-    This class is thread-safe.
-    """
+    """Manages the proxy lifecycle, state, and business logic."""
 
-    def __init__(self):
-        self.proxies: List[Dict] = []
-        self.stats: Dict[str, Dict] = {}
-        self.available_pools: Dict[str, List[str]] = {}
-        self.sources: Set[str] = set()
+    def __init__(self, config_path):
+        self.config_path = config_path
+        self.config = configparser.ConfigParser()
+        self.config.read(config_path, encoding="utf-8")
+
+        self.db = DatabaseManager(self.config)
         self.lock = threading.Lock()
-        # Default settings, will be overwritten by config file
-        self.consecutive_failure_threshold = 5
-        self.min_pool_size = 100
-        self.use_authenticated_proxies = False
 
-        # --- [NEW] Scheduler components ---
+        # --- In-Memory State ---
+        self.active_proxies: Set[str] = set()
+        # [MODIFIED] Full stats pool for all proxies
+        self.source_stats: Dict[str, Dict[str, Dict]] = {}
+        # [NEW] Top-K available proxy pool for fast retrieval
+        self.available_proxies: Dict[str, List[str]] = {}
+
+        # --- Load Configurable Settings ---
+        self._load_config()
+        self._initialize_source_pools()
+
+        # --- Scheduler & Components ---
+        self.fetcher_jobs = self._load_fetcher_jobs()
         self.scheduler_thread = None
         self.stop_scheduler_event = threading.Event()
-        self.proxy_source_urls = {}
-        self.update_interval_seconds = 300
-
-        logger.info("ProxyManager initialized an empty instance.")
-
-    def load_config(self, config_path: str):
-        """Loads sources and settings from the configuration file."""
-        with self.lock:
-            config = configparser.ConfigParser()
-            self.sources = {"insolvencydirect", "test"}
-
-            if os.path.exists(config_path):
-                config.read(config_path, encoding="utf-8")
-                sources_str = config.get(
-                    "sources", "default_sources", fallback="insolvencydirect,test"
-                )
-                self.sources = {s.strip() for s in sources_str.split(",") if s.strip()}
-                logger.info(f"Loaded sources from config: {self.sources}")
-
-                self.consecutive_failure_threshold = config.getint(
-                    "settings", "consecutive_failure_threshold", fallback=5
-                )
-                self.min_pool_size = config.getint(
-                    "settings", "min_pool_size", fallback=100
-                )
-                self.use_authenticated_proxies = config.getboolean(
-                    "settings", "use_authenticated_proxies", fallback=False
-                )
-
-                # --- [NEW] Load auto-fetch settings ---
-                self.update_interval_seconds = config.getint(
-                    "proxy_sources", "update_interval_seconds", fallback=300
-                )
-                self.proxy_source_urls["http"] = config.get(
-                    "proxy_sources", "http_url", fallback=None
-                )
-                self.proxy_source_urls["socks5"] = config.get(
-                    "proxy_sources", "socks5_url", fallback=None
-                )
-
-                logger.info(
-                    f"Loaded settings: FailureThreshold={self.consecutive_failure_threshold}, MinPoolSize={self.min_pool_size}"
-                )
-                logger.info(
-                    f"Auto-fetch enabled for URLs with interval {self.update_interval_seconds}s."
-                )
-            else:
-                logger.warning(
-                    f"Config file not found. Using default sources and settings."
-                )
-
-            self._ensure_sources_initialized()
-            self._save_config(config_path)
-
-    def _save_config(self, config_path: str):
-        """Saves the current sources and settings. MUST be called within a locked context."""
-        config = configparser.ConfigParser()
-        config["sources"] = {"default_sources": ",".join(sorted(list(self.sources)))}
-        config["settings"] = {
-            "consecutive_failure_threshold": str(self.consecutive_failure_threshold),
-            "min_pool_size": str(self.min_pool_size),
-            "use_authenticated_proxies": str(self.use_authenticated_proxies),
-        }
-        # --- [NEW] Save auto-fetch settings ---
-        config["proxy_sources"] = {
-            "update_interval_seconds": str(self.update_interval_seconds),
-            "http_url": self.proxy_source_urls.get("http", ""),
-            "socks5_url": self.proxy_source_urls.get("socks5", ""),
-        }
-        os.makedirs(os.path.dirname(config_path), exist_ok=True)
-        with open(config_path, "w", encoding="utf-8") as configfile:
-            config.write(configfile)
-        logger.info(f"Saved config to {config_path}")
-
-    # --- [NEW] The main loop for the background scheduler thread ---
-    def _auto_fetch_loop(self):
-        logger.info("Auto-fetch scheduler thread started.")
-        while not self.stop_scheduler_event.is_set():
-            try:
-                self._fetch_and_merge_proxies()
-            except Exception as e:
-                logger.error(f"Error in auto-fetch loop: {e}", exc_info=True)
-
-            # Wait for the next interval
-            self.stop_scheduler_event.wait(self.update_interval_seconds)
-        logger.info("Auto-fetch scheduler thread stopped.")
-
-    # --- [NEW] The core logic for fetching and merging proxies ---
-    def _fetch_and_merge_proxies(self):
-        logger.info("Starting automatic proxy fetch cycle...")
-        new_proxies = set()
-
-        # Fetch and format HTTP proxies
-        http_url = self.proxy_source_urls.get("http")
-        if http_url:
-            try:
-                response = requests.get(http_url, timeout=15)
-                response.raise_for_status()
-                for line in response.text.splitlines():
-                    if line.strip():
-                        new_proxies.add(f"http://{line.strip()}")
-                logger.info(
-                    f"Fetched {len(response.text.splitlines())} lines from HTTP source."
-                )
-            except requests.RequestException as e:
-                logger.error(f"Failed to fetch HTTP proxies: {e}")
-
-        # Fetch and format SOCKS5 proxies
-        socks5_url = self.proxy_source_urls.get("socks5")
-        if socks5_url:
-            try:
-                response = requests.get(socks5_url, timeout=15)
-                response.raise_for_status()
-                for line in response.text.splitlines():
-                    if line.strip():
-                        new_proxies.add(f"socks5://{line.strip()}")
-                logger.info(
-                    f"Fetched {len(response.text.splitlines())} lines from SOCKS5 source."
-                )
-            except requests.RequestException as e:
-                logger.error(f"Failed to fetch SOCKS5 proxies: {e}")
-
-        if not new_proxies:
-            logger.warning(
-                "Auto-fetch cycle completed, but no new proxies were fetched."
-            )
-            return
-
-        # Merge the newly fetched proxies into the manager
-        self._add_new_proxies_to_memory(list(new_proxies))
-
-    # --- [NEW] Helper to add a list of formatted proxies directly to memory ---
-    def _add_new_proxies_to_memory(self, proxy_lines: List[str]):
-        added_count = 0
-        with self.lock:
-            existing_proxy_urls = {p["url"] for p in self.proxies}
-            for line in proxy_lines:
-                try:
-                    # Simplified parsing since we've already formatted the lines
-                    protocol, rest = line.split("://", 1)
-                    host, port_str = rest.rsplit(":", 1)
-                    port = int(port_str)
-
-                    if not (1 <= port <= 65535):
-                        continue  # Invalid port
-
-                    url = f"{protocol}://{host}:{port}"
-                    if url not in existing_proxy_urls:
-                        proxy_info = {
-                            "protocol": protocol,
-                            "host": host,
-                            "port": port,
-                            "auth": None,
-                            "url": url,
-                        }
-                        self.proxies.append(proxy_info)
-                        existing_proxy_urls.add(url)
-                        for source in self.sources:
-                            self.stats[source][url] = self._get_new_proxy_stat()
-                            self.available_pools[source].append(url)
-                        added_count += 1
-                except (ValueError, IndexError):
-                    continue  # Skip malformed lines
-
-        logger.info(
-            f"Auto-fetch merge complete. Added {added_count} new unique proxies. Total proxies: {len(self.proxies)}"
+        self.fetch_executor = ThreadPoolExecutor(
+            max_workers=10, thread_name_prefix="Fetcher"
         )
+        self.is_validating = False
 
-    # --- [NEW] Methods to start and stop the scheduler ---
+    def _load_config(self):
+        """Loads all settings from the config file."""
+        # Server
+        self.server_port = self.config.getint("server", "port", fallback=6942)
+        # Validator
+        self.validation_workers = self.config.getint(
+            "validator", "validation_workers", fallback=100
+        )
+        self.validation_timeout_s = self.config.getint(
+            "validator", "validation_timeout_s", fallback=5
+        )
+        self.validation_target = self.config.get(
+            "validator", "validation_target", fallback="http://httpbin.org/get"
+        )
+        self.validation_supplement_threshold = self.config.getint(
+            "validator", "validation_supplement_threshold", fallback=1000
+        )
+        # Scheduler
+        self.validation_interval_s = self.config.getint(
+            "scheduler", "validation_interval_seconds", fallback=60
+        )
+        # Sources
+        sources_str = self.config.get(
+            "sources", "predefined_sources", fallback="default"
+        )
+        self.predefined_sources = {
+            s.strip() for s in sources_str.split(",") if s.strip()
+        }
+        self.default_source = self.config.get(
+            "sources", "default_source", fallback="default"
+        )
+        if self.default_source not in self.predefined_sources:
+            self.predefined_sources.add(self.default_source)
+        # Source Pool
+        self.max_pool_size = self.config.getint(
+            "source_pool", "max_pool_size", fallback=500
+        )
+        penalties_str = self.config.get(
+            "source_pool", "failure_penalties", fallback="-1, -10, -100"
+        )
+        self.failure_penalties = [int(p.strip()) for p in penalties_str.split(",")]
+        logger.info("Configuration loaded.")
+
+    def _initialize_source_pools(self):
+        """Initializes in-memory stats and available pools for all predefined sources."""
+        with self.lock:
+            for source in self.predefined_sources:
+                if source not in self.source_stats:
+                    self.source_stats[source] = {}
+                    self.available_proxies[source] = []
+            logger.info(
+                f"Initialized in-memory pools for sources: {self.predefined_sources}"
+            )
+
+    def reload_sources_from_config(self) -> Dict:
+        """
+        Reloads the predefined sources from the config file, adding new ones
+        and removing deprecated ones from the in-memory state.
+        """
+        logger.info(f"Attempting to hot-reload sources from {self.config_path}...")
+        new_config = configparser.ConfigParser()
+        new_config.read(self.config_path, encoding="utf-8")
+        new_sources_str = new_config.get(
+            "sources", "predefined_sources", fallback="default"
+        )
+        new_sources_set = {s.strip() for s in new_sources_str.split(",") if s.strip()}
+        new_default_source = new_config.get(
+            "sources", "default_source", fallback="default"
+        )
+        if new_default_source not in new_sources_set:
+            new_sources_set.add(new_default_source)
+
+        with self.lock:
+            current_sources_set = self.predefined_sources
+            added_sources = new_sources_set - current_sources_set
+            removed_sources = current_sources_set - new_sources_set
+
+            for source in removed_sources:
+                if source in self.source_stats:
+                    del self.source_stats[source]
+                if source in self.available_proxies:
+                    del self.available_proxies[source]
+                logger.info(f"Removed deprecated source from memory: {source}")
+
+            for source in added_sources:
+                self.source_stats[source] = {}
+                self.available_proxies[source] = []
+                # Immediately populate with existing active proxies
+                for url in self.active_proxies:
+                    self.source_stats[source][url] = self._get_new_proxy_stat()
+                logger.info(f"Added new source to memory: {source}")
+
+            # After adding/removing, re-sync and select top K
+            self._sync_and_select_top_proxies()
+
+            self.predefined_sources = new_sources_set
+            self.default_source = new_default_source
+
+        result = {"added": list(added_sources), "removed": list(removed_sources)}
+        logger.info(
+            f"Source reload complete. Added: {len(added_sources)}, Removed: {len(removed_sources)}."
+        )
+        return result
+
+    def _load_fetcher_jobs(self) -> List[Dict]:
+        """Loads proxy source jobs from the config file."""
+        jobs = []
+        for section in self.config.sections():
+            if section.startswith("proxy_source_"):
+                job = {
+                    "name": section,
+                    "url": self.config.get(section, "url", fallback=None),
+                    "interval_minutes": self.config.getint(
+                        section, "update_interval_minutes", fallback=60
+                    ),
+                    "default_protocol": self.config.get(
+                        section, "default_protocol", fallback=None
+                    ),
+                    "last_run": 0,
+                }
+                if job["url"]:
+                    jobs.append(job)
+        logger.info(f"Loaded {len(jobs)} proxy source jobs from config.")
+        return jobs
+
+    def _fetch_and_parse_source(self, job: Dict):
+        """Fetches a source, parses proxies, and inserts them into the DB."""
+        url = job["url"]
+        logger.info(f"Fetching proxy source: {job['name']} from {url}")
+        try:
+            response = requests.get(url, timeout=15)
+            response.raise_for_status()
+            proxies_to_insert = []
+            lines = response.text.splitlines()
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    if "://" in line:
+                        protocol, rest = line.split("://", 1)
+                        ip, port_str = rest.rsplit(":", 1)
+                        port = int(port_str)
+                        proxies_to_insert.append((protocol.lower(), ip, port))
+                    elif job["default_protocol"]:
+                        ip, port_str = line.rsplit(":", 1)
+                        port = int(port_str)
+                        proxies_to_insert.append(
+                            (job["default_protocol"].lower(), ip, port)
+                        )
+                except ValueError:
+                    continue
+
+            with self.lock:
+                self.db.insert_proxies(proxies_to_insert)
+        except requests.RequestException as e:
+            logger.error(f"Failed to fetch from {job['name']} ({url}): {e}")
+
+    def _validate_proxy(self, proxy_id: int, proxy_url: str):
+        """Validates a single proxy and updates its status in the DB."""
+        proxies = {"http": proxy_url, "https": proxy_url}
+        start_time = time.time()
+        try:
+            response = requests.get(
+                self.validation_target,
+                proxies=proxies,
+                timeout=self.validation_timeout_s,
+            )
+            response.raise_for_status()
+            latency_ms = int((time.time() - start_time) * 1000)
+            headers = response.json().get("headers", {})
+            is_anonymous = not any(
+                h in headers for h in ["X-Forwarded-For", "Via", "X-Real-Ip"]
+            )
+            anonymity = "elite" if is_anonymous else "transparent"
+            self.db.update_proxy_validation_result(
+                proxy_id, True, latency_ms, anonymity
+            )
+            return True
+        except (requests.RequestException, json.JSONDecodeError):
+            self.db.update_proxy_validation_result(proxy_id, False, None, None)
+            return False
+
+    def _run_validation_cycle(self):
+        """Runs a full validation cycle with smart supplementation."""
+        with self.lock:
+            if self.is_validating:
+                logger.warning(
+                    "Validation cycle is already in progress. Skipping this scheduled run."
+                )
+                return
+            self.is_validating = True
+
+        try:
+            proxies_to_validate = self.db.get_proxies_to_validate()
+            if len(proxies_to_validate) < self.validation_supplement_threshold:
+                supplement_needed = self.validation_supplement_threshold - len(
+                    proxies_to_validate
+                )
+                logger.info(
+                    f"Validation pool below threshold. Supplementing with {supplement_needed} recent failed proxies."
+                )
+                recent_failed = self.db.get_recent_failed_proxies(
+                    limit=supplement_needed
+                )
+                existing_ids = {p[0] for p in proxies_to_validate}
+                for p in recent_failed:
+                    if p[0] not in existing_ids:
+                        proxies_to_validate.append(p)
+
+            if not proxies_to_validate:
+                logger.info("Validation cycle skipped: no proxies to validate.")
+                return
+
+            total_to_validate = len(proxies_to_validate)
+            logger.info(f"Starting validation for {total_to_validate} proxies...")
+
+            success_count = 0
+            with ThreadPoolExecutor(max_workers=self.validation_workers) as executor:
+                future_to_proxy = {
+                    executor.submit(
+                        self._validate_proxy, p[0], f"{p[1]}://{p[2]}:{p[3]}"
+                    ): p
+                    for p in proxies_to_validate
+                }
+                for future in as_completed(future_to_proxy):
+                    try:
+                        if future.result():
+                            success_count += 1
+                    except Exception as exc:
+                        logger.error(f"Proxy validation generated an exception: {exc}")
+
+            logger.info(
+                f"Validation cycle finished. Success: {success_count}, Failed: {total_to_validate - success_count}."
+            )
+            # [MODIFIED] Call the new sync and select method
+            self._sync_and_select_top_proxies()
+        finally:
+            with self.lock:
+                self.is_validating = False
+            logger.info("Validation cycle lock released.")
+
+    # [REPLACED] Replaced _sync_source_pools_after_validation with this new method
+    def _sync_and_select_top_proxies(self):
+        """
+        Syncs stats with all active proxies, resets stats for new ones,
+        then sorts and selects the top K proxies for the available pool.
+        """
+        logger.info("Syncing and selecting Top-K proxies for all sources...")
+        newly_active_proxies = self.db.get_active_proxies()
+
+        with self.lock:
+            self.active_proxies = newly_active_proxies
+
+            for source in self.predefined_sources:
+                stats_pool = self.source_stats.get(source, {})
+
+                # 1. Add all active proxies to the stats pool and reset their stats
+                for proxy_url in self.active_proxies:
+                    # Whether it's new or existing, reset its stats to give it a fresh start
+                    stats_pool[proxy_url] = self._get_new_proxy_stat()
+
+                # 2. Sort the entire stats pool by score
+                # Items are (proxy_url, stat_dict)
+                sorted_proxies = sorted(
+                    stats_pool.items(), key=lambda item: item[1]["score"], reverse=True
+                )
+
+                # 3. Select the Top K proxies and update the available pool
+                top_k_proxies = [
+                    proxy_url for proxy_url, _ in sorted_proxies[: self.max_pool_size]
+                ]
+                self.available_proxies[source] = top_k_proxies
+
+                # Optional: Trim the main stats pool to save memory, though not strictly necessary
+                self.source_stats[source] = dict(sorted_proxies)
+
+                logger.info(
+                    f"Source '{source}' synced. Total proxies in stats: {len(self.source_stats[source])}. "
+                    f"Selected Top {len(self.available_proxies[source])} for active pool."
+                )
+
+    def _scheduler_loop(self):
+        """The main loop for the background scheduler."""
+        last_validation_run = 0
+        while not self.stop_scheduler_event.is_set():
+            now = time.time()
+            try:
+                for job in self.fetcher_jobs:
+                    if now - job["last_run"] >= job["interval_minutes"] * 60:
+                        job["last_run"] = now
+                        self.fetch_executor.submit(self._fetch_and_parse_source, job)
+                if now - last_validation_run >= self.validation_interval_s:
+                    last_validation_run = now
+                    threading.Thread(target=self._run_validation_cycle).start()
+                self.stop_scheduler_event.wait(5)
+            except Exception as e:
+                logger.error(f"Error in scheduler loop: {e}", exc_info=True)
+                self.stop_scheduler_event.wait(60)
+
     def start_scheduler(self):
-        if self.scheduler_thread is None or not self.scheduler_thread.is_alive():
+        if not self.scheduler_thread or not self.scheduler_thread.is_alive():
             self.stop_scheduler_event.clear()
             self.scheduler_thread = threading.Thread(
-                target=self._auto_fetch_loop, daemon=True
+                target=self._scheduler_loop, daemon=True
             )
             self.scheduler_thread.start()
+            logger.info("Background scheduler started.")
 
     def stop_scheduler(self):
         if self.scheduler_thread and self.scheduler_thread.is_alive():
             self.stop_scheduler_event.set()
-            self.scheduler_thread.join(timeout=5)  # Wait for thread to finish
-            logger.info("Scheduler stopped.")
+            self.fetch_executor.shutdown(wait=True)
+            self.scheduler_thread.join(timeout=10)
+            logger.info("Background scheduler stopped.")
 
-    def add_source(self, source: str, config_path: str):
-        """Adds a new source to the manager and persists it."""
-        with self.lock:
-            if source in self.sources:
-                logger.info(f"Source '{source}' already exists.")
-                return False
-
-            logger.info(f"Adding new source: {source}")
-            self.sources.add(source)
-            self._ensure_sources_initialized()
-            self._save_config(config_path)
-            return True
-
-    def _ensure_sources_initialized(self):
-        """Ensures all current sources are initialized in stats and pools."""
-        for source in self.sources:
-            if source not in self.stats:
-                self.stats[source] = {}
-                self.available_pools[source] = []
-                for p in self.proxies:
-                    proxy_url = p["url"]
-                    if proxy_url not in self.stats[source]:
-                        self.stats[source][proxy_url] = self._get_new_proxy_stat()
-                    if not self.stats[source][proxy_url].get("is_banned", False):
-                        if proxy_url not in self.available_pools[source]:
-                            self.available_pools[source].append(proxy_url)
-
-    @staticmethod
-    def _get_new_proxy_stat() -> Dict:
-        """Returns a dictionary for a new proxy's statistics."""
+    # [MODIFIED] Renamed from _get_new_source_stat
+    def _get_new_proxy_stat(self) -> Dict:
+        """Returns a clean, default state for a proxy."""
         return {
+            "score": 0,
             "success_count": 0,
             "failure_count": 0,
             "consecutive_failures": 0,
-            "avg_response_time_ms": float("inf"),
-            "is_banned": False,
-            "last_used": 0,
         }
 
-    def load_proxies_from_file(self, proxy_file: str) -> Dict:
-        """
-        Loads proxies from a text file and merges them with the existing state.
-        """
-        if not os.path.exists(proxy_file):
-            return {
-                "message": f"Warning: Proxy file '{proxy_file}' does not exist.",
-                "added": 0,
-                "total": len(self.proxies),
-            }
+    def _get_source_or_default(self, source: str) -> str:
+        """Returns the source if predefined, otherwise returns the default source."""
+        return source if source in self.predefined_sources else self.default_source
 
-        with open(proxy_file, "r", encoding="utf-8") as f:
-            unique_proxy_lines = {
-                line.strip() for line in f if line.strip() and not line.startswith("#")
-            }
-
-        self._add_new_proxies_to_memory(list(unique_proxy_lines))
-        return {"message": "Proxies loaded successfully.", "total": len(self.proxies)}
-
-    def save_state_to_pickle(self, pickle_path: str):
-        """Saves the entire ProxyManager object state to a pickle file."""
+    # [MODIFIED] Get proxy logic is now much simpler
+    def get_proxy(self, source: str) -> Optional[str]:
+        """Gets a random proxy from the pre-selected available pool for a source."""
+        source = self._get_source_or_default(source)
         with self.lock:
-            os.makedirs(os.path.dirname(pickle_path), exist_ok=True)
-            try:
-                with open(pickle_path, "wb") as f:
-                    pickle.dump(self, f)
-                logger.info(f"Successfully saved manager state to '{pickle_path}'.")
-            except Exception as e:
-                logger.error(f"Failed to save state to pickle file: {e}")
-
-    def get_proxy_for_source(self, source: str) -> Optional[str]:
-        """Gets a random proxy from the source's available pool."""
-        with self.lock:
-            if source not in self.sources:
+            proxy_pool = self.available_proxies.get(source)
+            if not proxy_pool:
                 return None
-            source_pool = self.available_pools.get(source, [])
-            source_stats = self.stats.get(source, {})
-            if len(source_pool) < self.min_pool_size:
-                proxy_to_revive_url = None
-                successful_revival_candidates = [
-                    p_url
-                    for p_url, p_stat in source_stats.items()
-                    if p_stat.get("is_banned") and p_stat.get("success_count", 0) > 0
-                ]
-                if successful_revival_candidates:
-                    proxy_to_revive_url = random.choice(successful_revival_candidates)
-                else:
-                    all_banned_proxies = [
-                        p_url
-                        for p_url, p_stat in source_stats.items()
-                        if p_stat.get("is_banned")
-                    ]
-                    if all_banned_proxies:
-                        proxy_to_revive_url = random.choice(all_banned_proxies)
-                if proxy_to_revive_url:
-                    source_stats[proxy_to_revive_url]["is_banned"] = False
-                    source_stats[proxy_to_revive_url]["consecutive_failures"] = 0
-                    if proxy_to_revive_url not in source_pool:
-                        source_pool.append(proxy_to_revive_url)
-            if not source_pool:
-                return None
-            chosen_proxy_url = random.choice(source_pool)
-            source_stats[chosen_proxy_url]["last_used"] = time.time()
-            return chosen_proxy_url
+            return random.choice(proxy_pool)
 
-    def process_feedback(self, feedback_data: Dict):
-        """Processes feedback and updates the proxy's status."""
-        source, proxy_url, status, resp_time = (
-            feedback_data.get("source"),
-            feedback_data.get("proxy"),
-            feedback_data.get("status"),
-            feedback_data.get("response_time_ms"),
-        )
-        logger.info(
-            f"Handled feedback: source={source}, proxy={proxy_url}, status={status}, resp_time={resp_time}"
-        )
-
-        if not all([source, proxy_url, status]):
-            return False
+    # [MODIFIED] Feedback logic with score reset
+    def process_feedback(self, source: str, proxy_url: str, status: str):
+        """Processes feedback, updating scores in the main stats pool."""
+        source = self._get_source_or_default(source)
         with self.lock:
-            if source not in self.stats or proxy_url not in self.stats[source]:
-                return False
-            stat = self.stats[source][proxy_url]
+            # Feedback always updates the main stats pool, not the available pool
+            stat = self.source_stats.get(source, {}).get(proxy_url)
+            if not stat:
+                return
+
             if status == "success":
                 stat["success_count"] += 1
-                stat["consecutive_failures"] = 0
-                if stat["is_banned"]:
-                    stat["is_banned"] = False
-                    if proxy_url not in self.available_pools.get(source, []):
-                        self.available_pools.setdefault(source, []).append(proxy_url)
+                # [NEW] If it was failing before, a single success resets its score to 1
+                if stat["consecutive_failures"] > 0:
+                    stat["score"] = 1
+                else:
+                    stat["score"] += 1
+                stat["consecutive_failures"] = 0  # Reset on success
+
             elif status == "failure":
                 stat["failure_count"] += 1
                 stat["consecutive_failures"] += 1
-                if (
-                    stat["consecutive_failures"] >= self.consecutive_failure_threshold
-                    and not stat["is_banned"]
-                ):
-                    stat["is_banned"] = True
-                    if proxy_url in self.available_pools.get(source, []):
-                        self.available_pools[source].remove(proxy_url)
-            return True
 
-    def get_source_stats(self, source: str) -> Optional[Dict]:
-        """Gets statistics for a given source."""
-        with self.lock:
-            if source not in self.sources:
-                return None
-            source_pool = self.available_pools.get(source, [])
-            return {
-                "source": source,
-                "available_proxies_count": len(source_pool),
-                "available_proxies_list": source_pool[:10],
-            }
+                penalty_index = min(
+                    stat["consecutive_failures"] - 1, len(self.failure_penalties) - 1
+                )
+                penalty = self.failure_penalties[penalty_index]
+                stat["score"] += penalty
+                logger.info(
+                    f"Proxy {proxy_url} failed for source '{source}'. "
+                    f"Penalty: {penalty}. New score: {stat['score']}"
+                )
+        # Note: We do not re-sort the available_proxies pool on every feedback call.
+        # It is only updated after the next validation cycle. This is more efficient.
 
 
-def load_proxy_manager(pickle_path, config_path, proxy_path) -> ProxyManager:
-    """Factory function to load or create a ProxyManager instance."""
-    manager = None
-    if os.path.exists(pickle_path):
-        try:
-            with open(pickle_path, "rb") as f:
-                manager = pickle.load(f)
-            logger.info("Successfully loaded manager state from pickle file.")
-            manager.load_config(config_path)
-        except Exception as e:
-            logger.error(f"Failed to load from pickle file: {e}. Creating new manager.")
-            manager = None
-    if manager is None:
-        manager = ProxyManager()
-        manager.load_config(config_path)
-    logger.info(f"Loading/merging proxies from text file: {proxy_path}")
-    manager.load_proxies_from_file(proxy_path)
+def load_proxy_manager(config_path: str) -> ProxyManager:
+    """Loads ProxyManager and initializes its state."""
+    logger.info("Initializing ProxyManager...")
+    manager = ProxyManager(config_path)
+    # [MODIFIED] Initial sync logic
+    manager._sync_and_select_top_proxies()
+    if not manager.active_proxies:
+        logger.warning(
+            "Cold start detected. Running initial synchronous fetch and validation..."
+        )
+        fetch_futures = [
+            manager.fetch_executor.submit(manager._fetch_and_parse_source, job)
+            for job in manager.fetcher_jobs
+        ]
+        for future in as_completed(fetch_futures):
+            pass
+        # This will run validation and then the new _sync_and_select_top_proxies method
+        manager._run_validation_cycle()
+        logger.info("Initial validation complete.")
     return manager
 
 
-# --- HTTP Server ---
+# --- Flask API Server ---
 app = Flask(__name__)
-proxy_manager = load_proxy_manager(PICKLE_FILE_PATH, CONFIG_FILE_PATH, PROXY_FILE_PATH)
+proxy_manager = load_proxy_manager(CONFIG_FILE_PATH)
 
 
 @app.route("/get-proxy", methods=["GET"])
@@ -409,7 +571,7 @@ def get_proxy():
     source = request.args.get("source")
     if not source:
         return jsonify({"error": "Query parameter 'source' is required."}), 400
-    proxy_url = proxy_manager.get_proxy_for_source(source)
+    proxy_url = proxy_manager.get_proxy(source)
     if proxy_url:
         return jsonify({"http": proxy_url, "https": proxy_url})
     else:
@@ -424,65 +586,34 @@ def get_proxy():
 @app.route("/feedback", methods=["POST"])
 def feedback():
     data = request.json
-    if not data or not proxy_manager.process_feedback(data):
-        return jsonify({"error": "Invalid or incomplete feedback data provided."}), 400
-    return jsonify({"message": "Feedback received and processed."})
+    source, proxy_url, status, resp_time = (
+        data.get("source"),
+        data.get("proxy"),
+        data.get("status"),
+        data.get("response_time_ms"),
+    )
+    logger.info(f"Handled feedback: {source} - {status} - {proxy_url} - {resp_time}")
+    if not all([source, proxy_url, status]) or status not in ["success", "failure"]:
+        return jsonify({"error": "Invalid feedback data."}), 400
+    proxy_manager.process_feedback(source, proxy_url, status)
+    return jsonify({"message": "Feedback received."})
 
 
-@app.route("/add-source", methods=["POST"])
-def add_source():
-    data = request.json
-    source = data.get("source")
-    if not source:
-        return jsonify({"error": "JSON body must contain a 'source' key."}), 400
-    if proxy_manager.add_source(source, CONFIG_FILE_PATH):
-        return jsonify({"message": f"Source '{source}' added successfully."})
-    else:
-        return jsonify({"message": f"Source '{source}' already exists."}), 200
-
-
-@app.route("/load-proxies", methods=["POST"])
-def load_proxies_endpoint():
-    logger.info("Hot-reload of proxies triggered via API.")
-    result = proxy_manager.load_proxies_from_file(PROXY_FILE_PATH)
+@app.route("/reload-sources", methods=["POST"])
+def reload_sources():
+    """Dynamically reloads the source configuration from the config file."""
+    result = proxy_manager.reload_sources_from_config()
     return jsonify(result)
 
 
-@app.route("/export-stats", methods=["GET"])
-def export_stats_endpoint():
-    proxy_manager.save_state_to_pickle(PICKLE_FILE_PATH)
-    return jsonify({"message": f"Manager state saved to {PICKLE_FILE_PATH}"})
-
-
-@app.route("/stats/<string:source>", methods=["GET"])
-def get_source_stats_endpoint(source: str):
-    stats = proxy_manager.get_source_stats(source)
-    if stats:
-        return jsonify(stats)
-    else:
-        return jsonify({"error": f"No statistics found for source '{source}'."}), 404
-
-
 def handle_shutdown(signal, frame):
-    logger.info("\nShutdown signal received, saving state and stopping scheduler...")
+    logger.info("Shutdown signal received. Stopping scheduler...")
     proxy_manager.stop_scheduler()
-    proxy_manager.save_state_to_pickle(PICKLE_FILE_PATH)
     sys.exit(0)
 
 
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, handle_shutdown)
     signal.signal(signal.SIGTERM, handle_shutdown)
-
-    os.makedirs(DATA_DIR, exist_ok=True)
-    if not os.path.exists(PROXY_FILE_PATH):
-        logger.info(f"Creating a dummy proxy file at '{PROXY_FILE_PATH}'.")
-        with open(PROXY_FILE_PATH, "w", encoding="utf-8") as f:
-            f.write("# Add proxies here in the format: protocol:host:port\n")
-    if not os.path.exists(CONFIG_FILE_PATH):
-        proxy_manager.load_config(CONFIG_FILE_PATH)
-
-    # --- [NEW] Start the background scheduler ---
     proxy_manager.start_scheduler()
-
-    app.run(host="0.0.0.0", port=6942, debug=True, use_reloader=False)
+    app.run(host="0.0.0.0", port=proxy_manager.server_port, debug=False)
