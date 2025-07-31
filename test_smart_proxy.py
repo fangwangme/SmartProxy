@@ -1,218 +1,134 @@
 import unittest
-from unittest.mock import patch, mock_open, MagicMock
+from unittest.mock import patch, MagicMock, ANY
 import os
-import sys
-import pickle
+import time
 import configparser
 
-# Add the parent directory to the path to allow importing smart_proxy
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+# Mock logger before importing the main module
+from logger import logger
 
-# Mock the logger before importing the main module
-mock_logger = MagicMock()
-sys.modules["logger"] = MagicMock()
-sys.modules["logger"].logger = mock_logger
+logger.disabled = True
 
-from smart_proxy import ProxyManager, load_proxy_manager
+# Mock psycopg2 before it's imported by the main module
+sys_modules = {
+    "psycopg2": MagicMock(),
+    "psycopg2.pool": MagicMock(),
+    "psycopg2.extras": MagicMock(),
+}
+with patch.dict("sys.modules", sys_modules):
+    import smart_proxy
 
 
-class TestProxyManager(unittest.TestCase):
-    """
-    Unit tests for the ProxyManager and related functionalities.
-    """
+class TestSmartProxyV3(unittest.TestCase):
 
     def setUp(self):
         """Set up a clean environment for each test."""
-        self.DATA_DIR = "test_data"
-        self.CONFIG_FILE_PATH = os.path.join(self.DATA_DIR, "config.ini")
-        self.PROXY_FILE_PATH = os.path.join(self.DATA_DIR, "proxies.txt")
-        self.PICKLE_FILE_PATH = os.path.join(self.DATA_DIR, "proxy_manager.pkl")
-
-        os.makedirs(self.DATA_DIR, exist_ok=True)
-
-        # Reset mocked logger calls
-        mock_logger.reset_mock()
-
-    def tearDown(self):
-        """Clean up created files after each test."""
-        for file_path in [
-            self.CONFIG_FILE_PATH,
-            self.PROXY_FILE_PATH,
-            self.PICKLE_FILE_PATH,
-        ]:
-            if os.path.exists(file_path):
-                os.remove(file_path)
-        if os.path.exists(self.DATA_DIR):
-            os.rmdir(self.DATA_DIR)
-
-    def test_load_sources_from_config_file_exists(self):
-        """Test loading sources from an existing config file."""
+        self.config_path = "test_config.ini"
         config = configparser.ConfigParser()
-        config["sources"] = {"default_sources": "source1, source2"}
-        with open(self.CONFIG_FILE_PATH, "w") as f:
+        config["database"] = {
+            "host": "fake",
+            "port": "5432",
+            "dbname": "fake",
+            "user": "fake",
+            "password": "fake",
+        }
+        config["validator"] = {"validation_workers": "10"}
+        config["scheduler"] = {"validation_interval_seconds": "60"}
+        config["source_pool"] = {"score_threshold_ban": "-5", "cooldown_minutes": "10"}
+        config["proxy_source_test"] = {
+            "url": "http://fake.com/proxies.txt",
+            "update_interval_minutes": "5",
+            "default_protocol": "http",
+        }
+        with open(self.config_path, "w") as f:
             config.write(f)
 
-        manager = ProxyManager()
-        manager.load_sources_from_config(self.CONFIG_FILE_PATH)
-        self.assertEqual(manager.sources, {"source1", "source2"})
+        # We patch the DatabaseManager to avoid actual DB calls
+        self.db_mock = MagicMock()
+        with patch("smart_proxy.DatabaseManager", return_value=self.db_mock):
+            self.manager = smart_proxy.ProxyManager(self.config_path)
 
-    def test_load_sources_from_config_file_not_exists(self):
-        """Test loading sources when config file does not exist."""
-        manager = ProxyManager()
-        manager.load_sources_from_config(self.CONFIG_FILE_PATH)
-        self.assertEqual(manager.sources, {"insolvencydirect", "test"})
+    def tearDown(self):
+        """Clean up created files."""
+        if os.path.exists(self.config_path):
+            os.remove(self.config_path)
 
-    def test_add_source(self):
-        """Test adding a new source."""
-        manager = ProxyManager()
-        manager.load_sources_from_config(self.CONFIG_FILE_PATH)  # Loads defaults
+    @patch("requests.get")
+    def test_fetch_and_parse_source(self, mock_get):
+        """Test fetching, parsing, and inserting proxies."""
+        mock_response = MagicMock()
+        mock_response.text = "1.1.1.1:8080\n2.2.2.2:8080"
+        mock_response.raise_for_status.return_value = None
+        mock_get.return_value = mock_response
 
-        result = manager.add_source("new_source", self.CONFIG_FILE_PATH)
-        self.assertTrue(result)
-        self.assertIn("new_source", manager.sources)
+        test_job = self.manager.fetcher_jobs[0]
+        self.manager._fetch_and_parse_source(test_job)
 
-        # Verify it was written to the config file
-        config = configparser.ConfigParser()
-        config.read(self.CONFIG_FILE_PATH)
-        self.assertIn("new_source", config.get("sources", "default_sources"))
+        # Verify that the database insert method was called with correctly parsed data
+        self.db_mock.insert_proxies.assert_called_once()
+        call_args = self.db_mock.insert_proxies.call_args[0][0]
+        self.assertIn(("http", "1.1.1.1", 8080), call_args)
+        self.assertIn(("http", "2.2.2.2", 8080), call_args)
 
-    def test_add_existing_source(self):
-        """Test adding a source that already exists."""
-        manager = ProxyManager()
-        manager.load_sources_from_config(self.CONFIG_FILE_PATH)  # Loads defaults
-        result = manager.add_source("test", self.CONFIG_FILE_PATH)
-        self.assertFalse(result)
+    @patch("requests.get")
+    def test_validation_cycle(self, mock_get):
+        """Test the validation logic."""
+        # Mock DB to return a proxy that needs validation
+        proxy_to_validate = [(1, "http", "1.1.1.1", 8080)]
+        self.db_mock.get_proxies_to_validate.return_value = proxy_to_validate
 
-    def test_load_proxies_from_file(self):
-        """Test loading valid, duplicate, and malformed proxies."""
-        proxy_content = (
-            "http:1.1.1.1:8080\n"
-            "http:2.2.2.2:8080\n"
-            "http:1.1.1.1:8080\n"  # Duplicate
-            "badprotocol:3.3.3.3:8080\n"  # Malformed
-            "http:4.4.4.4:99999\n"  # Malformed port
-        )
-        with open(self.PROXY_FILE_PATH, "w") as f:
-            f.write(proxy_content)
+        # Mock a successful validation response from requests
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"headers": {}}
+        mock_response.raise_for_status.return_value = None
+        mock_get.return_value = mock_response
 
-        manager = ProxyManager()
-        manager.load_sources_from_config(self.CONFIG_FILE_PATH)
-        result = manager.load_proxies_from_file(self.PROXY_FILE_PATH)
+        self.manager._run_validation_cycle()
 
-        self.assertEqual(len(manager.proxies), 2)
-        self.assertEqual(result["added"], 2)
-        self.assertEqual(result["total"], 2)
-
-        proxy_urls = {p["url"] for p in manager.proxies}
-        self.assertIn("http://1.1.1.1:8080", proxy_urls)
-        self.assertIn("http://2.2.2.2:8080", proxy_urls)
-
-    def test_pickle_persistence(self):
-        """Test saving and loading the manager state using pickle."""
-        # 1. Create and modify a manager instance
-        manager = ProxyManager()
-        manager.load_sources_from_config(self.CONFIG_FILE_PATH)
-        manager.load_proxies_from_file(self.PROXY_FILE_PATH)  # empty for now
-        manager.add_source("pickle_source", self.CONFIG_FILE_PATH)
-
-        # 2. Save its state
-        manager.save_state_to_pickle(self.PICKLE_FILE_PATH)
-        self.assertTrue(os.path.exists(self.PICKLE_FILE_PATH))
-
-        # 3. Load into a new manager using the factory
-        new_manager = load_proxy_manager(
-            self.PICKLE_FILE_PATH, self.CONFIG_FILE_PATH, self.PROXY_FILE_PATH
+        # Verify that the DB was updated with a successful result
+        self.db_mock.update_proxy_validation_result.assert_called_with(
+            1, True, ANY, "elite"
         )
 
-        # 4. Verify the state was restored
-        self.assertIsInstance(new_manager, ProxyManager)
-        self.assertIn("pickle_source", new_manager.sources)
+    def test_get_proxy_and_feedback(self):
+        """Test the in-memory get/feedback cycle."""
+        source = "test_source"
+        proxy_url = "http://1.1.1.1:8080"
 
-    def test_feedback_and_banning(self):
-        """Test the feedback mechanism and proxy banning."""
-        proxy_content = "http:5.5.5.5:8080\n"
-        with open(self.PROXY_FILE_PATH, "w") as f:
-            f.write(proxy_content)
+        # Manually set up the in-memory state
+        self.manager.active_proxies = {proxy_url}
+        self.manager._ensure_source_exists(source)
 
-        manager = ProxyManager()
-        manager.load_sources_from_config(self.CONFIG_FILE_PATH)
-        manager.load_proxies_from_file(self.PROXY_FILE_PATH)
+        # Get proxy
+        self.assertEqual(self.manager.get_proxy(source), proxy_url)
 
-        proxy_url = "http://5.5.5.5:8080"
-        source = "test"
+        # Give failure feedback
+        self.manager.process_feedback(source, proxy_url, "failure")
+        self.assertEqual(self.manager.source_stats[source][proxy_url]["score"], -5)
 
-        # Check initial state
-        self.assertIn(proxy_url, manager.available_pools[source])
+        # Give success feedback
+        self.manager.process_feedback(source, proxy_url, "success")
+        self.assertEqual(self.manager.source_stats[source][proxy_url]["score"], -4)
 
-        # Simulate failures until banning
-        from smart_proxy import CONSECUTIVE_FAILURE_THRESHOLD
+    def test_cold_start_logic(self):
+        """Test the synchronous initial load on cold start."""
+        with patch(
+            "smart_proxy.ProxyManager._run_validation_cycle"
+        ) as mock_validate, patch(
+            "smart_proxy.ProxyManager._fetch_and_parse_source"
+        ) as mock_fetch:
 
-        for _ in range(CONSECUTIVE_FAILURE_THRESHOLD):
-            feedback = {"source": source, "proxy": proxy_url, "status": "failure"}
-            manager.process_feedback(feedback)
+            # Simulate no pickle file and empty DB
+            self.db_mock.get_active_proxies.return_value = set()
 
-        # Verify proxy is banned and removed from available pool
-        self.assertTrue(manager.stats[source][proxy_url]["is_banned"])
-        self.assertNotIn(proxy_url, manager.available_pools[source])
+            with patch("os.path.exists", return_value=False):
+                manager = smart_proxy.load_proxy_manager(
+                    "fake_pickle.pkl", self.config_path
+                )
 
-        # Simulate a success
-        feedback = {
-            "source": source,
-            "proxy": proxy_url,
-            "status": "success",
-            "response_time_ms": 100,
-        }
-        manager.process_feedback(feedback)
-
-        # Verify proxy is unbanned and back in the pool
-        self.assertFalse(manager.stats[source][proxy_url]["is_banned"])
-        self.assertIn(proxy_url, manager.available_pools[source])
-        self.assertEqual(manager.stats[source][proxy_url]["consecutive_failures"], 0)
-
-    def test_revival_logic(self):
-        """Test the proxy revival logic when the pool is low."""
-        # Setup: 2 proxies, one successful, one not. Both banned.
-        proxies = ["http:6.6.6.6:8080", "http:7.7.7.7:8080"]
-        proxy_urls = [p.replace(":", "://") for p in proxies]
-
-        with open(self.PROXY_FILE_PATH, "w") as f:
-            f.write("\n".join(proxies))
-
-        manager = ProxyManager()
-        # Set a very low pool size to trigger revival immediately
-        from smart_proxy import MIN_POOL_SIZE
-
-        original_min_pool_size = MIN_POOL_SIZE
-        # We need to modify the global, or patch it inside the manager instance
-        # For simplicity, we'll just assume we can set it on the instance for this test
-        manager.MIN_POOL_SIZE = 1
-
-        manager.load_sources_from_config(self.CONFIG_FILE_PATH)
-        manager.load_proxies_from_file(self.PROXY_FILE_PATH)
-
-        source = "test"
-        # Manually set stats
-        manager.stats[source][proxy_urls[0]]["success_count"] = 1
-        manager.stats[source][proxy_urls[0]]["is_banned"] = True
-        manager.stats[source][proxy_urls[1]]["is_banned"] = True
-        manager.available_pools[source] = []  # Empty the pool
-
-        # 1. Test revival of historically successful proxy
-        revived_proxy = manager.get_proxy_for_source(source)
-        self.assertEqual(revived_proxy, proxy_urls[0])
-        self.assertFalse(manager.stats[source][proxy_urls[0]]["is_banned"])
-
-        # 2. Test revival of random proxy when no successful ones are available
-        manager.stats[source][proxy_urls[0]]["is_banned"] = True
-        manager.stats[source][proxy_urls[0]]["success_count"] = 0
-        manager.available_pools[source] = []  # Empty the pool again
-
-        revived_proxy_2 = manager.get_proxy_for_source(source)
-        self.assertIn(revived_proxy_2, proxy_urls)
-        self.assertFalse(manager.stats[source][revived_proxy_2]["is_banned"])
-
-        # Restore original value if necessary for other tests, though setUp handles isolation
-        # smart_proxy.MIN_POOL_SIZE = original_min_pool_size
+            # Verify that fetch and validate were called synchronously
+            self.assertTrue(mock_fetch.called)
+            self.assertTrue(mock_validate.called)
 
 
 if __name__ == "__main__":
