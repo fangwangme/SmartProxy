@@ -245,8 +245,11 @@ class ProxyManager:
         self.max_pool_size = self.config.getint(
             "source_pool", "max_pool_size", fallback=500
         )
+        self.stats_pool_max_multiplier = self.config.getint(
+            "source_pool", "stats_pool_max_multiplier", fallback=20
+        )
         penalties_str = self.config.get(
-            "source_pool", "failure_penalties", fallback="-1, -10, -100"
+            "source_pool", "failure_penalties", fallback="-1, -5, -20"
         )
         self.failure_penalties = [int(p.strip()) for p in penalties_str.split(",")]
         logger.info("Configuration loaded.")
@@ -426,7 +429,23 @@ class ProxyManager:
                     stats_pool.items(), key=lambda item: item[1]["score"], reverse=True
                 )
 
-                # 3. Select the Top K from the sorted list to form the new available pool.
+                # 3. Trim the stats pool if it exceeds the maximum size limit.
+                max_stats_size = self.max_pool_size * self.stats_pool_max_multiplier
+                if len(sorted_proxies) > max_stats_size:
+                    proxies_to_delete_count = len(sorted_proxies) - max_stats_size
+                    logger.info(
+                        f"Stats pool for source '{source}' exceeds limit ({len(sorted_proxies)} > {max_stats_size}). "
+                        f"Removing {proxies_to_delete_count} lowest-scoring proxies."
+                    )
+                    # Trim the list to the max size
+                    sorted_proxies = sorted_proxies[:max_stats_size]
+                    # Update the main stats pool with the trimmed, sorted list
+                    self.source_stats[source] = dict(sorted_proxies)
+                else:
+                    # If not over the limit, we still need to update the main pool in case new proxies were added
+                    self.source_stats[source] = dict(sorted_proxies)
+
+                # 4. Select the Top K from the sorted list to form the new available pool.
                 #    This pool may contain proxies that are currently inactive, but their
                 #    high score gives them a chance to be tried again.
                 top_k_proxies = [
