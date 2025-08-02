@@ -7,19 +7,23 @@ import signal
 import sys
 import threading
 import time
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from typing import Dict, List, Optional, Set, Tuple
 
 import psycopg2
 import psycopg2.pool
 import psycopg2.extras
 import requests
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_from_directory
+from flask_cors import CORS
 
 from logger import logger
 
 # --- Configuration & Constants ---
 CONFIG_FILE_PATH = os.path.join("./", "config.ini")
+SUCCESS_STATUS_CODES = {100, 7}  # Set of status codes that indicate success
 
 
 class DatabaseManager:
@@ -28,8 +32,8 @@ class DatabaseManager:
     def __init__(self, config):
         try:
             self.pool = psycopg2.pool.SimpleConnectionPool(
-                minconn=1,
-                maxconn=10,
+                minconn=2,  # Increased min connections for stats writer
+                maxconn=20,
                 host=config.get("database", "host"),
                 port=config.get("database", "port"),
                 dbname=config.get("database", "dbname"),
@@ -46,7 +50,8 @@ class DatabaseManager:
         conn = None
         try:
             conn = self.pool.getconn()
-            with conn.cursor() as cur:
+            # Use a dictionary cursor for easier data handling in API endpoints
+            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
                 cur.execute(query, params)
                 if fetch == "one":
                     return cur.fetchone()
@@ -63,26 +68,19 @@ class DatabaseManager:
                 self.pool.putconn(conn)
 
     def insert_proxies(self, proxies: List[Tuple[str, str, int]]):
-        """Inserts a list of proxies, ignoring duplicates, and logs the actual count."""
+        """Inserts a list of proxies, ignoring duplicates."""
         if not proxies:
             return
-        query = """
-            INSERT INTO proxies (protocol, ip, port) VALUES %s
-            ON CONFLICT (protocol, ip, port) DO NOTHING;
-        """
+        query = "INSERT INTO proxies (protocol, ip, port) VALUES %s ON CONFLICT (protocol, ip, port) DO NOTHING;"
         conn = None
-        inserted_count = 0
         try:
             conn = self.pool.getconn()
             with conn.cursor() as cur:
                 psycopg2.extras.execute_values(cur, query, proxies)
                 inserted_count = cur.rowcount
                 conn.commit()
-            logger.info(
-                f"Attempted to insert {len(proxies)} proxies. "
-                f"Successfully inserted {inserted_count} new proxies. "
-                f"{len(proxies) - inserted_count} were duplicates."
-            )
+            if inserted_count > 0:
+                logger.info(f"Inserted {inserted_count} new proxies.")
         except psycopg2.Error as e:
             logger.error(f"Database batch insert failed: {e}")
             if conn:
@@ -91,23 +89,12 @@ class DatabaseManager:
             if conn:
                 self.pool.putconn(conn)
 
-    def get_proxies_to_validate(self, interval_minutes=30) -> List[Tuple[int, str]]:
-        """Selects proxies that need validation (unvalidated or previously active)."""
-        query = """
-            SELECT id, protocol, ip, port FROM proxies
-            WHERE last_validated_at IS NULL 
-            OR (is_active = true AND last_validated_at < NOW() - INTERVAL '%s minutes');
-        """
+    def get_proxies_to_validate(self, interval_minutes=30) -> List[Tuple]:
+        query = "SELECT id, protocol, ip, port FROM proxies WHERE last_validated_at IS NULL OR (is_active = true AND last_validated_at < NOW() - INTERVAL '%s minutes');"
         return self._execute(query, (interval_minutes,), fetch="all") or []
 
-    def get_recent_failed_proxies(self, limit: int) -> List[Tuple[int, str]]:
-        """Selects the most recently inserted proxies that are currently inactive."""
-        query = """
-            SELECT id, protocol, ip, port FROM proxies
-            WHERE is_active = false
-            ORDER BY created_at DESC
-            LIMIT %s;
-        """
+    def get_recent_failed_proxies(self, limit: int) -> List[Tuple]:
+        query = "SELECT id, protocol, ip, port FROM proxies WHERE is_active = false ORDER BY created_at DESC LIMIT %s;"
         return self._execute(query, (limit,), fetch="all") or []
 
     def update_proxy_validation_result(
@@ -117,19 +104,72 @@ class DatabaseManager:
         latency: Optional[int],
         anonymity: Optional[str],
     ):
-        """Updates a proxy's record after a validation attempt."""
-        query = """
-            UPDATE proxies 
-            SET is_active = %s, latency_ms = %s, anonymity_level = %s, last_validated_at = NOW()
-            WHERE id = %s;
-        """
+        query = "UPDATE proxies SET is_active = %s, latency_ms = %s, anonymity_level = %s, last_validated_at = NOW() WHERE id = %s;"
         self._execute(query, (is_active, latency, anonymity, proxy_id))
 
     def get_active_proxies(self) -> Set[str]:
-        """Gets the set of all currently active proxy URLs."""
         query = "SELECT protocol, ip, port FROM proxies WHERE is_active = true;"
         rows = self._execute(query, fetch="all")
-        return {f"{row[0]}://{row[1]}:{row[2]}" for row in rows} if rows else set()
+        return (
+            {f"{row['protocol']}://{row['ip']}:{row['port']}" for row in rows}
+            if rows
+            else set()
+        )
+
+    # Flushes the in-memory feedback buffer to the database
+    def flush_feedback_stats(self, stats_buffer: List[Tuple]):
+        if not stats_buffer:
+            return
+        query = """
+            INSERT INTO source_stats_by_minute (minute, source_name, success_count, failure_count)
+            VALUES %s
+            ON CONFLICT (minute, source_name) DO UPDATE SET
+                success_count = source_stats_by_minute.success_count + EXCLUDED.success_count,
+                failure_count = source_stats_by_minute.failure_count + EXCLUDED.failure_count;
+        """
+        conn = None
+        try:
+            conn = self.pool.getconn()
+            with conn.cursor() as cur:
+                psycopg2.extras.execute_values(cur, query, stats_buffer)
+                conn.commit()
+            logger.info(
+                f"Flushed {len(stats_buffer)} minute-aggregated stats to the database."
+            )
+        except psycopg2.Error as e:
+            logger.error(f"Failed to flush feedback stats to DB: {e}")
+            if conn:
+                conn.rollback()
+        finally:
+            if conn:
+                self.pool.putconn(conn)
+
+    # Gets daily summary stats for the dashboard
+    def get_daily_stats(self, source: str, date: str):
+        query = """
+            SELECT 
+                COALESCE(SUM(success_count), 0) as total_success,
+                COALESCE(SUM(failure_count), 0) as total_failure
+            FROM source_stats_by_minute
+            WHERE source_name = %s AND DATE(minute) = %s;
+        """
+        return self._execute(query, (source, date), fetch="one")
+
+    # Gets time-series stats for the dashboard chart
+    def get_timeseries_stats(self, source: str, date: str, interval_minutes: int):
+        query = """
+            SELECT 
+                date_trunc('hour', minute) + (EXTRACT(minute FROM minute)::int / %s * %s) * interval '1 minute' AS interval_start,
+                SUM(success_count) as success,
+                SUM(failure_count) as failure
+            FROM source_stats_by_minute
+            WHERE source_name = %s AND DATE(minute) = %s
+            GROUP BY interval_start
+            ORDER BY interval_start;
+        """
+        return self._execute(
+            query, (interval_minutes, interval_minutes, source, date), fetch="all"
+        )
 
 
 class ProxyManager:
@@ -145,16 +185,16 @@ class ProxyManager:
 
         # --- In-Memory State ---
         self.active_proxies: Set[str] = set()
-        # [MODIFIED] Full stats pool for all proxies
         self.source_stats: Dict[str, Dict[str, Dict]] = {}
-        # [NEW] Top-K available proxy pool for fast retrieval
         self.available_proxies: Dict[str, List[str]] = {}
 
-        # --- Load Configurable Settings ---
+        # In-memory buffer for minute-level feedback stats
+        self.feedback_buffer = defaultdict(lambda: defaultdict(int))
+        self.last_flush_time = time.time()
+
         self._load_config()
         self._initialize_source_pools()
 
-        # --- Scheduler & Components ---
         self.fetcher_jobs = self._load_fetcher_jobs()
         self.scheduler_thread = None
         self.stop_scheduler_event = threading.Event()
@@ -165,9 +205,7 @@ class ProxyManager:
 
     def _load_config(self):
         """Loads all settings from the config file."""
-        # Server
         self.server_port = self.config.getint("server", "port", fallback=6942)
-        # Validator
         self.validation_workers = self.config.getint(
             "validator", "validation_workers", fallback=100
         )
@@ -180,11 +218,14 @@ class ProxyManager:
         self.validation_supplement_threshold = self.config.getint(
             "validator", "validation_supplement_threshold", fallback=1000
         )
-        # Scheduler
         self.validation_interval_s = self.config.getint(
             "scheduler", "validation_interval_seconds", fallback=60
         )
-        # Sources
+        # Interval for flushing feedback buffer
+        self.stats_flush_interval_s = self.config.getint(
+            "scheduler", "stats_flush_interval_seconds", fallback=60
+        )
+
         sources_str = self.config.get(
             "sources", "predefined_sources", fallback="default"
         )
@@ -196,7 +237,7 @@ class ProxyManager:
         )
         if self.default_source not in self.predefined_sources:
             self.predefined_sources.add(self.default_source)
-        # Source Pool
+
         self.max_pool_size = self.config.getint(
             "source_pool", "max_pool_size", fallback=500
         )
@@ -207,7 +248,7 @@ class ProxyManager:
         logger.info("Configuration loaded.")
 
     def _initialize_source_pools(self):
-        """Initializes in-memory stats and available pools for all predefined sources."""
+        """Initializes in-memory structures for all predefined sources."""
         with self.lock:
             for source in self.predefined_sources:
                 if source not in self.source_stats:
@@ -216,56 +257,6 @@ class ProxyManager:
             logger.info(
                 f"Initialized in-memory pools for sources: {self.predefined_sources}"
             )
-
-    def reload_sources_from_config(self) -> Dict:
-        """
-        Reloads the predefined sources from the config file, adding new ones
-        and removing deprecated ones from the in-memory state.
-        """
-        logger.info(f"Attempting to hot-reload sources from {self.config_path}...")
-        new_config = configparser.ConfigParser()
-        new_config.read(self.config_path, encoding="utf-8")
-        new_sources_str = new_config.get(
-            "sources", "predefined_sources", fallback="default"
-        )
-        new_sources_set = {s.strip() for s in new_sources_str.split(",") if s.strip()}
-        new_default_source = new_config.get(
-            "sources", "default_source", fallback="default"
-        )
-        if new_default_source not in new_sources_set:
-            new_sources_set.add(new_default_source)
-
-        with self.lock:
-            current_sources_set = self.predefined_sources
-            added_sources = new_sources_set - current_sources_set
-            removed_sources = current_sources_set - new_sources_set
-
-            for source in removed_sources:
-                if source in self.source_stats:
-                    del self.source_stats[source]
-                if source in self.available_proxies:
-                    del self.available_proxies[source]
-                logger.info(f"Removed deprecated source from memory: {source}")
-
-            for source in added_sources:
-                self.source_stats[source] = {}
-                self.available_proxies[source] = []
-                # Immediately populate with existing active proxies
-                for url in self.active_proxies:
-                    self.source_stats[source][url] = self._get_new_proxy_stat()
-                logger.info(f"Added new source to memory: {source}")
-
-            # After adding/removing, re-sync and select top K
-            self._sync_and_select_top_proxies()
-
-            self.predefined_sources = new_sources_set
-            self.default_source = new_default_source
-
-        result = {"added": list(added_sources), "removed": list(removed_sources)}
-        logger.info(
-            f"Source reload complete. Added: {len(added_sources)}, Removed: {len(removed_sources)}."
-        )
-        return result
 
     def _load_fetcher_jobs(self) -> List[Dict]:
         """Loads proxy source jobs from the config file."""
@@ -398,14 +389,13 @@ class ProxyManager:
             logger.info(
                 f"Validation cycle finished. Success: {success_count}, Failed: {total_to_validate - success_count}."
             )
-            # [MODIFIED] Call the new sync and select method
+            # Call the new sync and select method
             self._sync_and_select_top_proxies()
         finally:
             with self.lock:
                 self.is_validating = False
             logger.info("Validation cycle lock released.")
 
-    # [REPLACED] Replaced _sync_source_pools_after_validation with this new method
     def _sync_and_select_top_proxies(self):
         """
         Syncs stats with all active proxies, resets stats for new ones,
@@ -445,20 +435,58 @@ class ProxyManager:
                     f"Selected Top {len(self.available_proxies[source])} for active pool."
                 )
 
+    # Flushes the feedback buffer to the database
+    def _flush_feedback_buffer(self):
+        """Copies and clears the buffer, then writes its contents to the DB."""
+        with self.lock:
+            if not self.feedback_buffer:
+                return
+
+            # Create a copy of the buffer to be flushed
+            buffer_copy = self.feedback_buffer
+            # Reset the main buffer
+            self.feedback_buffer = defaultdict(lambda: defaultdict(int))
+
+        # Prepare data for batch insert
+        records_to_flush = []
+        now = datetime.now().replace(second=0, microsecond=0)  # Truncate to the minute
+
+        for source, counts in buffer_copy.items():
+            records_to_flush.append(
+                (now, source, counts.get("success", 0), counts.get("failure", 0))
+            )
+
+        if records_to_flush:
+            self.db.flush_feedback_stats(records_to_flush)
+
     def _scheduler_loop(self):
-        """The main loop for the background scheduler."""
+        """The main loop for background tasks."""
         last_validation_run = 0
         while not self.stop_scheduler_event.is_set():
             now = time.time()
             try:
+                # --- Fetcher Jobs ---
                 for job in self.fetcher_jobs:
-                    if now - job["last_run"] >= job["interval_minutes"] * 60:
+                    if now - job.get("last_run", 0) >= job["interval_minutes"] * 60:
                         job["last_run"] = now
                         self.fetch_executor.submit(self._fetch_and_parse_source, job)
+
+                # --- Validation Cycle ---
                 if now - last_validation_run >= self.validation_interval_s:
                     last_validation_run = now
-                    threading.Thread(target=self._run_validation_cycle).start()
-                self.stop_scheduler_event.wait(5)
+                    threading.Thread(
+                        target=self._run_validation_cycle, daemon=True
+                    ).start()
+
+                # --- Stats Flushing ---
+                if now - self.last_flush_time >= self.stats_flush_interval_s:
+                    self.last_flush_time = now
+                    # Run in a separate thread to avoid blocking the scheduler loop
+                    threading.Thread(
+                        target=self._flush_feedback_buffer, daemon=True
+                    ).start()
+
+                self.stop_scheduler_event.wait(5)  # Check every 5 seconds
             except Exception as e:
                 logger.error(f"Error in scheduler loop: {e}", exc_info=True)
                 self.stop_scheduler_event.wait(60)
@@ -473,15 +501,16 @@ class ProxyManager:
             logger.info("Background scheduler started.")
 
     def stop_scheduler(self):
+        logger.info("Stopping scheduler and flushing final stats...")
+        self._flush_feedback_buffer()  # Final flush before exit
         if self.scheduler_thread and self.scheduler_thread.is_alive():
             self.stop_scheduler_event.set()
             self.fetch_executor.shutdown(wait=True)
             self.scheduler_thread.join(timeout=10)
             logger.info("Background scheduler stopped.")
 
-    # [MODIFIED] Renamed from _get_new_source_stat
     def _get_new_proxy_stat(self) -> Dict:
-        """Returns a clean, default state for a proxy."""
+        """Returns a clean, default state for a proxy's score."""
         return {
             "score": 0,
             "success_count": 0,
@@ -493,7 +522,6 @@ class ProxyManager:
         """Returns the source if predefined, otherwise returns the default source."""
         return source if source in self.predefined_sources else self.default_source
 
-    # [MODIFIED] Get proxy logic is now much simpler
     def get_proxy(self, source: str) -> Optional[str]:
         """Gets a random proxy from the pre-selected available pool for a source."""
         source = self._get_source_or_default(source)
@@ -503,59 +531,57 @@ class ProxyManager:
                 return None
             return random.choice(proxy_pool)
 
+    # Processes feedback by updating the in-memory buffer and proxy score
     def process_feedback(
         self,
         source: str,
         proxy_url: str,
-        status: str,
+        status_code: int,
         response_time_ms: Optional[int] = None,
     ):
-        """
-        Processes feedback with latency-aware scoring and exponential penalties.
-        """
         source = self._get_source_or_default(source)
+
+        is_success = status_code in SUCCESS_STATUS_CODES
+
         with self.lock:
+            # --- Part 1: Update the minute-level statistics buffer ---
+            if is_success:
+                self.feedback_buffer[source]["success"] += 1
+            else:
+                self.feedback_buffer[source]["failure"] += 1
+
+            # --- Part 2: Update the in-memory proxy score for selection logic ---
             stat = self.source_stats.get(source, {}).get(proxy_url)
             if not stat:
                 return
 
-            if status == "success":
+            if is_success:
                 stat["success_count"] += 1
-
                 base_score_gain = 1
-                latency_bonus = 0
-
-                if response_time_ms is not None and response_time_ms > 0:
-                    latency_bonus = max(0, round((2000 - response_time_ms) / 400.0, 2))
-
+                latency_bonus = max(
+                    0, round((2000 - (response_time_ms or 2000)) / 400.0, 2)
+                )
                 total_gain = base_score_gain + latency_bonus
-
-                if stat["consecutive_failures"] > 0:
-                    stat["score"] = total_gain
-                else:
-                    stat["score"] += total_gain
-
+                stat["score"] = (
+                    total_gain
+                    if stat["consecutive_failures"] > 0
+                    else stat["score"] + total_gain
+                )
                 stat["consecutive_failures"] = 0
-
-            elif status == "failure":
+            else:  # Failure
                 stat["failure_count"] += 1
                 stat["consecutive_failures"] += 1
-
                 penalty_index = min(
                     stat["consecutive_failures"] - 1, len(self.failure_penalties) - 1
                 )
                 penalty = self.failure_penalties[penalty_index]
                 stat["score"] += penalty
-                logger.info(
-                    f"FAILURE: {proxy_url} for '{source}'. Penalty: {penalty}. New Score: {stat['score']}"
-                )
 
 
 def load_proxy_manager(config_path: str) -> ProxyManager:
     """Loads ProxyManager and initializes its state."""
     logger.info("Initializing ProxyManager...")
     manager = ProxyManager(config_path)
-    # [MODIFIED] Initial sync logic
     manager._sync_and_select_top_proxies()
     if not manager.active_proxies:
         logger.warning(
@@ -574,10 +600,12 @@ def load_proxy_manager(config_path: str) -> ProxyManager:
 
 
 # --- Flask API Server ---
-app = Flask(__name__)
+app = Flask(__name__, static_folder="dashboard/dist")
+CORS(app)
 proxy_manager = load_proxy_manager(CONFIG_FILE_PATH)
 
 
+# --- API Endpoints ---
 @app.route("/get-proxy", methods=["GET"])
 def get_proxy():
     source = request.args.get("source")
@@ -596,18 +624,24 @@ def get_proxy():
 
 
 @app.route("/feedback", methods=["POST"])
-def feedback():
+def feedback_route():
     data = request.json
-    source, proxy_url, status, resp_time = (
-        data.get("source"),
-        data.get("proxy"),
-        data.get("status"),
-        data.get("response_time_ms"),
-    )
-    logger.info(f"Handled feedback: {source} - {status} - {proxy_url} - {resp_time}")
-    if not all([source, proxy_url, status]) or status not in ["success", "failure"]:
-        return jsonify({"error": "Invalid feedback data."}), 400
-    proxy_manager.process_feedback(source, proxy_url, status, resp_time)
+    source = data.get("source")
+    proxy_url = data.get("proxy")
+    status_code = data.get("status_code")  # [MODIFIED]
+    resp_time = data.get("response_time_ms")
+
+    if not all([source, proxy_url]) or not isinstance(status_code, int):
+        return (
+            jsonify(
+                {
+                    "error": "Invalid feedback data. 'source', 'proxy', and 'status_code' (int) are required."
+                }
+            ),
+            400,
+        )
+
+    proxy_manager.process_feedback(source, proxy_url, status_code, resp_time)
     return jsonify({"message": "Feedback received."})
 
 
@@ -618,8 +652,77 @@ def reload_sources():
     return jsonify(result)
 
 
+# --- Dashboard API Endpoints ---
+@app.route("/api/sources", methods=["GET"])
+def get_sources():
+    """Returns the list of predefined source names."""
+    return jsonify(list(proxy_manager.predefined_sources))
+
+
+@app.route("/api/stats/daily", methods=["GET"])
+def get_daily_stats_route():
+    source = request.args.get("source")
+    date = request.args.get("date")  # Expected format: YYYY-MM-DD
+    if not all([source, date]):
+        return (
+            jsonify({"error": "'source' and 'date' query parameters are required."}),
+            400,
+        )
+
+    stats = proxy_manager.db.get_daily_stats(source, date)
+    if stats:
+        total = stats["total_success"] + stats["total_failure"]
+        success_rate = (stats["total_success"] / total * 100) if total > 0 else 0
+        return jsonify(
+            {
+                "total_requests": total,
+                "total_success": stats["total_success"],
+                "success_rate": round(success_rate, 2),
+            }
+        )
+    return jsonify({"total_requests": 0, "total_success": 0, "success_rate": 0})
+
+
+@app.route("/api/stats/timeseries", methods=["GET"])
+def get_timeseries_stats_route():
+    source = request.args.get("source")
+    date = request.args.get("date")
+    interval = request.args.get("interval", "10", type=int)
+    if not all([source, date]):
+        return (
+            jsonify({"error": "'source' and 'date' query parameters are required."}),
+            400,
+        )
+    if interval not in [5, 10, 60]:
+        return jsonify({"error": "'interval' must be 5, 10, or 60."}), 400
+
+    stats = proxy_manager.db.get_timeseries_stats(source, date, interval)
+
+    results = []
+    for row in stats:
+        total = row["success"] + row["failure"]
+        success_rate = (row["success"] / total * 100) if total > 0 else 0
+        results.append(
+            {
+                "time": row["interval_start"].strftime("%H:%M"),
+                "success_rate": round(success_rate, 2),
+            }
+        )
+    return jsonify(results)
+
+
+# --- Frontend Serving ---
+@app.route("/", defaults={"path": ""})
+@app.route("/<path:path>")
+def serve_frontend(path):
+    if path != "" and os.path.exists(os.path.join(app.static_folder, path)):
+        return send_from_directory(app.static_folder, path)
+    else:
+        return send_from_directory(app.static_folder, "index.html")
+
+
 def handle_shutdown(signal, frame):
-    logger.info("Shutdown signal received. Stopping scheduler...")
+    logger.info("Shutdown signal received. Performing graceful shutdown...")
     proxy_manager.stop_scheduler()
     sys.exit(0)
 
