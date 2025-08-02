@@ -372,6 +372,7 @@ class ProxyManager:
             logger.info(f"Starting validation for {total_to_validate} proxies...")
 
             success_count = 0
+            processed_count = 0
             with ThreadPoolExecutor(max_workers=self.validation_workers) as executor:
                 future_to_proxy = {
                     executor.submit(
@@ -380,12 +381,20 @@ class ProxyManager:
                     for p in proxies_to_validate
                 }
                 for future in as_completed(future_to_proxy):
+                    processed_count += 1
                     try:
                         if future.result():
                             success_count += 1
                     except Exception as exc:
                         logger.error(f"Proxy validation generated an exception: {exc}")
 
+                    if (
+                        processed_count % 500 == 0
+                        and processed_count < total_to_validate
+                    ):
+                        logger.info(
+                            f"Validation progress: {processed_count}/{total_to_validate} proxies checked."
+                        )
             logger.info(
                 f"Validation cycle finished. Success: {success_count}, Failed: {total_to_validate - success_count}."
             )
