@@ -2,6 +2,8 @@
 
 This is a high-performance, intelligent proxy service built with Python. This version introduces a major upgrade: a persistent statistics module and a real-time monitoring dashboard built with React.
 
+![Dashboard Screenshot](.github/assets/dashboard.png)
+
 ## **Core Architecture**
 
 * **PostgreSQL Backend**: Stores all discovered proxies and new minute-level performance statistics.  
