@@ -754,6 +754,7 @@ def get_timeseries_stats_route():
                 "time": row["interval_start"].strftime("%H:%M"),
                 "success_rate": round(success_rate, 2),
                 "total_requests": total,
+                "success_count": row["success"],
             }
         )
     return jsonify(results)
