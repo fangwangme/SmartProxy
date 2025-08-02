@@ -56,6 +56,7 @@ This is a high-performance, intelligent proxy service built with Python. This ve
    * Return to the project root directory.  
    * Start the server:  
      python smart\_proxy.py
+     nohup python smart_proxy.py > /dev/null 2>&1 &
 
    * The server will start (default: http://0.0.0.0:6942).  
    * Open your browser and navigate to http://127.0.0.1:6942 to see the monitoring dashboard.
