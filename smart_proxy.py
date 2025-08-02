@@ -157,18 +157,26 @@ class DatabaseManager:
 
     # Gets time-series stats for the dashboard chart
     def get_timeseries_stats(self, source: str, date: str, interval_minutes: int):
+        """
+        Calculates the success rate for each interval within a specific day.
+        """
         query = """
-            SELECT 
-                date_trunc('hour', minute) + (EXTRACT(minute FROM minute)::int / %s * %s) * interval '1 minute' AS interval_start,
+            SELECT
+                -- Truncate the timestamp to the desired interval
+                date_trunc('hour', minute) + (EXTRACT(minute FROM minute)::int / %(interval)s * %(interval)s) * interval '1 minute' AS interval_start,
                 SUM(success_count) as success,
                 SUM(failure_count) as failure
             FROM source_stats_by_minute
-            WHERE source_name = %s AND DATE(minute) = %s
+            WHERE
+                source_name = %(source)s AND
+                DATE(minute) = %(date)s
             GROUP BY interval_start
             ORDER BY interval_start;
         """
         return self._execute(
-            query, (interval_minutes, interval_minutes, source, date), fetch="all"
+            query,
+            {"source": source, "date": date, "interval": interval_minutes},
+            fetch="all",
         )
 
     # Gets a list of all unique source names from the stats table.
@@ -735,6 +743,7 @@ def get_timeseries_stats_route():
     source = request.args.get("source")
     date = request.args.get("date")
     interval = request.args.get("interval", "10", type=int)
+
     if not all([source, date]):
         return (
             jsonify({"error": "'source' and 'date' query parameters are required."}),
@@ -753,6 +762,7 @@ def get_timeseries_stats_route():
             {
                 "time": row["interval_start"].strftime("%H:%M"),
                 "success_rate": round(success_rate, 2),
+                "total_requests": total,
             }
         )
     return jsonify(results)
