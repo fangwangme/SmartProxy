@@ -741,8 +741,9 @@ def get_timeseries_stats_route():
             jsonify({"error": "'source' and 'date' query parameters are required."}),
             400,
         )
-    if interval not in [5, 10, 60]:
-        return jsonify({"error": "'interval' must be 5, 10, or 60."}), 400
+    valid_intervals = [2, 5, 10, 30, 60]
+    if interval not in valid_intervals:
+        return jsonify({"error": f"'interval' must be one of {valid_intervals}."}), 400
     stats = proxy_manager.db.get_timeseries_stats(source, date, interval)
     results = []
     for row in stats:
