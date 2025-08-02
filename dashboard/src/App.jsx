@@ -12,6 +12,7 @@ const CustomTooltip = ({ active, payload, label }) => {
       <div className="bg-gray-800 p-3 rounded-lg border border-gray-700 shadow-lg text-sm">
         <p className="label text-gray-300">{`Time : ${label}`}</p>
         <p className="intro text-cyan-400">{`Interval Success Rate : ${data.success_rate}%`}</p>
+        <p className="desc text-gray-400">{`Successful Requests: ${data.success_count.toLocaleString()}`}</p>
         <p className="desc text-gray-400">{`Interval Requests: ${data.total_requests.toLocaleString()}`}</p>
       </div>
     );
