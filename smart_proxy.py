@@ -503,24 +503,39 @@ class ProxyManager:
                 return None
             return random.choice(proxy_pool)
 
-    # [MODIFIED] Feedback logic with score reset
-    def process_feedback(self, source: str, proxy_url: str, status: str):
-        """Processes feedback, updating scores in the main stats pool."""
+    def process_feedback(
+        self,
+        source: str,
+        proxy_url: str,
+        status: str,
+        response_time_ms: Optional[int] = None,
+    ):
+        """
+        Processes feedback with latency-aware scoring and exponential penalties.
+        """
         source = self._get_source_or_default(source)
         with self.lock:
-            # Feedback always updates the main stats pool, not the available pool
             stat = self.source_stats.get(source, {}).get(proxy_url)
             if not stat:
                 return
 
             if status == "success":
                 stat["success_count"] += 1
-                # [NEW] If it was failing before, a single success resets its score to 1
+
+                base_score_gain = 1
+                latency_bonus = 0
+
+                if response_time_ms is not None and response_time_ms > 0:
+                    latency_bonus = max(0, round((2000 - response_time_ms) / 400.0, 2))
+
+                total_gain = base_score_gain + latency_bonus
+
                 if stat["consecutive_failures"] > 0:
-                    stat["score"] = 1
+                    stat["score"] = total_gain
                 else:
-                    stat["score"] += 1
-                stat["consecutive_failures"] = 0  # Reset on success
+                    stat["score"] += total_gain
+
+                stat["consecutive_failures"] = 0
 
             elif status == "failure":
                 stat["failure_count"] += 1
@@ -532,11 +547,8 @@ class ProxyManager:
                 penalty = self.failure_penalties[penalty_index]
                 stat["score"] += penalty
                 logger.info(
-                    f"Proxy {proxy_url} failed for source '{source}'. "
-                    f"Penalty: {penalty}. New score: {stat['score']}"
+                    f"FAILURE: {proxy_url} for '{source}'. Penalty: {penalty}. New Score: {stat['score']}"
                 )
-        # Note: We do not re-sort the available_proxies pool on every feedback call.
-        # It is only updated after the next validation cycle. This is more efficient.
 
 
 def load_proxy_manager(config_path: str) -> ProxyManager:
@@ -595,7 +607,7 @@ def feedback():
     logger.info(f"Handled feedback: {source} - {status} - {proxy_url} - {resp_time}")
     if not all([source, proxy_url, status]) or status not in ["success", "failure"]:
         return jsonify({"error": "Invalid feedback data."}), 400
-    proxy_manager.process_feedback(source, proxy_url, status)
+    proxy_manager.process_feedback(source, proxy_url, status, resp_time)
     return jsonify({"message": "Feedback received."})
 
 
