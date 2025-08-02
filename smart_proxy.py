@@ -171,6 +171,13 @@ class DatabaseManager:
             query, (interval_minutes, interval_minutes, source, date), fetch="all"
         )
 
+    # Gets a list of all unique source names from the stats table.
+    def get_distinct_sources(self) -> List[str]:
+        """Gets a list of all unique source names from the stats table."""
+        query = "SELECT DISTINCT source_name FROM source_stats_by_minute ORDER BY source_name;"
+        rows = self._execute(query, fetch="all")
+        return [row["source_name"] for row in rows] if rows else []
+
 
 class ProxyManager:
     """Manages the proxy lifecycle, state, and business logic."""
@@ -191,6 +198,9 @@ class ProxyManager:
         # In-memory buffer for minute-level feedback stats
         self.feedback_buffer = defaultdict(lambda: defaultdict(int))
         self.last_flush_time = time.time()
+
+        self.dashboard_sources: Set[str] = set()
+        self.last_source_refresh_time = 0
 
         self._load_config()
         self._initialize_source_pools()
@@ -224,6 +234,10 @@ class ProxyManager:
         # Interval for flushing feedback buffer
         self.stats_flush_interval_s = self.config.getint(
             "scheduler", "stats_flush_interval_seconds", fallback=60
+        )
+
+        self.source_refresh_interval_s = self.config.getint(
+            "scheduler", "source_refresh_interval_seconds", fallback=3600
         )
 
         sources_str = self.config.get(
@@ -468,6 +482,17 @@ class ProxyManager:
         if records_to_flush:
             self.db.flush_feedback_stats(records_to_flush)
 
+    # Periodically refreshes the list of sources for the dashboard from the DB.
+    def _update_dashboard_sources(self):
+        """Periodically refreshes the list of sources for the dashboard from the DB."""
+        logger.info("Refreshing dashboard sources from database...")
+        db_sources = self.db.get_distinct_sources()
+        with self.lock:
+            self.dashboard_sources = set(db_sources)
+        logger.info(
+            f"Dashboard sources updated: {len(self.dashboard_sources)} sources found."
+        )
+
     def _scheduler_loop(self):
         """The main loop for background tasks."""
         last_validation_run = 0
@@ -493,6 +518,16 @@ class ProxyManager:
                     # Run in a separate thread to avoid blocking the scheduler loop
                     threading.Thread(
                         target=self._flush_feedback_buffer, daemon=True
+                    ).start()
+
+                # --- Dashboard Source Refresh ---
+                if (
+                    now - self.last_source_refresh_time
+                    >= self.source_refresh_interval_s
+                ):
+                    self.last_source_refresh_time = now
+                    threading.Thread(
+                        target=self._update_dashboard_sources, daemon=True
                     ).start()
 
                 self.stop_scheduler_event.wait(5)  # Check every 5 seconds
@@ -637,8 +672,11 @@ def feedback_route():
     data = request.json
     source = data.get("source")
     proxy_url = data.get("proxy")
-    status_code = data.get("status_code")  # [MODIFIED]
+    status_code = data.get("status")  # [MODIFIED]
     resp_time = data.get("response_time_ms")
+    logger.info(
+        f"Handled feedback: {source} - {status_code} - {proxy_url} - {resp_time}"
+    )
 
     if not all([source, proxy_url]) or not isinstance(status_code, int):
         return (
@@ -664,8 +702,8 @@ def reload_sources():
 # --- Dashboard API Endpoints ---
 @app.route("/api/sources", methods=["GET"])
 def get_sources():
-    """Returns the list of predefined source names."""
-    return jsonify(list(proxy_manager.predefined_sources))
+    """Returns the list of source names found in the stats database (cached)."""
+    return jsonify(sorted(list(proxy_manager.dashboard_sources)))
 
 
 @app.route("/api/stats/daily", methods=["GET"])

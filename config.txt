@@ -26,6 +26,10 @@ validation_supplement_threshold = 2000
 # The fixed interval in seconds at which the validation task is triggered.
 validation_interval_seconds = 120
 
+stats_flush_interval_seconds = 60
+
+source_refresh_interval_seconds = 3600
+
 
 [sources]
 # [NEW] A comma-separated list of all predefined, valid source names.
