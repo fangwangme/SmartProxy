@@ -179,13 +179,16 @@ function App() {
               {loading ? (
                  <div className="flex items-center justify-center h-full text-gray-500">Loading chart data...</div>
               ) : timeseriesData.length > 0 ? (
-                <LineChart data={timeseriesData} margin={{ top: 5, right: 20, left: -10, bottom: 5 }}>
+                <LineChart data={timeseriesData} margin={{ top: 5, right: 20, left: 0, bottom: 5 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#4A5568" />
                   <XAxis dataKey="time" stroke="#A0AEC0" />
-                  <YAxis stroke="#A0AEC0" unit="%" domain={[0, 100]} />
+                  {/* [MODIFIED] Added yAxisId to both YAxis and Line components */}
+                  <YAxis yAxisId="left" stroke="#2DD4BF" unit="%" domain={[0, 100]} />
+                  <YAxis yAxisId="right" orientation="right" stroke="#8884d8" />
                   <Tooltip content={<CustomTooltip />} />
                   <Legend wrapperStyle={{ color: '#E2E8F0' }} />
-                  <Line type="monotone" dataKey="success_rate" name="Interval Success Rate" stroke="#2DD4BF" strokeWidth={2} dot={false} />
+                  <Line yAxisId="left" type="monotone" dataKey="success_rate" name="Success Rate" stroke="#2DD4BF" strokeWidth={2} dot={false} />
+                  <Line yAxisId="right" type="monotone" dataKey="total_requests" name="Request Count" stroke="#8884d8" strokeWidth={2} dot={false} />
                 </LineChart>
               ) : (
                 <div className="flex items-center justify-center h-full text-gray-500">
