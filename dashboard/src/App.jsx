@@ -26,7 +26,9 @@ function App() {
   const [selectedDate, setSelectedDate] = useState(toYYYYMMDD(new Date()));
   const [dailyStats, setDailyStats] = useState(null);
   const [timeseriesData, setTimeseriesData] = useState([]);
-  const [interval, setInterval] = useState(10);
+  // [MODIFIED] Changed default interval to 5 and defined the new list of intervals
+  const [interval, setInterval] = useState(2);
+  const validIntervals = [2, 5, 10, 30, 60];
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
@@ -104,7 +106,7 @@ function App() {
           </div>
         )}
 
-        {/* [MODIFIED] Controls section with optimized layout */}
+        {/* Controls */}
         <div className="bg-gray-800 p-4 rounded-lg mb-8 flex flex-wrap items-end gap-4 shadow-lg">
           <div>
             <label htmlFor="source-select" className="block text-sm font-medium text-gray-300 mb-1">Source</label>
@@ -157,9 +159,10 @@ function App() {
         <div className="bg-gray-800 p-4 sm:p-6 rounded-lg shadow-lg">
           <div className="flex justify-between items-center mb-4">
             <h2 className="text-xl font-semibold text-gray-200">Success Rate by Time Interval</h2>
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 flex-wrap">
               <span className="text-sm text-gray-400">Interval:</span>
-              {[5, 10, 60].map(val => (
+              {/* [MODIFIED] Mapped over the new list of intervals */}
+              {validIntervals.map(val => (
                 <button
                   key={val}
                   onClick={() => setInterval(val)}
