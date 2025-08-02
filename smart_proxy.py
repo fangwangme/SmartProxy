@@ -330,9 +330,6 @@ class ProxyManager:
             return True
         except (requests.RequestException, json.JSONDecodeError) as e:
             self.db.update_proxy_validation_result(proxy_id, False, None, None)
-            logger.info(
-                f"Validation FAILED for proxy: {proxy_url}. Reason: {type(e).__name__}"
-            )
             return False
 
     def _run_validation_cycle(self):
@@ -399,27 +396,51 @@ class ProxyManager:
             logger.info("Validation cycle lock released.")
 
     def _sync_and_select_top_proxies(self):
-        logger.info("Syncing and selecting Top-K proxies for all sources...")
+        """
+        Syncs the stats pool with newly validated proxies and selects the
+        Top-K proxies based purely on their score for the available pool.
+        """
+        logger.info(
+            "Syncing and selecting Top-K proxies for all sources based on score..."
+        )
         newly_active_proxies = self.db.get_active_proxies()
+
         with self.lock:
             self.active_proxies = newly_active_proxies
             for source in self.predefined_sources:
                 stats_pool = self.source_stats.get(source, {})
+
+                # 1. Add any newly discovered active proxies to the stats pool
+                #    with a default score of 0, so they get a chance to be used.
+                #    This step is crucial for introducing new proxies into the system.
                 for proxy_url in self.active_proxies:
                     if proxy_url not in stats_pool:
+                        logger.debug(
+                            f"Adding new active proxy {proxy_url} to stats pool for source '{source}'."
+                        )
                         stats_pool[proxy_url] = self._get_new_proxy_stat()
-                dead_proxies = set(stats_pool.keys()) - self.active_proxies
-                for proxy_url in dead_proxies:
-                    del stats_pool[proxy_url]
+
+                # 2. Sort the ENTIRE stats pool (both active and inactive proxies)
+                #    by score in descending order. This is the core of the new logic.
                 sorted_proxies = sorted(
                     stats_pool.items(), key=lambda item: item[1]["score"], reverse=True
                 )
-                self.available_proxies[source] = [
-                    p_url for p_url, _ in sorted_proxies[: self.max_pool_size]
+
+                # 3. Select the Top K from the sorted list to form the new available pool.
+                #    This pool may contain proxies that are currently inactive, but their
+                #    high score gives them a chance to be tried again.
+                top_k_proxies = [
+                    proxy_url for proxy_url, _ in sorted_proxies[: self.max_pool_size]
                 ]
-                self.source_stats[source] = dict(sorted_proxies)
+                self.available_proxies[source] = top_k_proxies
+
+                # The main self.source_stats[source] pool is NOT modified (no deletions).
+                # It continues to hold all proxies ever seen.
+
                 logger.info(
-                    f"Source '{source}' synced. Total proxies in stats: {len(self.source_stats[source])}. Selected Top {len(self.available_proxies[source])} for active pool."
+                    f"Source '{source}' synced. "
+                    f"Total proxies with stats: {len(self.source_stats[source])}. "
+                    f"Selected Top {len(self.available_proxies[source])} proxies based on score for the active pool."
                 )
 
     def _update_dashboard_sources(self):
