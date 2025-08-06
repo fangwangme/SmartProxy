@@ -23,7 +23,9 @@ from logger import logger
 
 # --- Configuration & Constants ---
 CONFIG_FILE_PATH = os.path.join("./", "config.ini")
-SUCCESS_STATUS_CODES = {100, 7}  # Set of status codes that indicate success
+FAILED_STATUS_CODES = {
+    4,
+}  # Set of status codes that indicate success
 
 
 class DatabaseManager:
@@ -597,7 +599,7 @@ class ProxyManager:
         response_time_ms: Optional[int] = None,
     ):
         source = self._get_source_or_default(source)
-        is_success = status_code in SUCCESS_STATUS_CODES
+        is_success = status_code not in FAILED_STATUS_CODES
 
         # Get the current timestamp truncated to the minute for accurate bucketing
         current_minute = datetime.now().replace(second=0, microsecond=0)
