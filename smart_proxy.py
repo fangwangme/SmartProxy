@@ -637,6 +637,10 @@ class ProxyManager:
                 penalty = self.failure_penalties[penalty_index]
                 stat["score"] += penalty
 
+            logger.info(
+                f"Computed Score for {source} - {proxy_url} - {status_code} - {response_time_ms} -> {stat['score']}"
+            )
+
 
 def load_proxy_manager(config_path: str) -> ProxyManager:
     logger.info("Initializing ProxyManager...")
