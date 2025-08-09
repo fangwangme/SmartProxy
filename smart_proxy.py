@@ -638,7 +638,7 @@ class ProxyManager:
                 stat["score"] += penalty
 
             logger.info(
-                f"Computed Score for {source} - {proxy_url} - {status_code} - {response_time_ms} -> {stat['score']}"
+                f"Computed Score for {source:<15} - {proxy_url:<32} - {status_code:<4} - {response_time_ms:<12.3f}ms -> {stat['score']:<10.4f}"
             )
 
 
