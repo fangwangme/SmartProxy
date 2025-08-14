@@ -24,7 +24,7 @@ from logger import logger
 # --- Configuration & Constants ---
 CONFIG_FILE_PATH = os.path.join("./", "config.ini")
 FAILED_STATUS_CODES = {
-    4,
+    0, 4,
 }  # Set of status codes that indicate success
 
 
@@ -638,7 +638,7 @@ class ProxyManager:
                 stat["score"] += penalty
 
             logger.info(
-                f"Computed Score for {source:<15} - {proxy_url:<32} - {status_code:<4} - {response_time_ms:<12.3f}ms -> {stat['score']:<10.4f}"
+                f"Computed Score for {source:<15} | {proxy_url:<30} | {status_code:<4} | {response_time_ms:<12.3f}ms -> {stat['score']:<10.4f}"
             )
 
 
