@@ -39,6 +39,9 @@ CREATE TABLE proxies (
     
     -- Timestamp of the last time this proxy was successfully or unsuccessfully validated. Indexed.
     last_validated_at TIMESTAMPTZ,
+
+    validation_attempts_in_window INT NOT NULL DEFAULT 0,
+    window_start_time TIMESTAMPTZ,
     
     -- Ensures that each proxy (protocol, ip, port combination) is unique in the table.
     UNIQUE (protocol, ip, port)
@@ -47,6 +50,7 @@ CREATE TABLE proxies (
 -- Create indexes for faster queries on critical columns.
 CREATE INDEX idx_proxies_is_active ON proxies (is_active);
 CREATE INDEX idx_proxies_last_validated_at ON proxies (last_validated_at);
+CREATE INDEX idx_proxies_validation_logic ON proxies (is_active, window_start_time, validation_attempts_in_window);
 
 COMMENT ON TABLE proxies IS 'Stores physical attributes and validation status of all discovered proxies.';
 COMMENT ON COLUMN proxies.is_active IS 'True if the proxy passed the last validation, false otherwise.';
@@ -74,6 +78,7 @@ CREATE TABLE source_stats_by_minute (
 
 -- Create an index on the timestamp for efficient date-based lookups.
 CREATE INDEX idx_source_stats_minute ON source_stats_by_minute (minute);
+CREATE INDEX idx_source_stats_by_minute_source_date ON source_stats_by_minute (source_name, (DATE(minute)));
 
 COMMENT ON TABLE source_stats_by_minute IS 'Stores aggregated success/failure counts for each source per minute.';
 COMMENT ON COLUMN source_stats_by_minute.minute IS 'Timestamp truncated to the minute, e.g., 2025-08-02 16:30:00';

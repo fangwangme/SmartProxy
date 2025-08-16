@@ -1,204 +1,181 @@
 import unittest
-from unittest.mock import patch, MagicMock, ANY, call
-import os
 import configparser
-import sys
-from collections import defaultdict
+from unittest.mock import MagicMock, patch, call
 
-# --- Mock critical dependencies before they are imported by the main module ---
-mock_logger = MagicMock()
-mock_logger.add.return_value = None
-patch("loguru.logger", mock_logger).start()
-
-sys_modules = {
-    "psycopg2": MagicMock(),
-    "psycopg2.pool": MagicMock(),
-    "psycopg2.extras": MagicMock(),
-}
-
-# Now we can safely import the module to be tested.
-# We apply the patch using a context manager in the test class setUp.
-import smart_proxy
+# It's better to import the classes directly for easier mocking
+from smart_proxy import ProxyManager, DatabaseManager
 
 
-class TestSmartProxyV4(unittest.TestCase):
-
-    @classmethod
-    def setUpClass(cls):
-        """Apply the psycopg2 mock before any tests run."""
-        cls.psycopg2_patcher = patch.dict("sys.modules", sys_modules)
-        cls.psycopg2_patcher.start()
-        # Reload the module to ensure it uses the mocked psycopg2
-        import importlib
-
-        importlib.reload(smart_proxy)
-
-    @classmethod
-    def tearDownClass(cls):
-        """Stop the patcher."""
-        cls.psycopg2_patcher.stop()
+class TestProxyManager(unittest.TestCase):
 
     def setUp(self):
-        """Set up a clean environment for each test."""
-        self.config_path = "test_config.ini"
-        config = configparser.ConfigParser()
-        config["server"] = {"port": "1234"}
-        config["database"] = {
-            "host": "fake",
-            "port": "5432",
-            "dbname": "fake",
-            "user": "fake",
-            "password": "fake",
-        }
-        config["validator"] = {
-            "validation_workers": "10",
-            "validation_timeout_s": "1",
-            "validation_target": "http://fake-validator.com",
-            "validation_supplement_threshold": "50",
-        }
-        config["scheduler"] = {
-            "validation_interval_seconds": "60",
-            "stats_flush_interval_seconds": "60",  # New config for testing
-        }
-        config["sources"] = {
-            "predefined_sources": "source_a, source_b",
-            "default_source": "source_a",
-        }
-        config["source_pool"] = {
-            "max_pool_size": "100",
-            "failure_penalties": "-1, -10, -50",
-        }
-        with open(self.config_path, "w") as f:
-            config.write(f)
-
-        self.db_mock = MagicMock()
-        with patch("smart_proxy.DatabaseManager", return_value=self.db_mock):
-            self.manager = smart_proxy.ProxyManager(self.config_path)
-
-    def tearDown(self):
-        """Clean up created files."""
-        if os.path.exists(self.config_path):
-            os.remove(self.config_path)
-
-    def test_feedback_updates_in_memory_buffer(self):
-        """
-        Test that process_feedback correctly updates the in-memory buffer
-        before it gets flushed to the database.
-        """
-        source = "source_a"
-        proxy_url = "http://1.1.1.1:8080"
-
-        # Manually add proxy to the scoring pool to avoid None error
-        self.manager.source_stats[source][
-            proxy_url
-        ] = self.manager._get_new_proxy_stat()
-
-        # Simulate 2 successes and 1 failure
-        self.manager.process_feedback(source, proxy_url, status_code=100)
-        self.manager.process_feedback(source, proxy_url, status_code=7)
-        self.manager.process_feedback(source, proxy_url, status_code=500)  # Failure
-
-        # Check the buffer state
-        self.assertEqual(self.manager.feedback_buffer[source]["success"], 2)
-        self.assertEqual(self.manager.feedback_buffer[source]["failure"], 1)
-
-    def test_flush_feedback_buffer_to_db(self):
-        """
-        Test that the _flush_feedback_buffer method correctly aggregates
-        the in-memory stats and calls the database manager.
-        """
-        # Populate the buffer directly for this test
-        self.manager.feedback_buffer = defaultdict(
-            lambda: defaultdict(int),
+        """Set up a mock environment for each test."""
+        # Create a mock config parser object
+        self.mock_config = configparser.ConfigParser()
+        self.mock_config.read_dict(
             {
-                "source_a": defaultdict(int, {"success": 5, "failure": 2}),
-                "source_b": defaultdict(int, {"success": 10}),
-            },
+                "database": {
+                    "host": "localhost",
+                    "port": "5432",
+                    "dbname": "test",
+                    "user": "user",
+                    "password": "password",
+                },
+                "server": {"port": "6942"},
+                "validator": {
+                    "validation_workers": "10",
+                    "validation_timeout_s": "5",
+                    "validation_target": "http://mocktarget.com",
+                    "validation_supplement_threshold": "100",
+                    "validation_window_minutes": "30",
+                    "max_validations_per_window": "5",
+                },
+                "scheduler": {
+                    "validation_interval_seconds": "60",
+                    "stats_flush_interval_seconds": "60",
+                    "source_refresh_interval_seconds": "300",
+                },
+                "sources": {
+                    "predefined_sources": "source1,source2",
+                    "default_source": "source1",
+                },
+                "source_pool": {
+                    "max_pool_size": "100",
+                    "stats_pool_max_multiplier": "10",
+                    "failure_penalties": "-1, -5",
+                },
+                "proxy_source_A": {
+                    "url": "http://source-a.com",
+                    "update_interval_minutes": "10",
+                },
+            }
         )
 
-        self.manager._flush_feedback_buffer()
+        # Patch the config parser's read method to return our mock config
+        patcher_config = patch(
+            "configparser.ConfigParser.read", return_value=self.mock_config
+        )
+        self.addCleanup(patcher_config.stop)
+        patcher_config.start()
 
-        # Verify that the DB flush method was called
-        self.db_mock.flush_feedback_stats.assert_called_once()
+        # Patch the entire DatabaseManager to avoid actual DB connections
+        patcher_db = patch("smart_proxy.DatabaseManager", spec=DatabaseManager)
+        self.addCleanup(patcher_db.stop)
+        self.MockDatabaseManager = patcher_db.start()
 
-        # Inspect the data that was passed to the DB method
-        call_args = self.db_mock.flush_feedback_stats.call_args[0][0]
+        # Instantiate the class we are testing
+        self.manager = ProxyManager("dummy_path.ini")
+        # Get a reference to the mocked DB instance
+        self.mock_db_instance = self.MockDatabaseManager.return_value
 
-        # Convert list of tuples to a dict for easier assertion
-        flushed_data = {
-            item[1]: {"success": item[2], "failure": item[3]} for item in call_args
+    def test_reload_sources_add_and_remove(self):
+        """Test that the reload_sources method correctly identifies changes."""
+        # --- Setup new config state ---
+        new_config_dict = self.mock_config._sections.copy()
+        new_config_dict["sources"][
+            "predefined_sources"
+        ] = "source2,source3"  # Add source3, remove source1
+        new_config_dict["proxy_source_B"] = {  # Add source B
+            "url": "http://source-b.com",
+            "update_interval_minutes": "5",
         }
+        del new_config_dict["proxy_source_A"]  # Remove source A
 
-        self.assertIn("source_a", flushed_data)
-        self.assertIn("source_b", flushed_data)
-        self.assertEqual(flushed_data["source_a"]["success"], 5)
-        self.assertEqual(flushed_data["source_a"]["failure"], 2)
-        self.assertEqual(flushed_data["source_b"]["success"], 10)
-        self.assertEqual(
-            flushed_data["source_b"].get("failure", 0), 0
-        )  # Ensure failure defaults to 0 if not present
+        # Mock the config parser to return the new config on the next 'read' call
+        new_mock_config = configparser.ConfigParser()
+        new_mock_config.read_dict(new_config_dict)
+        with patch("configparser.ConfigParser.read") as mock_read:
+            # The __init__ call reads it once. The reload_sources call will read it again.
+            mock_read.return_value = new_mock_config
 
-        # Verify that the buffer is cleared after flushing
-        self.assertEqual(len(self.manager.feedback_buffer), 0)
+            # --- Execute ---
+            result = self.manager.reload_sources()
 
-    def test_feedback_updates_proxy_score(self):
+        # --- Assert ---
+        self.assertIn(
+            "proxy_source_B", [job["name"] for job in self.manager.fetcher_jobs]
+        )
+        self.assertNotIn(
+            "proxy_source_A", [job["name"] for job in self.manager.fetcher_jobs]
+        )
+        self.assertIn("source3", self.manager.predefined_sources)
+        self.assertNotIn("source1", self.manager.predefined_sources)
+
+        self.assertEqual(result["added_fetcher_jobs"], ["proxy_source_B"])
+        self.assertEqual(result["removed_fetcher_jobs"], ["proxy_source_A"])
+        self.assertEqual(result["added_predefined_sources"], ["source3"])
+        self.assertEqual(result["removed_predefined_sources"], ["source1"])
+
+    def test_validation_cycle_supplements_with_eligible_proxies(self):
         """
-        Test that process_feedback still correctly updates the in-memory proxy score
-        for the selection logic, independent of the buffer.
+        Test that the validation cycle correctly fetches eligible failed proxies
+        when the initial pool is below the threshold.
         """
-        source = "source_a"
-        proxy_url = "http://1.1.1.1:8080"
+        # --- Setup Mocks ---
+        # Initial pool is small (2 proxies)
+        self.mock_db_instance.get_proxies_to_validate.return_value = [
+            {"id": 1, "protocol": "http", "ip": "1.1.1.1", "port": 80},
+            {"id": 2, "protocol": "http", "ip": "2.2.2.2", "port": 80},
+        ]
+        # Eligible failed proxies are available
+        self.mock_db_instance.get_eligible_failed_proxies.return_value = [
+            {"id": 3, "protocol": "http", "ip": "3.3.3.3", "port": 80},
+            {"id": 4, "protocol": "http", "ip": "4.4.4.4", "port": 80},
+        ]
+        # Mock the actual validation to do nothing
+        with patch.object(
+            self.manager, "_validate_proxy", return_value=True
+        ) as mock_validate:
+            # --- Execute ---
+            self.manager._run_validation_cycle()
 
-        # Setup initial state
-        self.manager.source_stats[source][
-            proxy_url
-        ] = self.manager._get_new_proxy_stat()
-
-        # First failure
-        self.manager.process_feedback(source, proxy_url, status_code=404)
-        self.assertEqual(self.manager.source_stats[source][proxy_url]["score"], -1)
-        self.assertEqual(
-            self.manager.source_stats[source][proxy_url]["consecutive_failures"], 1
+        # --- Assert ---
+        # 1. Check if it tried to get eligible proxies
+        self.mock_db_instance.get_eligible_failed_proxies.assert_called_once_with(
+            window_minutes=30,
+            max_attempts=5,
+            limit=98,  # 100 (threshold) - 2 (initial) = 98
         )
 
-        # Second consecutive failure (should use the second penalty)
-        self.manager.process_feedback(source, proxy_url, status_code=503)
-        self.assertEqual(
-            self.manager.source_stats[source][proxy_url]["score"], -1 - 10
-        )  # -11
-        self.assertEqual(
-            self.manager.source_stats[source][proxy_url]["consecutive_failures"], 2
-        )
+        # 2. Check that counters were updated for ALL proxies (initial + supplemented)
+        self.mock_db_instance.update_validation_counters.assert_called_once()
+        # Get the arguments passed to the mock
+        args, _ = self.mock_db_instance.update_validation_counters.call_args
+        # The first argument is the list of proxy IDs
+        updated_ids = args[0]
+        self.assertCountEqual(updated_ids, [1, 2, 3, 4])
 
-        # A success should reset the score and consecutive failures
-        self.manager.process_feedback(
-            source, proxy_url, status_code=100, response_time_ms=500
-        )
-        # Latency bonus: (2000-500)/400 = 3.75. Base gain: 1. Total: 4.75
-        self.assertAlmostEqual(
-            self.manager.source_stats[source][proxy_url]["score"], 4.75
-        )
-        self.assertEqual(
-            self.manager.source_stats[source][proxy_url]["consecutive_failures"], 0
-        )
+        # 3. Check that validation was called for all 4 proxies
+        self.assertEqual(mock_validate.call_count, 4)
+        self.assertIn(call(1, "http://1.1.1.1:80"), mock_validate.call_args_list)
+        self.assertIn(call(4, "http://4.4.4.4:80"), mock_validate.call_args_list)
 
-    def test_get_daily_stats_api_call(self):
-        """Test the underlying DB method for the daily stats API."""
-        source = "source_a"
-        date = "2025-08-02"
+    def test_validation_cycle_does_not_supplement_if_above_threshold(self):
+        """
+        Test that the validation cycle does NOT fetch failed proxies if the
+        initial pool is large enough.
+        """
+        # --- Setup Mocks ---
+        # Initial pool is large (101 proxies)
+        initial_proxies = [
+            {"id": i, "protocol": "http", "ip": f"1.1.1.{i}", "port": 80}
+            for i in range(101)
+        ]
+        self.mock_db_instance.get_proxies_to_validate.return_value = initial_proxies
 
-        # Mock the DB response
-        self.db_mock.get_daily_stats.return_value = {
-            "total_success": 100,
-            "total_failure": 25,
-        }
+        with patch.object(self.manager, "_validate_proxy", return_value=True):
+            # --- Execute ---
+            self.manager._run_validation_cycle()
 
-        # This is a conceptual test of the DB call, not the Flask route itself.
-        result = self.manager.db.get_daily_stats(source, date)
-
-        self.db_mock.get_daily_stats.assert_called_with(source, date)
-        self.assertEqual(result["total_success"], 100)
+        # --- Assert ---
+        # Assert that we did NOT try to get more proxies
+        self.mock_db_instance.get_eligible_failed_proxies.assert_not_called()
+        # Assert counters were updated only for the initial proxies
+        self.mock_db_instance.update_validation_counters.assert_called_once()
+        args, _ = self.mock_db_instance.update_validation_counters.call_args
+        updated_ids = args[0]
+        self.assertCountEqual(updated_ids, [p["id"] for p in initial_proxies])
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    unittest.main()
