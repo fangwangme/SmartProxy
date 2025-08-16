@@ -24,14 +24,14 @@ from logger import logger
 # --- Configuration & Constants ---
 CONFIG_FILE_PATH = os.path.join("./", "config.ini")
 FAILED_STATUS_CODES = {
-    0, 4,
+    0,
+    4,
 }  # Set of status codes that indicate success
 
 
 class DatabaseManager:
     """Handles all interactions with the PostgreSQL database."""
 
-    # This class remains unchanged.
     def __init__(self, config):
         try:
             self.pool = psycopg2.pool.SimpleConnectionPool(
@@ -53,7 +53,6 @@ class DatabaseManager:
         conn = None
         try:
             conn = self.pool.getconn()
-            # Use a dictionary cursor for easier data handling in API endpoints
             with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
                 cur.execute(query, params)
                 if fetch == "one":
@@ -95,9 +94,57 @@ class DatabaseManager:
         query = "SELECT id, protocol, ip, port FROM proxies WHERE last_validated_at IS NULL OR (is_active = true AND last_validated_at < NOW() - INTERVAL '%s minutes');"
         return self._execute(query, (interval_minutes,), fetch="all") or []
 
-    def get_recent_failed_proxies(self, limit: int) -> List[Tuple]:
-        query = "SELECT id, protocol, ip, port FROM proxies WHERE is_active = false ORDER BY created_at DESC LIMIT %s;"
-        return self._execute(query, (limit,), fetch="all") or []
+    def get_eligible_failed_proxies(
+        self, window_minutes: int, max_attempts: int, limit: int
+    ) -> List[Tuple]:
+        """
+        Gets recently failed proxies that are eligible for re-validation based on the time window and attempt count.
+        """
+        query = """
+            SELECT id, protocol, ip, port
+            FROM proxies
+            WHERE is_active = false
+            AND (
+                window_start_time IS NULL OR
+                NOW() > window_start_time + INTERVAL '%(window)s minutes' OR
+                validation_attempts_in_window < %(max_attempts)s
+            )
+            ORDER BY last_validated_at DESC NULLS FIRST, created_at DESC
+            LIMIT %(limit)s;
+        """
+        params = {
+            "window": window_minutes,
+            "max_attempts": max_attempts,
+            "limit": limit,
+        }
+        return self._execute(query, params, fetch="all") or []
+
+    def update_validation_counters(self, proxy_ids: List[int], window_minutes: int):
+        """
+        Updates the validation counters for a batch of proxies before they are validated.
+        Resets the counter and window if the window has expired.
+        """
+        if not proxy_ids:
+            return
+
+        query = """
+            UPDATE proxies
+            SET
+                validation_attempts_in_window = CASE
+                    WHEN window_start_time IS NULL OR NOW() > window_start_time + INTERVAL '%(window)s minutes'
+                    THEN 1
+                    ELSE validation_attempts_in_window + 1
+                END,
+                window_start_time = CASE
+                    WHEN window_start_time IS NULL OR NOW() > window_start_time + INTERVAL '%(window)s minutes'
+                    THEN NOW()
+                    ELSE window_start_time
+                END
+            WHERE id = ANY(%(ids)s);
+        """
+        params = {"window": window_minutes, "ids": proxy_ids}
+        self._execute(query, params)
+        logger.debug(f"Updated validation counters for {len(proxy_ids)} proxies.")
 
     def update_proxy_validation_result(
         self,
@@ -189,8 +236,6 @@ class ProxyManager:
         self.source_stats: Dict[str, Dict[str, Dict]] = {}
         self.available_proxies: Dict[str, List[str]] = {}
 
-        # [MODIFIED] Buffer structure to be calendar-aware.
-        # Structure: {minute_timestamp: {source_name: {'success': count, 'failure': count}}}
         self.feedback_buffer = defaultdict(
             lambda: defaultdict(lambda: defaultdict(int))
         )
@@ -209,7 +254,6 @@ class ProxyManager:
         )
         self.is_validating = False
 
-    # ... _load_config and other initializers are unchanged ...
     def _load_config(self):
         self.server_port = self.config.getint("server", "port", fallback=6942)
         self.validation_workers = self.config.getint(
@@ -223,6 +267,13 @@ class ProxyManager:
         )
         self.validation_supplement_threshold = self.config.getint(
             "validator", "validation_supplement_threshold", fallback=1000
+        )
+        # New configuration for validation logic
+        self.validation_window_minutes = self.config.getint(
+            "validator", "validation_window_minutes", fallback=30
+        )
+        self.max_validations_per_window = self.config.getint(
+            "validator", "max_validations_per_window", fallback=5
         )
         self.validation_interval_s = self.config.getint(
             "scheduler", "validation_interval_seconds", fallback=60
@@ -283,8 +334,72 @@ class ProxyManager:
                 }
                 if job["url"]:
                     jobs.append(job)
-        logger.info(f"Loaded {len(jobs)} proxy source jobs from config.")
         return jobs
+
+    def reload_sources(self) -> Dict:
+        """
+        Dynamically reloads proxy sources and fetcher jobs from the config file.
+        """
+        logger.info("Attempting to reload sources from config file...")
+        with self.lock:
+            self.config.read(self.config_path, encoding="utf-8")
+
+            old_job_names = {job["name"] for job in self.fetcher_jobs}
+            self.fetcher_jobs = self._load_fetcher_jobs()
+            new_job_names = {job["name"] for job in self.fetcher_jobs}
+            added_jobs = list(new_job_names - old_job_names)
+            removed_jobs = list(old_job_names - new_job_names)
+            if added_jobs or removed_jobs:
+                logger.info(
+                    f"Fetcher jobs reloaded. Added: {added_jobs}, Removed: {removed_jobs}"
+                )
+            else:
+                logger.info("Fetcher jobs reloaded. No changes detected.")
+
+            old_predefined_sources = self.predefined_sources.copy()
+            sources_str = self.config.get(
+                "sources", "predefined_sources", fallback="default"
+            )
+            self.predefined_sources = {
+                s.strip() for s in sources_str.split(",") if s.strip()
+            }
+            self.default_source = self.config.get(
+                "sources", "default_source", fallback="default"
+            )
+            if self.default_source not in self.predefined_sources:
+                self.predefined_sources.add(self.default_source)
+
+            added_sources = list(self.predefined_sources - old_predefined_sources)
+            removed_sources = list(old_predefined_sources - self.predefined_sources)
+
+            if added_sources:
+                logger.info(f"Predefined sources changed. Added: {added_sources}")
+                for source in added_sources:
+                    if source not in self.source_stats:
+                        self.source_stats[source] = {}
+                        self.available_proxies[source] = []
+                        logger.info(
+                            f"Initialized new in-memory pool for source: {source}"
+                        )
+
+            if removed_sources:
+                logger.info(f"Predefined sources changed. Removed: {removed_sources}")
+                for source in removed_sources:
+                    self.source_stats.pop(source, None)
+                    self.available_proxies.pop(source, None)
+                    logger.info(
+                        f"Cleaned up in-memory pool for removed source: {source}"
+                    )
+
+            if not added_sources and not removed_sources:
+                logger.info("Predefined sources reloaded. No changes detected.")
+
+        return {
+            "added_fetcher_jobs": added_jobs,
+            "removed_fetcher_jobs": removed_jobs,
+            "added_predefined_sources": added_sources,
+            "removed_predefined_sources": removed_sources,
+        }
 
     def _fetch_and_parse_source(self, job: Dict):
         url = job["url"]
@@ -352,18 +467,28 @@ class ProxyManager:
                     proxies_to_validate
                 )
                 logger.info(
-                    f"Validation pool below threshold. Supplementing with {supplement_needed} recent failed proxies."
+                    f"Validation pool below threshold. Supplementing with eligible failed proxies."
                 )
-                recent_failed = self.db.get_recent_failed_proxies(
-                    limit=supplement_needed
+                eligible_failed = self.db.get_eligible_failed_proxies(
+                    window_minutes=self.validation_window_minutes,
+                    max_attempts=self.max_validations_per_window,
+                    limit=supplement_needed,
                 )
                 existing_ids = {p["id"] for p in proxies_to_validate}
-                for p in recent_failed:
+                for p in eligible_failed:
                     if p["id"] not in existing_ids:
                         proxies_to_validate.append(p)
+
             if not proxies_to_validate:
                 logger.info("Validation cycle skipped: no proxies to validate.")
                 return
+
+            # Update counters for the selected proxies before validation begins.
+            proxy_ids_to_update = [p["id"] for p in proxies_to_validate]
+            self.db.update_validation_counters(
+                proxy_ids_to_update, self.validation_window_minutes
+            )
+
             total_to_validate = len(proxies_to_validate)
             logger.info(f"Starting validation for {total_to_validate} proxies...")
             success_count = 0
@@ -415,9 +540,6 @@ class ProxyManager:
             for source in self.predefined_sources:
                 stats_pool = self.source_stats.get(source, {})
 
-                # 1. Add any newly discovered active proxies to the stats pool
-                #    with a default score of 0, so they get a chance to be used.
-                #    This step is crucial for introducing new proxies into the system.
                 for proxy_url in self.active_proxies:
                     if proxy_url not in stats_pool:
                         logger.debug(
@@ -425,13 +547,10 @@ class ProxyManager:
                         )
                         stats_pool[proxy_url] = self._get_new_proxy_stat()
 
-                # 2. Sort the ENTIRE stats pool (both active and inactive proxies)
-                #    by score in descending order. This is the core of the new logic.
                 sorted_proxies = sorted(
                     stats_pool.items(), key=lambda item: item[1]["score"], reverse=True
                 )
 
-                # 3. Trim the stats pool if it exceeds the maximum size limit.
                 max_stats_size = self.max_pool_size * self.stats_pool_max_multiplier
                 if len(sorted_proxies) > max_stats_size:
                     proxies_to_delete_count = len(sorted_proxies) - max_stats_size
@@ -439,24 +558,15 @@ class ProxyManager:
                         f"Stats pool for source '{source}' exceeds limit ({len(sorted_proxies)} > {max_stats_size}). "
                         f"Removing {proxies_to_delete_count} lowest-scoring proxies."
                     )
-                    # Trim the list to the max size
                     sorted_proxies = sorted_proxies[:max_stats_size]
-                    # Update the main stats pool with the trimmed, sorted list
                     self.source_stats[source] = dict(sorted_proxies)
                 else:
-                    # If not over the limit, we still need to update the main pool in case new proxies were added
                     self.source_stats[source] = dict(sorted_proxies)
 
-                # 4. Select the Top K from the sorted list to form the new available pool.
-                #    This pool may contain proxies that are currently inactive, but their
-                #    high score gives them a chance to be tried again.
                 top_k_proxies = [
                     proxy_url for proxy_url, _ in sorted_proxies[: self.max_pool_size]
                 ]
                 self.available_proxies[source] = top_k_proxies
-
-                # The main self.source_stats[source] pool is NOT modified (no deletions).
-                # It continues to hold all proxies ever seen.
 
                 logger.info(
                     f"Source '{source}' synced. "
@@ -479,7 +589,10 @@ class ProxyManager:
         while not self.stop_scheduler_event.is_set():
             now = time.time()
             try:
-                for job in self.fetcher_jobs:
+                with self.lock:
+                    current_jobs = list(self.fetcher_jobs)
+
+                for job in current_jobs:
                     if now - job.get("last_run", 0) >= job["interval_minutes"] * 60:
                         job["last_run"] = now
                         self.fetch_executor.submit(self._fetch_and_parse_source, job)
@@ -533,7 +646,9 @@ class ProxyManager:
         }
 
     def _get_source_or_default(self, source: str) -> str:
-        return source if source in self.predefined_sources else self.default_source
+        with self.lock:
+            is_defined = source in self.predefined_sources
+        return source if is_defined else self.default_source
 
     def get_proxy(self, source: str) -> Optional[str]:
         source = self._get_source_or_default(source)
@@ -546,23 +661,17 @@ class ProxyManager:
             logger.debug(f"Providing proxy {proxy} for source '{source}'")
             return proxy
 
-    # Flushes completed minutes from the feedback buffer to the database.
     def _flush_feedback_buffer(self):
         """Flushes stats for all fully completed minutes to the database."""
-        # Determine the cutoff time: the start of the current minute.
-        # We only flush data from minutes *before* this one.
         current_minute_start = datetime.now().replace(second=0, microsecond=0)
 
         records_to_flush = []
         minutes_to_clear = []
 
-        # Safely iterate over a copy of keys to allow modification while iterating
         with self.lock:
-            # Create a copy of the keys to avoid runtime errors during dictionary modification
             buffer_keys = list(self.feedback_buffer.keys())
             for minute_timestamp in buffer_keys:
                 if minute_timestamp < current_minute_start:
-                    # This minute is complete and in the past, so we can flush it.
                     logger.debug(
                         f"Preparing to flush stats for completed minute: {minute_timestamp.strftime('%Y-%m-%d %H:%M')}"
                     )
@@ -579,7 +688,6 @@ class ProxyManager:
                         )
                     minutes_to_clear.append(minute_timestamp)
 
-            # Clean up the flushed entries from the main buffer
             for minute in minutes_to_clear:
                 del self.feedback_buffer[minute]
 
@@ -590,7 +698,6 @@ class ProxyManager:
                 "Flush stats task ran, but no completed minutes were found in the buffer."
             )
 
-    #  Processes feedback by adding it to the new calendar-aware buffer.
     def process_feedback(
         self,
         source: str,
@@ -601,17 +708,14 @@ class ProxyManager:
         source = self._get_source_or_default(source)
         is_success = status_code not in FAILED_STATUS_CODES
 
-        # Get the current timestamp truncated to the minute for accurate bucketing
         current_minute = datetime.now().replace(second=0, microsecond=0)
 
         with self.lock:
-            # --- Part 1: Update the minute-level statistics buffer ---
             if is_success:
                 self.feedback_buffer[current_minute][source]["success"] += 1
             else:
                 self.feedback_buffer[current_minute][source]["failure"] += 1
 
-            # --- Part 2: Update the in-memory proxy score for selection logic ---
             stat = self.source_stats.get(source, {}).get(proxy_url)
             if not stat:
                 return
@@ -651,9 +755,11 @@ def load_proxy_manager(config_path: str) -> ProxyManager:
         logger.warning(
             "Cold start detected. Running initial synchronous fetch and validation..."
         )
+        initial_jobs = manager._load_fetcher_jobs()
+        manager.fetcher_jobs = initial_jobs
         fetch_futures = [
             manager.fetch_executor.submit(manager._fetch_and_parse_source, job)
-            for job in manager.fetcher_jobs
+            for job in initial_jobs
         ]
         for _ in as_completed(fetch_futures):
             pass
@@ -663,7 +769,6 @@ def load_proxy_manager(config_path: str) -> ProxyManager:
 
 
 # --- Flask API Server ---
-# ... (The Flask routes are unchanged from the previous version) ...
 app = Flask(__name__, static_folder="dashboard/dist")
 CORS(app)
 proxy_manager = load_proxy_manager(CONFIG_FILE_PATH)
@@ -691,7 +796,7 @@ def feedback_route():
     data = request.json
     source = data.get("source")
     proxy_url = data.get("proxy")
-    status_code = data.get("status")  # [MODIFIED]
+    status_code = data.get("status")
     resp_time = data.get("response_time_ms")
     logger.info(
         f"Handled feedback: {source} - {status_code} - {proxy_url} - {resp_time}"
@@ -707,6 +812,36 @@ def feedback_route():
         )
     proxy_manager.process_feedback(source, proxy_url, status_code, resp_time)
     return jsonify({"message": "Feedback received."})
+
+
+@app.route("/reload-sources", methods=["POST"])
+def reload_sources_route():
+    """
+    API endpoint to dynamically reload proxy sources from the config file.
+    """
+    try:
+        result = proxy_manager.reload_sources()
+        return (
+            jsonify(
+                {
+                    "status": "success",
+                    "message": "Configuration and sources reloaded.",
+                    "details": result,
+                }
+            ),
+            200,
+        )
+    except Exception as e:
+        logger.error(f"Error during source reload via API: {e}", exc_info=True)
+        return (
+            jsonify(
+                {
+                    "status": "error",
+                    "message": "An internal error occurred during reload.",
+                }
+            ),
+            500,
+        )
 
 
 @app.route("/api/sources", methods=["GET"])

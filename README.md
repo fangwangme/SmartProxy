@@ -1,121 +1,130 @@
-# **Smart Proxy Server**
+# **SmartProxy: An Intelligent, Self-Adapting Proxy Pool Service**
 
-This is a high-performance, intelligent proxy service built with Python. This version introduces a major upgrade: a persistent statistics module and a real-time monitoring dashboard built with React.
+SmartProxy is a sophisticated proxy management system designed to provide reliable, high-quality proxy services. It automates the entire lifecycle of proxies, from fetching and validation to intelligent scoring and dynamic pool management, ensuring that your applications always have access to the best available proxies.
 
-![Dashboard Screenshot](.github/assets/dashboard.png)
+![Dashboard](./.github/assets/dashboard.png)
 
-## **Core Architecture**
+## **Core Features**
 
-* **PostgreSQL Backend**: Stores all discovered proxies and new minute-level performance statistics.  
-* **High-Performance Feedback Loop**:  
-  * /feedback requests are handled instantly by updating an in-memory buffer.  
-  * A background task periodically flushes these aggregated statistics to the PostgreSQL database, ensuring no performance impact on the main request threads.  
-* **Real-time Monitoring Dashboard**: A rich frontend application built with React and Vite, providing visual insights into proxy performance.  
-* **Fixed-Rate Scheduling**: Background tasks for proxy validation and fetching are triggered at fixed intervals for predictable, reliable execution.  
-* **Advanced Logging**: Uses **Loguru** for configurable, high-performance logging with daily file rotation.
+* **Automated Proxy Fetching**: Gathers proxies from multiple user-defined sources.  
+* **Intelligent Validation & Scoring**: Continuously validates proxies and assigns a dynamic score based on performance (latency, success rate) and feedback.  
+* **Feedback-Driven Adaptation**: A scoring system that penalizes failures and rewards success, allowing the pool to adapt based on real-world usage.  
+* **Dynamic Source Reloading**: A hot-reload endpoint (/reload-sources) allows adding or removing proxy sources without restarting the service.  
+* **Sustainable Validation Logic**: Employs a time-window-based attempt limit for re-validating failed proxies. This prevents proxy burnout, reduces database load, and ensures long-term service stability.  
+* **Source-Specific Pools**: Maintains separate proxy pools for different sources/use cases.  
+* **RESTful API**: Simple endpoints for fetching proxies and submitting feedback.  
+* **Monitoring Dashboard**: A web-based UI to monitor the health and statistics of different proxy sources in real-time.
 
-## **Features**
+## **How It Works**
 
-* **Persistent Statistics**: All feedback is aggregated and stored in the database by the minute.  
-* **Monitoring Dashboard**:  
-  * Displays daily total requests, successes, and success rates for each source.  
-  * Provides interactive time-series charts showing success rate changes over 5, 10, or 60-minute intervals.  
-* **Robust Persistence**: Uses PostgreSQL to store all proxy data.  
-* **High-Performance In-Memory Cache**: Manages proxy scores for intelligent selection.  
-* **Dynamic Source Fetching & Configuration**: Fetches proxies from multiple sources and allows hot-reloading of the source list.  
-* **Simple & Powerful REST API**: Easy to integrate with any client application and provides new endpoints for statistical data.
+1. **Fetch**: The service periodically fetches proxy lists from various sources defined in config.ini.  
+2. **Validate**: A validation cycle runs regularly. It prioritizes new and previously successful proxies. To avoid overwhelming unreliable proxies, it supplements the validation queue with failed proxies that have not been tested more than a configured number of times within a specific time window (e.g., 5 times in 30 minutes).  
+3. **Score**: Proxies are managed in memory for each source. When a proxy is used, feedback is sent to the /feedback endpoint. Successful requests increase the proxy's score (with a bonus for low latency), while failures apply a penalty. The penalty becomes more severe with consecutive failures.  
+4. **Select**: When a client requests a proxy for a specific source via /get-proxy, the system provides a random proxy from the pool of top-scoring candidates for that source.  
+5. **Adapt**: Through continuous validation and feedback, low-quality proxies are phased out, and high-performing ones are prioritized, ensuring the overall quality of the pool constantly improves.
 
-## **Requirements**
+## **Installation and Setup**
 
-* Python 3.7+  
-* PostgreSQL Server  
-* Node.js and npm (for building the dashboard)  
-* Required Python libraries:  
-  pip install requests flask psycopg2-binary loguru flask-cors
+### **Prerequisites**
 
-  Or install from the file:  
-  pip install \-r requirements.txt
+* Python 3.8+  
+* PostgreSQL
 
-## **Setup & Usage**
+### **Steps**
 
-1. **Clone the project.**  
-2. **Set up PostgreSQL:**  
-   * Ensure you have a running PostgreSQL server.  
-   * Create a database and a user for the service.  
-   * Execute the database\_setup.sql script to create the proxies and source\_stats\_by\_minute tables.  
-     psql \-U your\_postgres\_user \-d your\_database\_name \-f database\_setup.sql
+1. **Clone the repository:**  
+   git clone \<repository\_url\>  
+   cd smartproxy
 
-3. **Configure the Backend:**  
-   * Copy or rename config.txt.example to config.txt.  
-   * Edit config.txt and fill in your \[database\] connection details.  
-   * Adjust other settings as needed.  
-4. **Build the Frontend Dashboard:**  
-   * Navigate to the dashboard directory: cd dashboard.  
-   * Install dependencies: npm install.  
-   * Build the static files for production: npm run build.  
-   * This will create a dist folder inside dashboard. The Flask server is pre-configured to serve files from this location.  
-5. **Run the Server:**  
-   * Return to the project root directory.  
-   * Start the server:  
-     python smart\_proxy.py
-     nohup python smart_proxy.py > /dev/null 2>&1 &
+2. **Install dependencies:**  
+   pip install \-r requirements.txt
 
-   * The server will start (default: http://0.0.0.0:6942).  
-   * Open your browser and navigate to http://127.0.0.1:6942 to see the monitoring dashboard.
+3. **Set up the database:**  
+   * Ensure your PostgreSQL server is running.  
+   * Create a database and a user.  
+   * Execute the database\_setup.sql script to create the necessary tables and indexes.  
+     psql \-U your\_user \-d your\_db \-f database\_setup.sql
 
-## **API Endpoints**
+4. **Configure the service:**  
+   * Rename or copy config.ini.example to config.ini.  
+   * Edit config.ini with your database credentials, desired port, and proxy sources. See the **Configuration** section below for details.  
+5. **Run the service:**  
+   python smart\_proxy.py
 
-### **Core API**
+   The service will start, and you can access the dashboard at http://localhost:6942 (or your configured port).
 
-#### **1\. Get a Proxy**
+## **Configuration (config.ini)**
 
-* **Endpoint**: GET /get-proxy  
-* **Description**: Retrieves an available proxy for a specific target source.  
-* **Query Parameters**: source (required).  
-* **Example**: curl "http://127.0.0.1:6942/get-proxy?source=insolvencydirect"
+The service is configured via the config.ini file.
 
-#### **2\. Submit Feedback**
+* **\[database\]**: Credentials for your PostgreSQL database.  
+* **\[server\]**: port for the API and dashboard.  
+* **\[validator\]**:  
+  * validation\_target: URL used to test proxy connectivity.  
+  * validation\_workers: Number of concurrent threads for validation.  
+  * validation\_supplement\_threshold: If the number of new/active proxies to test is below this, the queue will be supplemented with failed proxies.  
+  * validation\_window\_minutes: The time window (in minutes) for the validation attempt limit.  
+  * max\_validations\_per\_window: The maximum number of times a failed proxy will be re-tested within the time window.  
+* **\[scheduler\]**: Intervals for background tasks like fetching, validation, and flushing stats.  
+* **\[sources\]**:  
+  * predefined\_sources: A comma-separated list of logical names for your proxy pools (e.g., google\_search, web\_scraping).  
+  * default\_source: The pool to use if a requested source doesn't exist.  
+* **\[source\_pool\]**: Parameters for the scoring and selection algorithm.  
+* **\[proxy\_source\_\*\]**: Define your proxy sources here. Each source should have its own section (e.g., \[proxy\_source\_freeproxies\]).  
+  * url: The URL to fetch the proxy list from.  
+  * update\_interval\_minutes: How often to fetch from this source.  
+  * default\_protocol: The protocol (http, https etc.) if not specified in the source file.
 
-* **Endpoint**: POST /feedback  
-* **Description**: Submits feedback on proxy performance. This is crucial for both the in-memory scoring and the persistent statistics.  
+## **API Documentation**
+
+### **GET /get-proxy**
+
+Fetches an available proxy for a specific use case.
+
+* **Query Parameters**:  
+  * source (required): The name of the source pool to get a proxy from (must match one in predefined\_sources).  
+* **Success Response (200)**:  
+  
+```json
+  {  
+    "http": "http://1.2.3.4:8080",  
+    "https": "http://1.2.3.4:8080"  
+  }
+```
+
+* **Error Response (404)**: Returned if no proxies are currently available for the requested source.
+
+### **POST /feedback**
+
+Submits feedback on a proxy's performance. This is crucial for the scoring system.
+
 * **Request Body** (JSON):  
-  * source (string, required)  
-  * proxy (string, required): The full proxy URL used.  
-  * status\_code (integer, required): The numerical status code of the result. 100 and 7 are treated as success, all others as failure.  
-  * response\_time\_ms (integer, optional): Response time for calculating latency bonuses.  
-* **Example Success Feedback**:  
-  curl \-X POST \-H "Content-Type: application/json" \\  
-       \-d '{"source": "insolvencydirect", "proxy": "http://1.2.3.4:8080", "status\_code": 100, "response\_time\_ms": 250}' \\  
-       http://127.0.0.1:6942/feedback
+  * source (string, required): The source pool the proxy belongs to.  
+  * proxy (string, required): The full proxy URL (e.g., http://1.2.3.4:8080).  
+  * status (integer, required): A status code representing the outcome. 0 and 4 are treated as failures; all other codes are successes.  
+  * response\_time\_ms (integer, optional): The response time in milliseconds for successful requests. Lower times result in a higher score bonus.  
+* **Success Response (200)**:  
 
-#### **3\. Reload Sources**
+```json
+  { "message": "Feedback received." }
+```
 
-* **Endpoint**: POST /reload-sources  
-* **Description**: Triggers a hot reload of the predefined\_sources list from config.txt.  
-* **Example**: curl \-X POST http://127.0.0.1:6942/reload-sources
+### **POST /reload-sources**
 
-### **Dashboard API**
+Triggers a hot-reload of the proxy source configuration from config.ini. This allows you to add or remove \[proxy\_source\_\*\] sections and update predefined\_sources without restarting the service.
 
-#### **1\. Get All Sources**
+* **Request Body**: Empty  
+* **Success Response (200)**:  
 
-* **Endpoint**: GET /api/sources  
-* **Description**: Returns a list of all predefined source names for populating UI dropdowns.
-
-#### **2\. Get Daily Statistics**
-
-* **Endpoint**: GET /api/stats/daily  
-* **Description**: Retrieves the aggregated daily statistics for a given source and date.  
-* **Query Parameters**:  
-  * source (required)  
-  * date (required, format: YYYY-MM-DD)  
-* **Example**: curl "http://127.0.0.1:6942/api/stats/daily?source=default\&date=2025-08-02"
-
-#### **3\. Get Time-series Statistics**
-
-* **Endpoint**: GET /api/stats/timeseries  
-* **Description**: Retrieves time-series data for success rates, aggregated into intervals.  
-* **Query Parameters**:  
-  * source (required)  
-  * date (required, format: YYYY-MM-DD)  
-  * interval (optional, 5, 10, or 60, default: 10\)  
-* **Example**: curl "http://127.0.0.1:6942/api/stats/timeseries?source=default\&date=2025-08-02\&interval=5"
+```json
+  {  
+    "status": "success",  
+    "message": "Configuration and sources reloaded.",  
+    "details": {  
+      "added\_fetcher\_jobs": \["proxy\_source\_new"\],  
+      "removed\_fetcher\_jobs": \[\],  
+      "added\_predefined\_sources": \["new\_pool"\],  
+      "removed\_predefined\_sources": \[\]  
+    }  
+  }  
+```
