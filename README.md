@@ -121,10 +121,10 @@ Triggers a hot-reload of the proxy source configuration from config.ini. This al
     "status": "success",  
     "message": "Configuration and sources reloaded.",  
     "details": {  
-      "added\_fetcher\_jobs": \["proxy\_source\_new"\],  
-      "removed\_fetcher\_jobs": \[\],  
-      "added\_predefined\_sources": \["new\_pool"\],  
-      "removed\_predefined\_sources": \[\]  
+      "added_fetcher_jobs": ["proxy_source\_new"],  
+      "removed_fetcher_jobs": [],  
+      "added_predefined_sources": ["new_pool"],  
+      "removed_predefined_sources": []  
     }  
   }  
 ```
