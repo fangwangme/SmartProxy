@@ -24,7 +24,8 @@ from logger import logger
 # --- Configuration & Constants ---
 CONFIG_FILE_PATH = os.path.join("./", "config.ini")
 FAILED_STATUS_CODES = {
-    0, 4,
+    0,
+    4,
 }  # Set of status codes that indicate success
 
 
@@ -283,8 +284,78 @@ class ProxyManager:
                 }
                 if job["url"]:
                     jobs.append(job)
-        logger.info(f"Loaded {len(jobs)} proxy source jobs from config.")
+        # This function is now called during reload, so the log message is more generic.
         return jobs
+
+    def reload_sources(self) -> Dict:
+        """
+        Dynamically reloads proxy sources and fetcher jobs from the config file.
+        """
+        logger.info("Attempting to reload sources from config file...")
+        with self.lock:
+            # Re-read the configuration file
+            self.config.read(self.config_path, encoding="utf-8")
+
+            # --- Reload Fetcher Jobs ---
+            old_job_names = {job["name"] for job in self.fetcher_jobs}
+            self.fetcher_jobs = self._load_fetcher_jobs()
+            new_job_names = {job["name"] for job in self.fetcher_jobs}
+            added_jobs = list(new_job_names - old_job_names)
+            removed_jobs = list(old_job_names - new_job_names)
+            if added_jobs or removed_jobs:
+                logger.info(
+                    f"Fetcher jobs reloaded. Added: {added_jobs}, Removed: {removed_jobs}"
+                )
+            else:
+                logger.info("Fetcher jobs reloaded. No changes detected.")
+
+            # --- Reload Predefined Sources (for stats and pools) ---
+            old_predefined_sources = self.predefined_sources.copy()
+            sources_str = self.config.get(
+                "sources", "predefined_sources", fallback="default"
+            )
+            self.predefined_sources = {
+                s.strip() for s in sources_str.split(",") if s.strip()
+            }
+            self.default_source = self.config.get(
+                "sources", "default_source", fallback="default"
+            )
+            if self.default_source not in self.predefined_sources:
+                self.predefined_sources.add(self.default_source)
+
+            added_sources = list(self.predefined_sources - old_predefined_sources)
+            removed_sources = list(old_predefined_sources - self.predefined_sources)
+
+            # Initialize pools for newly added sources
+            if added_sources:
+                logger.info(f"Predefined sources changed. Added: {added_sources}")
+                for source in added_sources:
+                    if source not in self.source_stats:
+                        self.source_stats[source] = {}
+                        self.available_proxies[source] = []
+                        logger.info(
+                            f"Initialized new in-memory pool for source: {source}"
+                        )
+
+            # Clean up pools for removed sources
+            if removed_sources:
+                logger.info(f"Predefined sources changed. Removed: {removed_sources}")
+                for source in removed_sources:
+                    self.source_stats.pop(source, None)
+                    self.available_proxies.pop(source, None)
+                    logger.info(
+                        f"Cleaned up in-memory pool for removed source: {source}"
+                    )
+
+            if not added_sources and not removed_sources:
+                logger.info("Predefined sources reloaded. No changes detected.")
+
+        return {
+            "added_fetcher_jobs": added_jobs,
+            "removed_fetcher_jobs": removed_jobs,
+            "added_predefined_sources": added_sources,
+            "removed_predefined_sources": removed_sources,
+        }
 
     def _fetch_and_parse_source(self, job: Dict):
         url = job["url"]
@@ -479,7 +550,11 @@ class ProxyManager:
         while not self.stop_scheduler_event.is_set():
             now = time.time()
             try:
-                for job in self.fetcher_jobs:
+                # Use a copy of fetcher_jobs to avoid issues if it's modified by the reload endpoint
+                with self.lock:
+                    current_jobs = list(self.fetcher_jobs)
+
+                for job in current_jobs:
                     if now - job.get("last_run", 0) >= job["interval_minutes"] * 60:
                         job["last_run"] = now
                         self.fetch_executor.submit(self._fetch_and_parse_source, job)
@@ -533,7 +608,10 @@ class ProxyManager:
         }
 
     def _get_source_or_default(self, source: str) -> str:
-        return source if source in self.predefined_sources else self.default_source
+        # Use a lock to safely access predefined_sources which can be modified during a reload
+        with self.lock:
+            is_defined = source in self.predefined_sources
+        return source if is_defined else self.default_source
 
     def get_proxy(self, source: str) -> Optional[str]:
         source = self._get_source_or_default(source)
@@ -651,9 +729,12 @@ def load_proxy_manager(config_path: str) -> ProxyManager:
         logger.warning(
             "Cold start detected. Running initial synchronous fetch and validation..."
         )
+        # In initial load, make sure fetcher jobs are loaded before being used
+        initial_jobs = manager._load_fetcher_jobs()
+        manager.fetcher_jobs = initial_jobs
         fetch_futures = [
             manager.fetch_executor.submit(manager._fetch_and_parse_source, job)
-            for job in manager.fetcher_jobs
+            for job in initial_jobs
         ]
         for _ in as_completed(fetch_futures):
             pass
@@ -707,6 +788,36 @@ def feedback_route():
         )
     proxy_manager.process_feedback(source, proxy_url, status_code, resp_time)
     return jsonify({"message": "Feedback received."})
+
+
+@app.route("/reload-sources", methods=["POST"])
+def reload_sources_route():
+    """
+    API endpoint to dynamically reload proxy sources from the config file.
+    """
+    try:
+        result = proxy_manager.reload_sources()
+        return (
+            jsonify(
+                {
+                    "status": "success",
+                    "message": "Configuration and sources reloaded.",
+                    "details": result,
+                }
+            ),
+            200,
+        )
+    except Exception as e:
+        logger.error(f"Error during source reload via API: {e}", exc_info=True)
+        return (
+            jsonify(
+                {
+                    "status": "error",
+                    "message": "An internal error occurred during reload.",
+                }
+            ),
+            500,
+        )
 
 
 @app.route("/api/sources", methods=["GET"])
