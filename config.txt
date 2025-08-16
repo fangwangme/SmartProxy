@@ -21,6 +21,8 @@ validation_timeout_s = 10
 validation_workers = 150
 # supplement with recent failed proxies.
 validation_supplement_threshold = 2000
+validation_window_minutes = 30
+max_validations_per_window = 5
 
 [scheduler]
 # The fixed interval in seconds at which the validation task is triggered.
