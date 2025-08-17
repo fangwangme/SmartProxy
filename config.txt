@@ -11,6 +11,7 @@ port = 5432
 dbname = proxy_db
 user = proxy_user
 password = hell02025
+max_connections = 50
 
 [validator]
 # Target website for validating proxy liveness and anonymity.
