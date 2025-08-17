@@ -452,13 +452,16 @@ class ProxyManager:
             "removed_predefined_sources": removed_sources,
         }
 
-    def _fetch_and_parse_source(self, job: Dict):
+    def _fetch_and_parse_source(self, job: Dict) -> List:
+        """
+        DEADLOCK FIX: This method now returns a list of proxies instead of writing to the DB.
+        """
         url = job["url"]
         logger.info(f"Fetching proxy source: {job['name']} from {url}")
+        proxies_to_insert = []
         try:
             response = requests.get(url, timeout=15)
             response.raise_for_status()
-            proxies_to_insert = []
             for line in response.text.splitlines():
                 line = line.strip()
                 if not line:
@@ -475,9 +478,35 @@ class ProxyManager:
                         )
                 except ValueError:
                     continue
-            self.db.insert_proxies(proxies_to_insert)
         except requests.RequestException as e:
             logger.error(f"Failed to fetch from {job['name']} ({url}): {e}")
+        return proxies_to_insert
+
+    def _handle_fetch_results(self, futures: List):
+        """
+        DEADLOCK FIX: New method to consolidate results from all fetchers and insert in a single batch.
+        """
+        all_new_proxies = []
+        for future in as_completed(futures):
+            try:
+                proxies = future.result()
+                if proxies:
+                    all_new_proxies.extend(proxies)
+            except Exception as e:
+                logger.error(f"A fetcher job raised an exception: {e}")
+
+        if not all_new_proxies:
+            logger.info("No new proxies were fetched in this cycle.")
+            return
+
+        # Remove duplicates before inserting to reduce DB load
+        unique_proxies_set = {tuple(p) for p in all_new_proxies}
+        unique_proxies_list = [list(p) for p in unique_proxies_set]
+
+        logger.info(
+            f"Consolidated {len(unique_proxies_list)} unique proxies from all sources for insertion."
+        )
+        self.db.insert_proxies(unique_proxies_list)
 
     def _validate_proxy(self, proxy_id: int, proxy_url: str) -> Dict:
         """
@@ -652,10 +681,25 @@ class ProxyManager:
                 with self.lock:
                     current_jobs = list(self.fetcher_jobs)
 
+                # DEADLOCK FIX: Submit jobs and handle results in a separate thread
+                fetch_futures = []
                 for job in current_jobs:
                     if now - job.get("last_run", 0) >= job["interval_minutes"] * 60:
                         job["last_run"] = now
-                        self.fetch_executor.submit(self._fetch_and_parse_source, job)
+                        fetch_futures.append(
+                            self.fetch_executor.submit(
+                                self._fetch_and_parse_source, job
+                            )
+                        )
+
+                if fetch_futures:
+                    logger.info(f"Submitted {len(fetch_futures)} fetcher jobs.")
+                    threading.Thread(
+                        target=self._handle_fetch_results,
+                        args=(fetch_futures,),
+                        daemon=True,
+                    ).start()
+
                 if now - last_validation_run >= self.validation_interval_s:
                     last_validation_run = now
                     threading.Thread(
@@ -821,8 +865,25 @@ def load_proxy_manager(config_path: str) -> ProxyManager:
             manager.fetch_executor.submit(manager._fetch_and_parse_source, job)
             for job in initial_jobs
         ]
-        for _ in as_completed(fetch_futures):
-            pass
+
+        # DEADLOCK FIX: Consolidate results before inserting
+        all_proxies = []
+        for future in as_completed(fetch_futures):
+            try:
+                proxies = future.result()
+                if proxies:
+                    all_proxies.extend(proxies)
+            except Exception as e:
+                logger.error(f"Initial fetcher job failed: {e}")
+
+        if all_proxies:
+            unique_proxies_set = {tuple(p) for p in all_proxies}
+            unique_proxies_list = [list(p) for p in unique_proxies_set]
+            logger.info(
+                f"Initial fetch: Consolidated {len(unique_proxies_list)} unique proxies for insertion."
+            )
+            manager.db.insert_proxies(unique_proxies_list)
+
         manager._run_validation_cycle()
         logger.info("Initial validation complete.")
     return manager
