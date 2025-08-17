@@ -84,8 +84,7 @@ class DatabaseManager:
             conn = self.pool.getconn()
             with conn.cursor() as cur:
                 psycopg2.extras.execute_values(cur, query, proxies)
-                if cur.rowcount > 0:
-                    logger.info(f"Inserted {cur.rowcount} new proxies.")
+                logger.info(f"Inserted {cur.rowcount} new proxies.")
                 conn.commit()
         except psycopg2.Error as e:
             logger.error(f"Database batch insert failed: {e}")
