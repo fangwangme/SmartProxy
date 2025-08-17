@@ -34,16 +34,21 @@ class DatabaseManager:
 
     def __init__(self, config):
         try:
+            # OPTIMIZATION: Increased maxconn to better handle concurrent workers.
+            # The ideal number depends on your DB server's capacity.
+            max_connections = config.getint("database", "max_connections", fallback=50)
             self.pool = psycopg2.pool.SimpleConnectionPool(
                 minconn=2,
-                maxconn=20,
+                maxconn=max_connections,
                 host=config.get("database", "host"),
                 port=config.get("database", "port"),
                 dbname=config.get("database", "dbname"),
                 user=config.get("database", "user"),
                 password=config.get("database", "password"),
             )
-            logger.info("Database connection pool created successfully.")
+            logger.info(
+                f"Database connection pool created successfully (max_conn={max_connections})."
+            )
         except (configparser.NoSectionError, psycopg2.OperationalError) as e:
             logger.error(f"Database configuration error or connection failed: {e}")
             sys.exit(1)
@@ -146,15 +151,62 @@ class DatabaseManager:
         self._execute(query, params)
         logger.debug(f"Updated validation counters for {len(proxy_ids)} proxies.")
 
-    def update_proxy_validation_result(
-        self,
-        proxy_id: int,
-        is_active: bool,
-        latency: Optional[int],
-        anonymity: Optional[str],
+    def batch_update_proxy_results(
+        self, success_proxies: List[Dict], failure_proxy_ids: List[int]
     ):
-        query = "UPDATE proxies SET is_active = %s, latency_ms = %s, anonymity_level = %s, last_validated_at = NOW() WHERE id = %s;"
-        self._execute(query, (is_active, latency, anonymity, proxy_id))
+        """
+        OPTIMIZATION: Batch update results of a validation cycle.
+        """
+        conn = None
+        try:
+            conn = self.pool.getconn()
+            with conn.cursor() as cur:
+                # Batch update successful proxies
+                if success_proxies:
+                    update_query_success = """
+                        UPDATE proxies SET
+                            is_active = true,
+                            latency_ms = data.latency_ms,
+                            anonymity_level = data.anonymity_level,
+                            last_validated_at = NOW()
+                        FROM (VALUES %s) AS data(id, latency_ms, anonymity_level)
+                        WHERE proxies.id = data.id;
+                    """
+                    psycopg2.extras.execute_values(
+                        cur,
+                        update_query_success,
+                        [
+                            (p["id"], p["latency"], p["anonymity"])
+                            for p in success_proxies
+                        ],
+                    )
+                    logger.info(
+                        f"Batch updated {len(success_proxies)} successful proxies."
+                    )
+
+                # Batch update failed proxies
+                if failure_proxy_ids:
+                    update_query_failure = """
+                        UPDATE proxies SET
+                            is_active = false,
+                            latency_ms = NULL,
+                            anonymity_level = NULL,
+                            last_validated_at = NOW()
+                        WHERE id = ANY(%s);
+                    """
+                    cur.execute(update_query_failure, (failure_proxy_ids,))
+                    logger.info(
+                        f"Batch updated {len(failure_proxy_ids)} failed proxies."
+                    )
+
+                conn.commit()
+        except psycopg2.Error as e:
+            logger.error(f"Database batch update for validation results failed: {e}")
+            if conn:
+                conn.rollback()
+        finally:
+            if conn:
+                self.pool.putconn(conn)
 
     def get_active_proxies(self) -> Set[str]:
         query = "SELECT protocol, ip, port FROM proxies WHERE is_active = true;"
@@ -268,7 +320,6 @@ class ProxyManager:
         self.validation_supplement_threshold = self.config.getint(
             "validator", "validation_supplement_threshold", fallback=1000
         )
-        # New configuration for validation logic
         self.validation_window_minutes = self.config.getint(
             "validator", "validation_window_minutes", fallback=30
         )
@@ -428,7 +479,10 @@ class ProxyManager:
         except requests.RequestException as e:
             logger.error(f"Failed to fetch from {job['name']} ({url}): {e}")
 
-    def _validate_proxy(self, proxy_id: int, proxy_url: str):
+    def _validate_proxy(self, proxy_id: int, proxy_url: str) -> Dict:
+        """
+        OPTIMIZATION: This method now returns a result dict instead of calling the DB directly.
+        """
         proxies = {"http": proxy_url, "https": proxy_url}
         start_time = time.time()
         try:
@@ -444,13 +498,14 @@ class ProxyManager:
                 h in headers for h in ["X-Forwarded-For", "Via", "X-Real-Ip"]
             )
             anonymity = "elite" if is_anonymous else "transparent"
-            self.db.update_proxy_validation_result(
-                proxy_id, True, latency_ms, anonymity
-            )
-            return True
-        except (requests.RequestException, json.JSONDecodeError) as e:
-            self.db.update_proxy_validation_result(proxy_id, False, None, None)
-            return False
+            return {
+                "id": proxy_id,
+                "success": True,
+                "latency": latency_ms,
+                "anonymity": anonymity,
+            }
+        except (requests.RequestException, json.JSONDecodeError):
+            return {"id": proxy_id, "success": False}
 
     def _run_validation_cycle(self):
         with self.lock:
@@ -483,7 +538,6 @@ class ProxyManager:
                 logger.info("Validation cycle skipped: no proxies to validate.")
                 return
 
-            # Update counters for the selected proxies before validation begins.
             proxy_ids_to_update = [p["id"] for p in proxies_to_validate]
             self.db.update_validation_counters(
                 proxy_ids_to_update, self.validation_window_minutes
@@ -491,8 +545,10 @@ class ProxyManager:
 
             total_to_validate = len(proxies_to_validate)
             logger.info(f"Starting validation for {total_to_validate} proxies...")
-            success_count = 0
-            processed_count = 0
+
+            success_proxies = []
+            failure_proxy_ids = []
+
             with ThreadPoolExecutor(max_workers=self.validation_workers) as executor:
                 future_to_proxy = {
                     executor.submit(
@@ -503,22 +559,26 @@ class ProxyManager:
                     for p in proxies_to_validate
                 }
                 for future in as_completed(future_to_proxy):
-                    processed_count += 1
                     try:
-                        if future.result():
-                            success_count += 1
+                        result = future.result()
+                        if result["success"]:
+                            success_proxies.append(result)
+                        else:
+                            failure_proxy_ids.append(result["id"])
                     except Exception as exc:
-                        logger.error(f"Proxy validation generated an exception: {exc}")
-                    if (
-                        processed_count % 500 == 0
-                        and processed_count < total_to_validate
-                    ):
-                        logger.info(
-                            f"Validation progress: {processed_count}/{total_to_validate} proxies checked."
+                        proxy_info = future_to_proxy[future]
+                        failure_proxy_ids.append(proxy_info["id"])
+                        logger.error(
+                            f"Proxy validation for {proxy_info['id']} generated an exception: {exc}"
                         )
+
             logger.info(
-                f"Validation cycle finished. Success: {success_count}, Failed: {total_to_validate - success_count}."
+                f"Validation cycle finished. Success: {len(success_proxies)}, Failed: {len(failure_proxy_ids)}."
             )
+
+            # OPTIMIZATION: Perform batch updates after all threads are complete
+            self.db.batch_update_proxy_results(success_proxies, failure_proxy_ids)
+
             self._sync_and_select_top_proxies()
         finally:
             with self.lock:
