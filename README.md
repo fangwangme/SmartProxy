@@ -113,6 +113,10 @@ Submits feedback on a proxy's performance. This is crucial for the scoring syste
 
 Triggers a hot-reload of the proxy source configuration from config.ini. This allows you to add or remove \[proxy\_source\_\*\] sections and update predefined\_sources without restarting the service.
 
+```bash
+curl -X POST -H "Content-Type: application/json" http://127.0.0.1:6942/reload-sources
+```
+
 * **Request Body**: Empty  
 * **Success Response (200)**:  
 
@@ -121,7 +125,7 @@ Triggers a hot-reload of the proxy source configuration from config.ini. This al
     "status": "success",  
     "message": "Configuration and sources reloaded.",  
     "details": {  
-      "added_fetcher_jobs": ["proxy_source\_new"],  
+      "added_fetcher_jobs": ["proxy_source_new"],  
       "removed_fetcher_jobs": [],  
       "added_predefined_sources": ["new_pool"],  
       "removed_predefined_sources": []  

@@ -84,9 +84,9 @@ class DatabaseManager:
             conn = self.pool.getconn()
             with conn.cursor() as cur:
                 psycopg2.extras.execute_values(cur, query, proxies)
-                logger.info(f"Inserted {cur.rowcount} new proxies.")
+                logger.info(f"Inserted {cur.rowcount}/ {len(proxies)} new proxies.")
                 conn.commit()
-        except psycopg2.Error as e:
+        except Exception as e:
             logger.error(f"Database batch insert failed: {e}")
             if conn:
                 conn.rollback()
@@ -94,9 +94,9 @@ class DatabaseManager:
             if conn:
                 self.pool.putconn(conn)
 
-    def get_proxies_to_validate(self, interval_minutes=30) -> List[Tuple]:
-        query = "SELECT id, protocol, ip, port FROM proxies WHERE last_validated_at IS NULL OR (is_active = true AND last_validated_at < NOW() - INTERVAL '%s minutes');"
-        return self._execute(query, (interval_minutes,), fetch="all") or []
+    def get_proxies_to_validate(self, interval_minutes=30, limit=2000) -> List[Tuple]:
+        query = "SELECT id, protocol, ip, port FROM proxies WHERE last_validated_at IS NULL OR (is_active = true AND last_validated_at < NOW() - INTERVAL '%s minutes') LIMIT %s;"
+        return self._execute(query, (interval_minutes, limit), fetch="all") or []
 
     def get_eligible_failed_proxies(
         self, window_minutes: int, max_attempts: int, limit: int
@@ -545,6 +545,9 @@ class ProxyManager:
             self.is_validating = True
         try:
             proxies_to_validate = self.db.get_proxies_to_validate()
+            logger.info(
+                f"There are {len(proxies_to_validate)} proxies need to be validated"
+            )
             if len(proxies_to_validate) < self.validation_supplement_threshold:
                 supplement_needed = self.validation_supplement_threshold - len(
                     proxies_to_validate
