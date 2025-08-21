@@ -285,7 +285,9 @@ class ProxyManager:
 
         self.active_proxies: Set[str] = set()
         self.source_stats: Dict[str, Dict[str, Dict]] = {}
-        self.available_proxies: Dict[str, List[str]] = {}
+        self.available_proxies: Dict[str, Dict[str, List[str]]] = (
+            {}
+        )  # MODIFIED: Structure for tiers
 
         self.feedback_buffer = defaultdict(
             lambda: defaultdict(lambda: defaultdict(int))
@@ -355,6 +357,18 @@ class ProxyManager:
             "source_pool", "failure_penalties", fallback="-1, -5, -20"
         )
         self.failure_penalties = [int(p.strip()) for p in penalties_str.split(",")]
+
+        # NEW: Load weighted selection config
+        self.weighted_selection_enabled = self.config.getboolean(
+            "source_pool", "weighted_selection_enabled", fallback=False
+        )
+        self.top_tier_size = self.config.getint(
+            "source_pool", "top_tier_size", fallback=100
+        )
+        self.top_tier_load_percentage = self.config.getint(
+            "source_pool", "top_tier_load_percentage", fallback=70
+        )
+
         logger.info("Configuration loaded.")
 
     def _initialize_source_pools(self):
@@ -362,7 +376,8 @@ class ProxyManager:
             for source in self.predefined_sources:
                 if source not in self.source_stats:
                     self.source_stats[source] = {}
-                    self.available_proxies[source] = []
+                    # MODIFIED: Initialize tiered structure
+                    self.available_proxies[source] = {"top_tier": [], "bottom_tier": []}
             logger.info(
                 f"Initialized in-memory pools for sources: {self.predefined_sources}"
             )
@@ -427,7 +442,10 @@ class ProxyManager:
                 for source in added_sources:
                     if source not in self.source_stats:
                         self.source_stats[source] = {}
-                        self.available_proxies[source] = []
+                        self.available_proxies[source] = {
+                            "top_tier": [],
+                            "bottom_tier": [],
+                        }
                         logger.info(
                             f"Initialized new in-memory pool for source: {source}"
                         )
@@ -498,7 +516,6 @@ class ProxyManager:
             logger.info("No new proxies were fetched in this cycle.")
             return
 
-        # Remove duplicates before inserting to reduce DB load
         unique_proxies_set = {tuple(p) for p in all_new_proxies}
         unique_proxies_list = [list(p) for p in unique_proxies_set]
 
@@ -607,7 +624,6 @@ class ProxyManager:
                 f"Validation cycle finished. Success: {len(success_proxies)}, Failed: {len(failure_proxy_ids)}."
             )
 
-            # OPTIMIZATION: Perform batch updates after all threads are complete
             self.db.batch_update_proxy_results(success_proxies, failure_proxy_ids)
 
             self._sync_and_select_top_proxies()
@@ -618,12 +634,9 @@ class ProxyManager:
 
     def _sync_and_select_top_proxies(self):
         """
-        Syncs the stats pool with newly validated proxies and selects the
-        Top-K proxies based purely on their score for the available pool.
+        MODIFIED: Syncs proxies and splits them into performance tiers.
         """
-        logger.info(
-            "Syncing and selecting Top-K proxies for all sources based on score..."
-        )
+        logger.info("Syncing and selecting proxies for all sources...")
         newly_active_proxies = self.db.get_active_proxies()
 
         with self.lock:
@@ -633,9 +646,6 @@ class ProxyManager:
 
                 for proxy_url in self.active_proxies:
                     if proxy_url not in stats_pool:
-                        logger.debug(
-                            f"Adding new active proxy {proxy_url} to stats pool for source '{source}'."
-                        )
                         stats_pool[proxy_url] = self._get_new_proxy_stat()
 
                 sorted_proxies = sorted(
@@ -654,15 +664,22 @@ class ProxyManager:
                 else:
                     self.source_stats[source] = dict(sorted_proxies)
 
-                top_k_proxies = [
-                    proxy_url for proxy_url, _ in sorted_proxies[: self.max_pool_size]
+                # Select all proxies up to the max_pool_size for potential use
+                usable_proxies = [
+                    p_url for p_url, _ in sorted_proxies[: self.max_pool_size]
                 ]
-                self.available_proxies[source] = top_k_proxies
+
+                # NEW: Split the usable proxies into tiers
+                top_tier = usable_proxies[: self.top_tier_size]
+                bottom_tier = usable_proxies[self.top_tier_size :]
+
+                self.available_proxies[source]["top_tier"] = top_tier
+                self.available_proxies[source]["bottom_tier"] = bottom_tier
 
                 logger.info(
                     f"Source '{source}' synced. "
-                    f"Total proxies with stats: {len(self.source_stats[source])}. "
-                    f"Selected Top {len(self.available_proxies[source])} proxies based on score for the active pool."
+                    f"Top Tier: {len(top_tier)} proxies. "
+                    f"Bottom Tier: {len(bottom_tier)} proxies."
                 )
 
     def _update_dashboard_sources(self):
@@ -683,7 +700,6 @@ class ProxyManager:
                 with self.lock:
                     current_jobs = list(self.fetcher_jobs)
 
-                # DEADLOCK FIX: Submit jobs and handle results in a separate thread
                 fetch_futures = []
                 for job in current_jobs:
                     if now - job.get("last_run", 0) >= job["interval_minutes"] * 60:
@@ -757,15 +773,48 @@ class ProxyManager:
         return source if is_defined else self.default_source
 
     def get_proxy(self, source: str) -> Optional[str]:
+        """
+        MODIFIED: Implements weighted random selection from performance tiers.
+        """
         source = self._get_source_or_default(source)
+
         with self.lock:
-            proxy_pool = self.available_proxies.get(source)
-            if not proxy_pool:
-                logger.warning(f"No available proxy for source '{source}'")
+            # If weighted selection is disabled, fall back to old behavior
+            if not self.weighted_selection_enabled:
+                proxy_pools = self.available_proxies.get(source, {})
+                flat_pool = proxy_pools.get("top_tier", []) + proxy_pools.get(
+                    "bottom_tier", []
+                )
+                if not flat_pool:
+                    logger.warning(
+                        f"No available proxy for source '{source}' (weighted selection disabled)."
+                    )
+                    return None
+                return random.choice(flat_pool)
+
+            # Weighted selection logic
+            proxy_pools = self.available_proxies.get(source)
+            if not proxy_pools:
+                logger.warning(f"No proxy pools defined for source '{source}'.")
                 return None
-            proxy = random.choice(proxy_pool)
-            logger.debug(f"Providing proxy {proxy} for source '{source}'")
-            return proxy
+
+            top_tier = proxy_pools.get("top_tier", [])
+            bottom_tier = proxy_pools.get("bottom_tier", [])
+
+            # Determine which tier to pull from
+            use_top_tier = random.randint(1, 100) <= self.top_tier_load_percentage
+
+            if use_top_tier and top_tier:
+                return random.choice(top_tier)
+            elif (
+                bottom_tier
+            ):  # Fallback to bottom tier if top is chosen but empty, or if bottom is chosen
+                return random.choice(bottom_tier)
+            elif top_tier:  # Fallback to top tier if bottom is chosen but empty
+                return random.choice(top_tier)
+            else:
+                logger.warning(f"No available proxy in any tier for source '{source}'.")
+                return None
 
     def _flush_feedback_buffer(self):
         """Flushes stats for all fully completed minutes to the database."""
@@ -868,7 +917,6 @@ def load_proxy_manager(config_path: str) -> ProxyManager:
             for job in initial_jobs
         ]
 
-        # DEADLOCK FIX: Consolidate results before inserting
         all_proxies = []
         for future in as_completed(fetch_futures):
             try:
