@@ -50,6 +50,13 @@ failure_penalties = -1, -5, -20
 
 stats_pool_max_multiplier = 20
 
+# Enable or disable the tiered proxy selection feature.
+weighted_selection_enabled = true
+# The number of proxies to place in the high-performance (top) tier.
+top_tier_size = 100
+# The percentage of requests (0-100) that should be handled by the top tier.
+top_tier_load_percentage = 70
+
 # ===================================================================
 # Dynamic Proxy Source Definitions
 # ===================================================================
