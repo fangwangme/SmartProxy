@@ -439,6 +439,10 @@ class ProxyManager:
 
             if added_sources:
                 logger.info(f"Predefined sources changed. Added: {added_sources}")
+                # Get default source data for copying to new sources
+                default_stats = self.source_stats.get(self.default_source, {})
+                default_proxies = self.available_proxies.get(self.default_source, {})
+
                 for source in added_sources:
                     if source not in self.source_stats:
                         self.source_stats[source] = {}
@@ -446,9 +450,24 @@ class ProxyManager:
                             "top_tier": [],
                             "bottom_tier": [],
                         }
-                        logger.info(
-                            f"Initialized new in-memory pool for source: {source}"
-                        )
+
+                    # Copy proxy stats from default_source with fresh scores
+                    for proxy_url in default_stats:
+                        if proxy_url not in self.source_stats[source]:
+                            self.source_stats[source][proxy_url] = self._get_new_proxy_stat()
+
+                    # Copy available proxy lists from default_source
+                    self.available_proxies[source]["top_tier"] = list(
+                        default_proxies.get("top_tier", [])
+                    )
+                    self.available_proxies[source]["bottom_tier"] = list(
+                        default_proxies.get("bottom_tier", [])
+                    )
+
+                    copied_count = len(self.source_stats[source])
+                    logger.info(
+                        f"Initialized new source '{source}' with {copied_count} proxies copied from '{self.default_source}'"
+                    )
 
             if removed_sources:
                 logger.info(f"Predefined sources changed. Removed: {removed_sources}")
@@ -678,6 +697,7 @@ class ProxyManager:
 
                 logger.info(
                     f"Source '{source}' synced. "
+                    f"Total : {len(sorted_proxies)} proxies."
                     f"Top Tier: {len(top_tier)} proxies. "
                     f"Bottom Tier: {len(bottom_tier)} proxies."
                 )
