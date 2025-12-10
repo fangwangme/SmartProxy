@@ -10,6 +10,7 @@ import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 import psycopg2
@@ -369,6 +370,17 @@ class ProxyManager:
             "source_pool", "top_tier_load_percentage", fallback=70
         )
 
+        # Backup configuration
+        self.stats_backup_enabled = self.config.getboolean(
+            "backup", "stats_backup_enabled", fallback=True
+        )
+        self.stats_backup_interval_s = self.config.getint(
+            "backup", "stats_backup_interval_seconds", fallback=3600  # 1 hour
+        )
+        self.stats_backup_path = Path(
+            self.config.get("backup", "stats_backup_path", fallback="./data/proxy_stats_backup.json")
+        )
+
         logger.info("Configuration loaded.")
 
     def _initialize_source_pools(self):
@@ -714,6 +726,7 @@ class ProxyManager:
     def _scheduler_loop(self):
         last_validation_run = 0
         last_flush_time = 0
+        last_backup_time = 0
         while not self.stop_scheduler_event.is_set():
             now = time.time()
             try:
@@ -756,6 +769,12 @@ class ProxyManager:
                     threading.Thread(
                         target=self._update_dashboard_sources, daemon=True
                     ).start()
+
+                # Stats backup task
+                if self.stats_backup_enabled and now - last_backup_time >= self.stats_backup_interval_s:
+                    last_backup_time = now
+                    threading.Thread(target=self.backup_stats, daemon=True).start()
+
                 self.stop_scheduler_event.wait(5)
             except Exception as e:
                 logger.error(f"Error in scheduler loop: {e}", exc_info=True)
@@ -773,6 +792,8 @@ class ProxyManager:
     def stop_scheduler(self):
         logger.info("Stopping scheduler and flushing final stats...")
         self._flush_feedback_buffer()
+        if self.stats_backup_enabled:
+            self.backup_stats()  # Backup before shutdown
         if self.scheduler_thread and self.scheduler_thread.is_alive():
             self.stop_scheduler_event.set()
             self.fetch_executor.shutdown(wait=True)
@@ -786,6 +807,75 @@ class ProxyManager:
             "failure_count": 0,
             "consecutive_failures": 0,
         }
+
+    def backup_stats(self) -> Dict:
+        """Backup source_stats to a JSON file."""
+        with self.lock:
+            stats_snapshot = {
+                "timestamp": datetime.now().isoformat(),
+                "source_stats": {source: dict(proxies) for source, proxies in self.source_stats.items()},
+            }
+
+        try:
+            # Create directory if it doesn't exist
+            self.stats_backup_path.parent.mkdir(parents=True, exist_ok=True)
+
+            with open(self.stats_backup_path, "w", encoding="utf-8") as f:
+                json.dump(stats_snapshot, f, ensure_ascii=False, indent=2)
+
+            total_proxies = sum(len(proxies) for proxies in stats_snapshot["source_stats"].values())
+            logger.info(
+                f"Stats backup completed: {len(stats_snapshot['source_stats'])} sources, "
+                f"{total_proxies} proxy stats saved to {self.stats_backup_path}"
+            )
+            return {
+                "status": "success",
+                "path": str(self.stats_backup_path),
+                "sources": len(stats_snapshot["source_stats"]),
+                "total_proxies": total_proxies,
+            }
+        except Exception as e:
+            logger.error(f"Failed to backup stats: {e}")
+            return {"status": "error", "message": str(e)}
+
+    def restore_stats(self) -> Dict:
+        """Restore source_stats from JSON file on startup."""
+        if not self.stats_backup_path.exists():
+            logger.info(f"No backup file found at {self.stats_backup_path}, starting with fresh stats.")
+            return {"status": "skipped", "message": "No backup file found"}
+
+        try:
+            with open(self.stats_backup_path, "r", encoding="utf-8") as f:
+                snapshot = json.load(f)
+
+            with self.lock:
+                restored_sources = 0
+                restored_proxies = 0
+                for source, proxies in snapshot.get("source_stats", {}).items():
+                    if source in self.predefined_sources:
+                        self.source_stats[source] = proxies
+                        restored_sources += 1
+                        restored_proxies += len(proxies)
+                    else:
+                        logger.debug(f"Skipping source '{source}' from backup (not in predefined_sources)")
+
+            backup_time = snapshot.get("timestamp", "unknown")
+            logger.info(
+                f"Stats restored from backup ({backup_time}): "
+                f"{restored_sources} sources, {restored_proxies} proxy stats loaded"
+            )
+            return {
+                "status": "success",
+                "timestamp": backup_time,
+                "restored_sources": restored_sources,
+                "restored_proxies": restored_proxies,
+            }
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse backup file (invalid JSON): {e}")
+            return {"status": "error", "message": f"Invalid JSON: {e}"}
+        except Exception as e:
+            logger.error(f"Failed to restore stats: {e}")
+            return {"status": "error", "message": str(e)}
 
     def _get_source_or_default(self, source: str) -> str:
         with self.lock:
@@ -924,6 +1014,7 @@ class ProxyManager:
 def load_proxy_manager(config_path: str) -> ProxyManager:
     logger.info("Initializing ProxyManager...")
     manager = ProxyManager(config_path)
+    manager.restore_stats()  # Restore from backup if available
     manager._sync_and_select_top_proxies()
     manager._update_dashboard_sources()
     if not manager.active_proxies:
@@ -1033,6 +1124,18 @@ def reload_sources_route():
             ),
             500,
         )
+
+
+@app.route("/backup-stats", methods=["POST"])
+def backup_stats_route():
+    """API endpoint to manually trigger stats backup."""
+    try:
+        result = proxy_manager.backup_stats()
+        status_code = 200 if result["status"] == "success" else 500
+        return jsonify(result), status_code
+    except Exception as e:
+        logger.error(f"Error during stats backup via API: {e}", exc_info=True)
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 
 @app.route("/api/sources", methods=["GET"])

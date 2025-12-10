@@ -57,6 +57,12 @@ top_tier_size = 100
 # The percentage of requests (0-100) that should be handled by the top tier.
 top_tier_load_percentage = 70
 
+
+[backup]
+stats_backup_enabled = true
+stats_backup_interval_seconds = 3600
+stats_backup_path = ./data/proxy_stats_backup.json
+
 # ===================================================================
 # Dynamic Proxy Source Definitions
 # ===================================================================
