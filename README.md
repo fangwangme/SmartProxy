@@ -132,3 +132,46 @@ curl -X POST -H "Content-Type: application/json" http://127.0.0.1:6942/reload-so
     }  
   }  
 ```
+
+### **POST /backup-stats**
+
+Manually triggers a backup of the in-memory proxy statistics to a JSON file.
+
+```bash
+curl -X POST http://127.0.0.1:6942/backup-stats
+```
+
+* **Request Body**: Empty  
+* **Success Response (200)**:  
+
+```json
+{
+  "status": "success",
+  "path": "./data/proxy_stats_backup.json",
+  "sources": 4,
+  "total_proxies": 1500
+}
+```
+
+### **GET /get-premium-proxy**
+
+Fetches a premium (highest quality) proxy for Playwright and other high-reliability use cases. Returns one of the top-scoring proxies across all sources.
+
+```bash
+curl http://127.0.0.1:6942/get-premium-proxy
+```
+
+* **Query Parameters**: None required  
+* **Success Response (200)**:  
+
+```json
+{
+  "http": "http://1.2.3.4:8080",  
+  "https": "http://1.2.3.4:8080",
+  "premium": true
+}
+```
+
+* **Error Response (404)**: Returned if no premium proxies are currently available.
+
+**Note**: Premium proxies are selected from proxies with at least 50 uses (configurable via `premium_min_usage_count`) and sorted by score. This ensures only battle-tested, high-quality proxies are returned.
