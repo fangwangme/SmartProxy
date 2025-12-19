@@ -57,8 +57,10 @@ top_tier_size = 100
 # The percentage of requests (0-100) that should be handled by the top tier.
 top_tier_load_percentage = 70
 
-premium_pool_size = 20         # 高质量代理池大小，默认20
-premium_min_usage_count = 50   # 最小使用次数要求，默认50
+# 高质量代理池大小
+premium_pool_size = 20
+# 最小使用次数要求
+premium_min_usage_count = 50
 
 
 [backup]
