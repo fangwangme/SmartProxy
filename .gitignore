@@ -138,3 +138,5 @@ proxy_stats.json
 
 
 *.ini
+
+.smart_proxy.pid

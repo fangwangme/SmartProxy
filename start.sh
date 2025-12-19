@@ -1,1 +1,131 @@
-nohup python -u smart_proxy.py > /dev/null 2>&1 &
+#!/bin/bash
+
+# SmartProxy 服务管理脚本
+# 用法: ./start.sh {start|stop|restart|status|logs}
+
+# 获取脚本所在的绝对路径
+PROJECT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+LOG_DIR="/usr/local/var/log"
+LOG_FILE="$LOG_DIR/proxy_$(date +%Y-%m-%d).log"
+PID_FILE="$PROJECT_DIR/.smart_proxy.pid"
+PORT=6942
+
+# 确保日志目录存在
+mkdir -p "$LOG_DIR" 2>/dev/null
+
+start_server() {
+    # 检查是否已经在运行
+    if [ -f "$PID_FILE" ] && kill -0 $(cat "$PID_FILE") 2>/dev/null; then
+        echo "SmartProxy is already running (PID: $(cat $PID_FILE))"
+        return 1
+    fi
+
+    # 进入项目目录
+    cd "$PROJECT_DIR"
+
+    echo "=================================================="
+    echo " Starting SmartProxy Server..."
+    echo " Project Path: $PROJECT_DIR"
+    echo " URL: http://localhost:$PORT"
+    echo " Log File: $LOG_FILE"
+    echo "=================================================="
+
+    # 使用 nohup 后台运行服务器
+    nohup python -u smart_proxy.py >> "$LOG_FILE" 2>&1 &
+    echo $! > "$PID_FILE"
+
+    sleep 1
+
+    # 验证进程是否启动成功
+    if kill -0 $(cat "$PID_FILE") 2>/dev/null; then
+        echo "SmartProxy started with PID: $(cat $PID_FILE)"
+    else
+        echo "Failed to start SmartProxy. Check log: $LOG_FILE"
+        rm -f "$PID_FILE"
+        return 1
+    fi
+}
+
+stop_server() {
+    if [ -f "$PID_FILE" ]; then
+        PID=$(cat "$PID_FILE")
+        if kill -0 $PID 2>/dev/null; then
+            echo "Stopping SmartProxy (PID: $PID)..."
+            kill $PID
+            
+            # 等待进程结束
+            for i in {1..10}; do
+                if ! kill -0 $PID 2>/dev/null; then
+                    break
+                fi
+                sleep 0.5
+            done
+            
+            # 强制终止
+            if kill -0 $PID 2>/dev/null; then
+                echo "Force killing..."
+                kill -9 $PID
+            fi
+            
+            rm -f "$PID_FILE"
+            echo "SmartProxy stopped."
+        else
+            echo "SmartProxy process not found. Cleaning up PID file."
+            rm -f "$PID_FILE"
+        fi
+    else
+        echo "SmartProxy is not running (no PID file found)."
+    fi
+}
+
+status_server() {
+    if [ -f "$PID_FILE" ] && kill -0 $(cat "$PID_FILE") 2>/dev/null; then
+        PID=$(cat "$PID_FILE")
+        echo "SmartProxy is running (PID: $PID)"
+        echo "URL: http://localhost:$PORT"
+        echo "Log: $LOG_FILE"
+        
+        # 显示进程运行时间
+        if [[ "$OSTYPE" == "darwin"* ]]; then
+            ps -p $PID -o etime= | xargs echo "Uptime:"
+        else
+            ps -p $PID -o etime= --no-headers | xargs echo "Uptime:"
+        fi
+    else
+        echo "SmartProxy is not running."
+        [ -f "$PID_FILE" ] && rm -f "$PID_FILE"
+    fi
+}
+
+logs_server() {
+    if [ -f "$LOG_FILE" ]; then
+        tail -f "$LOG_FILE"
+    else
+        echo "Log file not found: $LOG_FILE"
+    fi
+}
+
+# 命令行参数处理
+case "${1:-start}" in
+    start)
+        start_server
+        ;;
+    stop)
+        stop_server
+        ;;
+    restart)
+        stop_server
+        sleep 1
+        start_server
+        ;;
+    status)
+        status_server
+        ;;
+    logs)
+        logs_server
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status|logs}"
+        exit 1
+        ;;
+esac
