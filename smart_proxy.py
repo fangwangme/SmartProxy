@@ -289,6 +289,7 @@ class ProxyManager:
         self.available_proxies: Dict[str, Dict[str, List[str]]] = (
             {}
         )  # MODIFIED: Structure for tiers
+        self.premium_proxies: List[str] = []  # High-quality proxies for Playwright
 
         self.feedback_buffer = defaultdict(
             lambda: defaultdict(lambda: defaultdict(int))
@@ -658,6 +659,8 @@ class ProxyManager:
             self.db.batch_update_proxy_results(success_proxies, failure_proxy_ids)
 
             self._sync_and_select_top_proxies()
+            # Sync premium proxies after validation
+            self._sync_premium_proxies()
         finally:
             with self.lock:
                 self.is_validating = False
@@ -845,24 +848,42 @@ class ProxyManager:
             return {"status": "skipped", "message": "No backup file found"}
 
         try:
+            # Log file info before loading
+            file_size = self.stats_backup_path.stat().st_size
+            logger.info(f"Loading stats backup from: {self.stats_backup_path} (size: {file_size / 1024:.2f} KB)")
+
             with open(self.stats_backup_path, "r", encoding="utf-8") as f:
                 snapshot = json.load(f)
+
+            # Log backup metadata
+            backup_time = snapshot.get("timestamp", "unknown")
+            total_sources_in_file = len(snapshot.get("source_stats", {}))
+            logger.info(f"Backup file parsed successfully. Timestamp: {backup_time}, Sources in file: {total_sources_in_file}")
 
             with self.lock:
                 restored_sources = 0
                 restored_proxies = 0
+                skipped_sources = []
+
                 for source, proxies in snapshot.get("source_stats", {}).items():
                     if source in self.predefined_sources:
                         self.source_stats[source] = proxies
                         restored_sources += 1
-                        restored_proxies += len(proxies)
+                        proxy_count = len(proxies)
+                        restored_proxies += proxy_count
+                        # Log each source being restored
+                        logger.info(f"  [RESTORED] Source '{source}': {proxy_count} proxies loaded")
                     else:
-                        logger.debug(f"Skipping source '{source}' from backup (not in predefined_sources)")
+                        skipped_sources.append(source)
+                        logger.debug(f"  [SKIPPED] Source '{source}': not in predefined_sources")
 
-            backup_time = snapshot.get("timestamp", "unknown")
+                # Log skipped sources summary if any
+                if skipped_sources:
+                    logger.warning(f"Skipped {len(skipped_sources)} sources not in predefined_sources: {skipped_sources}")
+
             logger.info(
-                f"Stats restored from backup ({backup_time}): "
-                f"{restored_sources} sources, {restored_proxies} proxy stats loaded"
+                f"Stats restore completed: {restored_sources}/{total_sources_in_file} sources, "
+                f"{restored_proxies} proxy stats loaded"
             )
             return {
                 "status": "success",
@@ -925,6 +946,78 @@ class ProxyManager:
             else:
                 logger.warning(f"No available proxy in any tier for source '{source}'.")
                 return None
+
+    def get_premium_proxy(self) -> Optional[str]:
+        """
+        Get a premium (highest quality) proxy for Playwright and other high-reliability use cases.
+        Returns one of the lowest-latency proxies from the database.
+        """
+        with self.lock:
+            if not self.premium_proxies:
+                logger.warning("No premium proxies available.")
+                return None
+
+            selected = random.choice(self.premium_proxies)
+            logger.debug(
+                f"Premium proxy selected: {selected} "
+                f"(pool size: {len(self.premium_proxies)})"
+            )
+            return selected
+
+    def _sync_premium_proxies(self):
+        """
+        Sync premium proxies from source_stats.
+        Aggregates proxies across all sources and selects the top N by score.
+        Only considers proxies with usage count > 50 to avoid new proxies with inflated scores.
+        """
+        premium_pool_size = self.config.getint(
+            "source_pool", "premium_pool_size", fallback=20
+        )
+        min_usage_count = self.config.getint(
+            "source_pool", "premium_min_usage_count", fallback=50
+        )
+
+        with self.lock:
+            # Aggregate all proxies with their highest score across all sources
+            # Only consider proxies with sufficient usage history
+            proxy_best_scores: Dict[str, float] = {}
+            for source, stats in self.source_stats.items():
+                for proxy_url, stat in stats.items():
+                    # Calculate total usage count
+                    usage_count = stat.get("success_count", 0) + stat.get("failure_count", 0)
+                    
+                    # Skip proxies with insufficient usage history
+                    if usage_count < min_usage_count:
+                        continue
+                    
+                    score = stat.get("score", 0)
+                    # Keep the highest score for each proxy across all sources
+                    if proxy_url not in proxy_best_scores or score > proxy_best_scores[proxy_url]:
+                        proxy_best_scores[proxy_url] = score
+
+            # Filter to only active proxies and sort by score descending
+            active_proxy_scores = {
+                url: score for url, score in proxy_best_scores.items()
+                if url in self.active_proxies
+            }
+
+            sorted_proxies = sorted(
+                active_proxy_scores.items(),
+                key=lambda x: x[1],
+                reverse=True
+            )
+
+            # Take the top N
+            self.premium_proxies = [url for url, _ in sorted_proxies[:premium_pool_size]]
+
+        if self.premium_proxies:
+            top_scores = [proxy_best_scores.get(url, 0) for url in self.premium_proxies[:5]]
+            logger.info(
+                f"Premium proxy pool synced: {len(self.premium_proxies)} proxies loaded "
+                f"(top 5 scores: {top_scores})"
+            )
+        else:
+            logger.warning("No premium proxies found in source_stats.")
 
     def _flush_feedback_buffer(self):
         """Flushes stats for all fully completed minutes to the database."""
@@ -1016,6 +1109,7 @@ def load_proxy_manager(config_path: str) -> ProxyManager:
     manager = ProxyManager(config_path)
     manager.restore_stats()  # Restore from backup if available
     manager._sync_and_select_top_proxies()
+    manager._sync_premium_proxies()  # Sync premium proxies on startup
     manager._update_dashboard_sources()
     if not manager.active_proxies:
         logger.warning(
@@ -1068,6 +1162,21 @@ def get_proxy_route():
         return (
             jsonify(
                 {"error": f"No available proxy for source '{source}' at the moment."}
+            ),
+            404,
+        )
+
+
+@app.route("/get-premium-proxy", methods=["GET"])
+def get_premium_proxy_route():
+    """Get a premium (highest quality) proxy for Playwright and high-reliability use cases."""
+    proxy_url = proxy_manager.get_premium_proxy()
+    if proxy_url:
+        return jsonify({"http": proxy_url, "https": proxy_url, "premium": True})
+    else:
+        return (
+            jsonify(
+                {"error": "No premium proxy available at the moment."}
             ),
             404,
         )
