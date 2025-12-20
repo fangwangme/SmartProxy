@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # SmartProxy 服务管理脚本
-# 用法: ./start.sh {start|stop|restart|status|logs|backup}
+# 用法: ./start.sh {start|stop|restart|status|logs|backup} [--debug]
 
 # 获取脚本所在的绝对路径
 PROJECT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
@@ -9,6 +9,7 @@ LOG_DIR="/usr/local/var/log"
 LOG_FILE="$LOG_DIR/proxy_$(date +%Y-%m-%d).log"
 PID_FILE="$PROJECT_DIR/.smart_proxy.pid"
 PORT=6942
+DEBUG_FLAG=""
 
 # 确保日志目录存在
 mkdir -p "$LOG_DIR" 2>/dev/null
@@ -17,10 +18,10 @@ backup_stats() {
     # 备份代理统计数据
     echo "Triggering stats backup..."
     if curl -s -X POST "http://localhost:$PORT/backup-stats" -o /tmp/backup_response.json 2>/dev/null; then
-        status=$(python3 -c "import json; d=json.load(open('/tmp/backup_response.json')); print(d.get('status', 'unknown'))" 2>/dev/null)
+        status=$(python -c "import json; d=json.load(open('/tmp/backup_response.json')); print(d.get('status', 'unknown'))" 2>/dev/null)
         if [ "$status" = "success" ]; then
-            sources=$(python3 -c "import json; d=json.load(open('/tmp/backup_response.json')); print(d.get('sources', 'N/A'))" 2>/dev/null)
-            proxies=$(python3 -c "import json; d=json.load(open('/tmp/backup_response.json')); print(d.get('total_proxies', 'N/A'))" 2>/dev/null)
+            sources=$(python -c "import json; d=json.load(open('/tmp/backup_response.json')); print(d.get('sources', 'N/A'))" 2>/dev/null)
+            proxies=$(python -c "import json; d=json.load(open('/tmp/backup_response.json')); print(d.get('total_proxies', 'N/A'))" 2>/dev/null)
             echo "Backup successful: $sources sources, $proxies proxies"
         else
             echo "Backup failed or service not responding"
@@ -46,10 +47,11 @@ start_server() {
     echo " Project Path: $PROJECT_DIR"
     echo " URL: http://localhost:$PORT"
     echo " Log File: $LOG_FILE"
+    [ -n "$DEBUG_FLAG" ] && echo " Debug Mode: ENABLED"
     echo "=================================================="
 
     # 使用 nohup 后台运行服务器
-    nohup python -u smart_proxy.py >> "$LOG_FILE" 2>&1 &
+    nohup python -u smart_proxy.py $DEBUG_FLAG >> "$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
 
     sleep 1
@@ -126,6 +128,13 @@ logs_server() {
     fi
 }
 
+# 解析 --debug 参数
+for arg in "$@"; do
+    if [ "$arg" = "--debug" ]; then
+        DEBUG_FLAG="--debug"
+    fi
+done
+
 # 命令行参数处理
 case "${1:-start}" in
     start)
@@ -149,7 +158,7 @@ case "${1:-start}" in
         backup_stats
         ;;
     *)
-        echo "Usage: $0 {start|stop|restart|status|logs|backup}"
+        echo "Usage: $0 {start|stop|restart|status|logs|backup} [--debug]"
         exit 1
         ;;
 esac
