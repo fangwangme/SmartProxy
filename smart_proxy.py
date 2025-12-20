@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import time
+import argparse
 import asyncio
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -316,6 +317,7 @@ class ProxyManager:
             max_workers=10, thread_name_prefix="Fetcher"
         )
         self.is_validating = False
+        self.debug_mode = False  # Set via command line --debug flag
 
     def _load_config(self):
         self.server_port = self.config.getint("server", "port", fallback=6942)
@@ -598,7 +600,20 @@ class ProxyManager:
                     "latency": latency_ms,
                     "anonymity": anonymity,
                 }
-        except Exception:
+        except aiohttp.ClientProxyConnectionError as e:
+            # Proxy connection refused/unreachable
+            if self.debug_mode:
+                logger.debug(f"Proxy {proxy_id} connection error: {type(e).__name__}")
+            return {"id": proxy_id, "success": False}
+        except asyncio.TimeoutError:
+            # Request timed out
+            if self.debug_mode:
+                logger.debug(f"Proxy {proxy_id} timeout after {self.validation_timeout_s}s")
+            return {"id": proxy_id, "success": False}
+        except Exception as e:
+            # Other errors
+            if self.debug_mode:
+                logger.debug(f"Proxy {proxy_id} failed: {type(e).__name__}")
             return {"id": proxy_id, "success": False}
 
     async def _validate_proxies_batch_async(self, proxies_to_validate: List[Dict]) -> Tuple[List[Dict], List[int]]:
@@ -1476,6 +1491,16 @@ def handle_shutdown(signal, frame):
 
 
 if __name__ == "__main__":
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="SmartProxy Service")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging for validation")
+    args = parser.parse_args()
+    
+    # Set debug mode on proxy manager
+    proxy_manager.debug_mode = args.debug
+    if args.debug:
+        logger.info("Debug mode enabled - verbose validation logging active")
+    
     # Suppress Werkzeug's default access logs for per-request noise reduction
     import logging
     logging.getLogger("werkzeug").setLevel(logging.WARNING)

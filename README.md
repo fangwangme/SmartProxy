@@ -48,8 +48,17 @@ SmartProxy is a sophisticated proxy management system designed to provide reliab
 4. **Configure the service:**  
    * Rename or copy config.ini.example to config.ini.  
    * Edit config.ini with your database credentials, desired port, and proxy sources. See the **Configuration** section below for details.  
+
 5. **Run the service:**  
-   python smart\_proxy.py
+   ```bash
+   ./start.sh start           # Start the service
+   ./start.sh stop            # Stop the service (auto-backup)
+   ./start.sh restart         # Restart the service
+   ./start.sh status          # Check service status
+   ./start.sh logs            # Tail the log file
+   ./start.sh backup          # Manual stats backup
+   ./start.sh start --debug   # Start with verbose validation logging
+   ```
 
    The service will start, and you can access the dashboard at http://localhost:6942 (or your configured port).
 
@@ -175,3 +184,33 @@ curl http://127.0.0.1:6942/get-premium-proxy
 * **Error Response (404)**: Returned if no premium proxies are currently available.
 
 **Note**: Premium proxies are selected from proxies with at least 50 uses (configurable via `premium_min_usage_count`) and sorted by score. This ensures only battle-tested, high-quality proxies are returned.
+
+### **GET /health**
+
+Health check endpoint for monitoring.
+
+```bash
+curl http://127.0.0.1:6942/health
+```
+
+* **Success Response (200)**:
+
+```json
+{
+  "status": "healthy",
+  "active_proxies": 1500,
+  "premium_proxies": 50,
+  "sources": 4,
+  "is_validating": false
+}
+```
+
+### **GET /metrics**
+
+Prometheus-compatible metrics endpoint.
+
+```bash
+curl http://127.0.0.1:6942/metrics
+```
+
+* **Success Response (200)**: Returns metrics in Prometheus text format.
