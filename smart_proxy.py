@@ -4,14 +4,18 @@ import json
 import os
 import random
 import signal
+import subprocess
 import sys
 import threading
 import time
+import asyncio
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
+
+import aiohttp
 
 import psycopg2
 import psycopg2.pool
@@ -27,7 +31,7 @@ CONFIG_FILE_PATH = os.path.join("./", "config.ini")
 FAILED_STATUS_CODES = {
     0,
     4,
-}  # Set of status codes that indicate success
+}  # Set of status codes that indicate failure (0=timeout, 4=proxy error)
 
 
 class DatabaseManager:
@@ -38,7 +42,8 @@ class DatabaseManager:
             # OPTIMIZATION: Increased maxconn to better handle concurrent workers.
             # The ideal number depends on your DB server's capacity.
             max_connections = config.getint("database", "max_connections", fallback=50)
-            self.pool = psycopg2.pool.SimpleConnectionPool(
+            # Use ThreadedConnectionPool for thread-safe access in multi-threaded environment
+            self.pool = psycopg2.pool.ThreadedConnectionPool(
                 minconn=2,
                 maxconn=max_connections,
                 host=config.get("database", "host"),
@@ -282,7 +287,10 @@ class ProxyManager:
         self.config.read(config_path, encoding="utf-8")
 
         self.db = DatabaseManager(self.config)
-        self.lock = threading.Lock()
+        # Use RLock for reentrant locking (allows same thread to acquire lock multiple times)
+        self.lock = threading.RLock()
+        # Per-source locks for fine-grained concurrency control
+        self.source_locks: Dict[str, threading.Lock] = {}
 
         self.active_proxies: Set[str] = set()
         self.source_stats: Dict[str, Dict[str, Dict]] = {}
@@ -504,14 +512,23 @@ class ProxyManager:
     def _fetch_and_parse_source(self, job: Dict) -> List:
         """
         DEADLOCK FIX: This method now returns a list of proxies instead of writing to the DB.
+        Uses curl subprocess to bypass Python process direct rule in Clash Verge.
         """
         url = job["url"]
         logger.info(f"Fetching proxy source: {job['name']} from {url}")
         proxies_to_insert = []
         try:
-            response = requests.get(url, timeout=15)
-            response.raise_for_status()
-            for line in response.text.splitlines():
+            # Use curl instead of requests to bypass Python's direct rule in Clash Verge
+            result = subprocess.run(
+                ["curl", "-s", "-f", "--connect-timeout", "15", "--max-time", "30", url],
+                capture_output=True,
+                text=True,
+                timeout=35
+            )
+            if result.returncode != 0:
+                raise Exception(f"curl failed with return code {result.returncode}: {result.stderr}")
+            response_text = result.stdout
+            for line in response_text.splitlines():
                 line = line.strip()
                 if not line:
                     continue
@@ -527,7 +544,7 @@ class ProxyManager:
                         )
                 except ValueError:
                     continue
-        except requests.RequestException as e:
+        except Exception as e:
             logger.error(f"Failed to fetch from {job['name']} ({url}): {e}")
         return proxies_to_insert
 
@@ -556,9 +573,74 @@ class ProxyManager:
         )
         self.db.insert_proxies(unique_proxies_list)
 
+    async def _validate_proxy_async(self, session: aiohttp.ClientSession, proxy_id: int, proxy_url: str) -> Dict:
+        """
+        Async version of proxy validation using aiohttp for better performance.
+        """
+        start_time = time.time()
+        try:
+            async with session.get(
+                self.validation_target,
+                proxy=proxy_url,
+                timeout=aiohttp.ClientTimeout(total=self.validation_timeout_s),
+            ) as response:
+                response.raise_for_status()
+                latency_ms = int((time.time() - start_time) * 1000)
+                data = await response.json()
+                headers = data.get("headers", {})
+                is_anonymous = not any(
+                    h in headers for h in ["X-Forwarded-For", "Via", "X-Real-Ip"]
+                )
+                anonymity = "elite" if is_anonymous else "transparent"
+                return {
+                    "id": proxy_id,
+                    "success": True,
+                    "latency": latency_ms,
+                    "anonymity": anonymity,
+                }
+        except Exception:
+            return {"id": proxy_id, "success": False}
+
+    async def _validate_proxies_batch_async(self, proxies_to_validate: List[Dict]) -> Tuple[List[Dict], List[int]]:
+        """
+        Validate a batch of proxies concurrently using aiohttp.
+        Returns (success_proxies, failure_proxy_ids).
+        """
+        # No session-level timeout - each request has its own timeout
+        # limit controls max concurrent connections
+        connector = aiohttp.TCPConnector(
+            limit=self.validation_workers,
+            force_close=True,
+            enable_cleanup_closed=True,
+        )
+        
+        async with aiohttp.ClientSession(connector=connector) as session:
+            tasks = [
+                self._validate_proxy_async(
+                    session,
+                    p["id"],
+                    f"{p['protocol']}://{p['ip']}:{p['port']}",
+                )
+                for p in proxies_to_validate
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        success_proxies = []
+        failure_proxy_ids = []
+        
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                failure_proxy_ids.append(proxies_to_validate[i]["id"])
+            elif result.get("success"):
+                success_proxies.append(result)
+            else:
+                failure_proxy_ids.append(result["id"])
+        
+        return success_proxies, failure_proxy_ids
+
     def _validate_proxy(self, proxy_id: int, proxy_url: str) -> Dict:
         """
-        OPTIMIZATION: This method now returns a result dict instead of calling the DB directly.
+        Sync fallback for proxy validation (kept for compatibility).
         """
         proxies = {"http": proxy_url, "https": proxy_url}
         start_time = time.time()
@@ -624,36 +706,27 @@ class ProxyManager:
             )
 
             total_to_validate = len(proxies_to_validate)
-            logger.info(f"Starting validation for {total_to_validate} proxies...")
+            logger.info(f"Starting async validation for {total_to_validate} proxies...")
 
-            success_proxies = []
-            failure_proxy_ids = []
-
-            with ThreadPoolExecutor(max_workers=self.validation_workers) as executor:
-                future_to_proxy = {
-                    executor.submit(
-                        self._validate_proxy,
-                        p["id"],
-                        f"{p['protocol']}://{p['ip']}:{p['port']}",
-                    ): p
-                    for p in proxies_to_validate
-                }
-                for future in as_completed(future_to_proxy):
-                    try:
-                        result = future.result()
-                        if result["success"]:
-                            success_proxies.append(result)
-                        else:
-                            failure_proxy_ids.append(result["id"])
-                    except Exception as exc:
-                        proxy_info = future_to_proxy[future]
-                        failure_proxy_ids.append(proxy_info["id"])
-                        logger.error(
-                            f"Proxy validation for {proxy_info['id']} generated an exception: {exc}"
-                        )
+            # Use asyncio for high-performance validation
+            validation_start_time = time.time()
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                success_proxies, failure_proxy_ids = loop.run_until_complete(
+                    self._validate_proxies_batch_async(proxies_to_validate)
+                )
+            finally:
+                loop.close()
+            
+            validation_duration = time.time() - validation_start_time
+            proxies_per_second = total_to_validate / validation_duration if validation_duration > 0 else 0
+            success_rate = len(success_proxies) / total_to_validate * 100 if total_to_validate > 0 else 0
 
             logger.info(
-                f"Validation cycle finished. Success: {len(success_proxies)}, Failed: {len(failure_proxy_ids)}."
+                f"Validation cycle finished in {validation_duration:.2f}s. "
+                f"Success: {len(success_proxies)}/{total_to_validate} ({success_rate:.1f}%), "
+                f"Throughput: {proxies_per_second:.1f} proxies/s"
             )
 
             self.db.batch_update_proxy_results(success_proxies, failure_proxy_ids)
@@ -898,6 +971,13 @@ class ProxyManager:
             logger.error(f"Failed to restore stats: {e}")
             return {"status": "error", "message": str(e)}
 
+    def _get_source_lock(self, source: str) -> threading.Lock:
+        """Get or create a lock for a specific source for fine-grained locking."""
+        with self.lock:
+            if source not in self.source_locks:
+                self.source_locks[source] = threading.Lock()
+            return self.source_locks[source]
+
     def _get_source_or_default(self, source: str) -> str:
         with self.lock:
             is_defined = source in self.predefined_sources
@@ -1099,8 +1179,9 @@ class ProxyManager:
                 penalty = self.failure_penalties[penalty_index]
                 stat["score"] += penalty
 
-            logger.info(
-                f"Computed Score for {source:<15} | {proxy_url:<30} | {status_code:<4} | {response_time_ms:<12.3f}ms -> {stat['score']:<10.4f}"
+            response_time_str = f"{response_time_ms:.3f}" if response_time_ms is not None else "N/A"
+            logger.debug(
+                f"Computed Score for {source:<15} | {proxy_url:<30} | {status_code:<4} | {response_time_str:<12}ms -> {stat['score']:<10.4f}"
             )
 
 
@@ -1113,34 +1194,44 @@ def load_proxy_manager(config_path: str) -> ProxyManager:
     manager._update_dashboard_sources()
     if not manager.active_proxies:
         logger.warning(
-            "Cold start detected. Running initial synchronous fetch and validation..."
+            "Cold start detected. Running initial fetch and validation in background..."
         )
-        initial_jobs = manager._load_fetcher_jobs()
-        manager.fetcher_jobs = initial_jobs
-        fetch_futures = [
-            manager.fetch_executor.submit(manager._fetch_and_parse_source, job)
-            for job in initial_jobs
-        ]
-
-        all_proxies = []
-        for future in as_completed(fetch_futures):
+        
+        def _cold_start_initialization():
+            """Background task for cold start initialization."""
             try:
-                proxies = future.result()
-                if proxies:
-                    all_proxies.extend(proxies)
+                initial_jobs = manager._load_fetcher_jobs()
+                manager.fetcher_jobs = initial_jobs
+                fetch_futures = [
+                    manager.fetch_executor.submit(manager._fetch_and_parse_source, job)
+                    for job in initial_jobs
+                ]
+
+                all_proxies = []
+                for future in as_completed(fetch_futures):
+                    try:
+                        proxies = future.result()
+                        if proxies:
+                            all_proxies.extend(proxies)
+                    except Exception as e:
+                        logger.error(f"Initial fetcher job failed: {e}")
+
+                if all_proxies:
+                    unique_proxies_set = {tuple(p) for p in all_proxies}
+                    unique_proxies_list = [list(p) for p in unique_proxies_set]
+                    logger.info(
+                        f"Initial fetch: Consolidated {len(unique_proxies_list)} unique proxies for insertion."
+                    )
+                    manager.db.insert_proxies(unique_proxies_list)
+
+                manager._run_validation_cycle()
+                logger.info("Cold start initialization complete.")
             except Exception as e:
-                logger.error(f"Initial fetcher job failed: {e}")
-
-        if all_proxies:
-            unique_proxies_set = {tuple(p) for p in all_proxies}
-            unique_proxies_list = [list(p) for p in unique_proxies_set]
-            logger.info(
-                f"Initial fetch: Consolidated {len(unique_proxies_list)} unique proxies for insertion."
-            )
-            manager.db.insert_proxies(unique_proxies_list)
-
-        manager._run_validation_cycle()
-        logger.info("Initial validation complete.")
+                logger.error(f"Cold start initialization failed: {e}")
+        
+        # Run initialization in background thread to avoid blocking server startup
+        threading.Thread(target=_cold_start_initialization, daemon=True).start()
+        logger.info("Server starting immediately, cold start running in background.")
     return manager
 
 
@@ -1148,6 +1239,71 @@ def load_proxy_manager(config_path: str) -> ProxyManager:
 app = Flask(__name__, static_folder="dashboard/dist")
 CORS(app)
 proxy_manager = load_proxy_manager(CONFIG_FILE_PATH)
+
+
+@app.route("/health", methods=["GET"])
+def health_check():
+    """Health check endpoint for monitoring."""
+    with proxy_manager.lock:
+        active_count = len(proxy_manager.active_proxies)
+        premium_count = len(proxy_manager.premium_proxies)
+        sources_count = len(proxy_manager.predefined_sources)
+    
+    return jsonify({
+        "status": "healthy",
+        "active_proxies": active_count,
+        "premium_proxies": premium_count,
+        "sources": sources_count,
+        "is_validating": proxy_manager.is_validating,
+    })
+
+
+@app.route("/metrics", methods=["GET"])
+def metrics():
+    """Prometheus-compatible metrics endpoint."""
+    with proxy_manager.lock:
+        active_count = len(proxy_manager.active_proxies)
+        premium_count = len(proxy_manager.premium_proxies)
+        sources_count = len(proxy_manager.predefined_sources)
+        
+        # Calculate total stats across all sources
+        total_success = 0
+        total_failure = 0
+        for source_stats in proxy_manager.source_stats.values():
+            for stat in source_stats.values():
+                total_success += stat.get("success_count", 0)
+                total_failure += stat.get("failure_count", 0)
+    
+    total_requests = total_success + total_failure
+    success_rate = (total_success / total_requests * 100) if total_requests > 0 else 0
+    
+    # Prometheus text format
+    metrics_text = f"""# HELP smartproxy_active_proxies Number of active proxies
+# TYPE smartproxy_active_proxies gauge
+smartproxy_active_proxies {active_count}
+
+# HELP smartproxy_premium_proxies Number of premium proxies
+# TYPE smartproxy_premium_proxies gauge
+smartproxy_premium_proxies {premium_count}
+
+# HELP smartproxy_sources_total Number of configured sources
+# TYPE smartproxy_sources_total gauge
+smartproxy_sources_total {sources_count}
+
+# HELP smartproxy_requests_total Total requests processed
+# TYPE smartproxy_requests_total counter
+smartproxy_requests_success_total {total_success}
+smartproxy_requests_failure_total {total_failure}
+
+# HELP smartproxy_success_rate_percent Current success rate percentage
+# TYPE smartproxy_success_rate_percent gauge
+smartproxy_success_rate_percent {success_rate:.2f}
+
+# HELP smartproxy_is_validating Whether validation is in progress
+# TYPE smartproxy_is_validating gauge
+smartproxy_is_validating {1 if proxy_manager.is_validating else 0}
+"""
+    return metrics_text, 200, {"Content-Type": "text/plain; charset=utf-8"}
 
 
 @app.route("/get-proxy", methods=["GET"])
@@ -1189,7 +1345,7 @@ def feedback_route():
     proxy_url = data.get("proxy")
     status_code = data.get("status")
     resp_time = data.get("response_time_ms")
-    logger.info(
+    logger.debug(
         f"Handled feedback: {source} - {status_code} - {proxy_url} - {resp_time}"
     )
     if not all([source, proxy_url]) or not isinstance(status_code, int):
@@ -1320,6 +1476,10 @@ def handle_shutdown(signal, frame):
 
 
 if __name__ == "__main__":
+    # Suppress Werkzeug's default access logs for per-request noise reduction
+    import logging
+    logging.getLogger("werkzeug").setLevel(logging.WARNING)
+    
     signal.signal(signal.SIGINT, handle_shutdown)
     signal.signal(signal.SIGTERM, handle_shutdown)
     proxy_manager.start_scheduler()

@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # SmartProxy 服务管理脚本
-# 用法: ./start.sh {start|stop|restart|status|logs}
+# 用法: ./start.sh {start|stop|restart|status|logs|backup}
 
 # 获取脚本所在的绝对路径
 PROJECT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
@@ -12,6 +12,24 @@ PORT=6942
 
 # 确保日志目录存在
 mkdir -p "$LOG_DIR" 2>/dev/null
+
+backup_stats() {
+    # 备份代理统计数据
+    echo "Triggering stats backup..."
+    if curl -s -X POST "http://localhost:$PORT/backup-stats" -o /tmp/backup_response.json 2>/dev/null; then
+        status=$(python3 -c "import json; d=json.load(open('/tmp/backup_response.json')); print(d.get('status', 'unknown'))" 2>/dev/null)
+        if [ "$status" = "success" ]; then
+            sources=$(python3 -c "import json; d=json.load(open('/tmp/backup_response.json')); print(d.get('sources', 'N/A'))" 2>/dev/null)
+            proxies=$(python3 -c "import json; d=json.load(open('/tmp/backup_response.json')); print(d.get('total_proxies', 'N/A'))" 2>/dev/null)
+            echo "Backup successful: $sources sources, $proxies proxies"
+        else
+            echo "Backup failed or service not responding"
+        fi
+        rm -f /tmp/backup_response.json
+    else
+        echo "Could not connect to SmartProxy service"
+    fi
+}
 
 start_server() {
     # 检查是否已经在运行
@@ -50,6 +68,9 @@ stop_server() {
     if [ -f "$PID_FILE" ]; then
         PID=$(cat "$PID_FILE")
         if kill -0 $PID 2>/dev/null; then
+            # 先备份再停止
+            backup_stats
+            
             echo "Stopping SmartProxy (PID: $PID)..."
             kill $PID
             
@@ -124,8 +145,11 @@ case "${1:-start}" in
     logs)
         logs_server
         ;;
+    backup)
+        backup_stats
+        ;;
     *)
-        echo "Usage: $0 {start|stop|restart|status|logs}"
+        echo "Usage: $0 {start|stop|restart|status|logs|backup}"
         exit 1
         ;;
 esac

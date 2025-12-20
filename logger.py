@@ -39,16 +39,18 @@ logger.remove()
 
 # --- Configure Console Log Handler ---
 # This handler is responsible for displaying colorful, readable logs in the terminal.
-# Ideal for development and real-time monitoring.
-logger.add(
-    sys.stderr,  # Sink: standard error stream
-    level="INFO",  # Log level
-    format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
-    "<level>{level: <8}</level> | "
-    "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - "
-    "<level>{message}</level>",
-    colorize=True,  # Enable colorization
-)
+# Only enabled when running interactively (stderr is a TTY),
+# to avoid duplicate logs when running as a background service with redirected output.
+if sys.stderr.isatty():
+    logger.add(
+        sys.stderr,  # Sink: standard error stream
+        level="INFO",  # Log level
+        format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
+        "<level>{level: <8}</level> | "
+        "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - "
+        "<level>{message}</level>",
+        colorize=True,  # Enable colorization
+    )
 
 # --- Configure File Log Handler ---
 # This handler writes logs to a file and manages rotation, retention, and compression.
