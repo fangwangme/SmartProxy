@@ -25,7 +25,7 @@ import requests
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 
-from logger import logger
+from logger import logger, setup_logging
 
 # --- Configuration & Constants ---
 CONFIG_FILE_PATH = os.path.join("./", "config.ini")
@@ -1499,6 +1499,7 @@ if __name__ == "__main__":
     # Set debug mode on proxy manager
     proxy_manager.debug_mode = args.debug
     if args.debug:
+        setup_logging("DEBUG")
         logger.info("Debug mode enabled - verbose validation logging active")
     
     # Suppress Werkzeug's default access logs for per-request noise reduction

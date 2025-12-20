@@ -33,39 +33,49 @@ except PermissionError:
     sys.exit(1)
 
 
-# --- Initialize Logger ---
-# First, remove any default handlers to start with a clean configuration.
-logger.remove()
 
-# --- Configure Console Log Handler ---
-# This handler is responsible for displaying colorful, readable logs in the terminal.
-# Only enabled when running interactively (stderr is a TTY),
-# to avoid duplicate logs when running as a background service with redirected output.
-if sys.stderr.isatty():
+def setup_logging(level="INFO"):
+    """
+    Configures the logger with the specified log level.
+    """
+    # --- Initialize Logger ---
+    # First, remove any default handlers to start with a clean configuration.
+    logger.remove()
+
+    # --- Configure Console Log Handler ---
+    # This handler is responsible for displaying colorful, readable logs in the terminal.
+    # Only enabled when running interactively (stderr is a TTY),
+    # to avoid duplicate logs when running as a background service with redirected output.
+    if sys.stderr.isatty():
+        logger.add(
+            sys.stderr,  # Sink: standard error stream
+            level=level,  # Log level
+            format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
+            "<level>{level: <8}</level> | "
+            "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - "
+            "<level>{message}</level>",
+            colorize=True,  # Enable colorization
+        )
+
+    # --- Configure File Log Handler ---
+    # This handler writes logs to a file and manages rotation, retention, and compression.
     logger.add(
-        sys.stderr,  # Sink: standard error stream
-        level="INFO",  # Log level
-        format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
-        "<level>{level: <8}</level> | "
-        "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - "
-        "<level>{message}</level>",
-        colorize=True,  # Enable colorization
+        LOG_FILE_PATH,  # Sink: path to the log file
+        level=level,  # Log level
+        format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}",
+        rotation="00:00",  # Rotate the log file at midnight every day
+        retention="3 days",  # Keep logs for the last 7 days
+        compression="zip",  # Compress old log files into .zip format
+        encoding="utf-8",  # File encoding
+        enqueue=True,  # Make logging asynchronous to prevent blocking the main thread
+        backtrace=True,  # Include full stack trace in exception logs
+        diagnose=True,  # Add extended diagnostic information for exceptions
     )
+    
+    logger.info(f"Logger configured with level: {level}")
 
-# --- Configure File Log Handler ---
-# This handler writes logs to a file and manages rotation, retention, and compression.
-logger.add(
-    LOG_FILE_PATH,  # Sink: path to the log file
-    level="INFO",  # Log level
-    format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}",
-    rotation="00:00",  # Rotate the log file at midnight every day
-    retention="3 days",  # Keep logs for the last 7 days
-    compression="zip",  # Compress old log files into .zip format
-    encoding="utf-8",  # File encoding
-    enqueue=True,  # Make logging asynchronous to prevent blocking the main thread
-    backtrace=True,  # Include full stack trace in exception logs
-    diagnose=True,  # Add extended diagnostic information for exceptions
-)
+# Initialize with default level
+setup_logging()
 
 logger.info("Logger initialized successfully.")
 
