@@ -605,17 +605,17 @@ class ProxyManager:
             except aiohttp.ClientProxyConnectionError as e:
                 # Proxy connection refused/unreachable
                 if self.debug_mode:
-                    logger.debug(f"Proxy {proxy_id} connection error: {type(e).__name__}")
+                    logger.debug(f"Proxy {proxy_url} (ID: {proxy_id}) connection error: {type(e).__name__}")
                 return {"id": proxy_id, "success": False}
             except asyncio.TimeoutError:
                 # Request timed out
                 if self.debug_mode:
-                    logger.debug(f"Proxy {proxy_id} timeout after {self.validation_timeout_s}s")
+                    logger.debug(f"Proxy {proxy_url} (ID: {proxy_id}) timeout after {self.validation_timeout_s}s")
                 return {"id": proxy_id, "success": False}
             except Exception as e:
                 # Other errors
                 if self.debug_mode:
-                    logger.debug(f"Proxy {proxy_id} failed: {type(e).__name__}")
+                    logger.debug(f"Proxy {proxy_url} (ID: {proxy_id}) failed: {type(e).__name__}")
                 return {"id": proxy_id, "success": False}
 
     async def _validate_proxies_batch_async(self, proxies_to_validate: List[Dict]) -> Tuple[List[Dict], List[int]]:
