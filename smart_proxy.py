@@ -575,46 +575,48 @@ class ProxyManager:
         )
         self.db.insert_proxies(unique_proxies_list)
 
-    async def _validate_proxy_async(self, session: aiohttp.ClientSession, proxy_id: int, proxy_url: str) -> Dict:
+    async def _validate_proxy_async(self, session: aiohttp.ClientSession, proxy_id: int, proxy_url: str, semaphore: asyncio.Semaphore) -> Dict:
         """
         Async version of proxy validation using aiohttp for better performance.
+        Uses semaphore to ensure timeout timer only starts when execution begins.
         """
-        start_time = time.time()
-        try:
-            async with session.get(
-                self.validation_target,
-                proxy=proxy_url,
-                timeout=aiohttp.ClientTimeout(total=self.validation_timeout_s),
-            ) as response:
-                response.raise_for_status()
-                latency_ms = int((time.time() - start_time) * 1000)
-                data = await response.json()
-                headers = data.get("headers", {})
-                is_anonymous = not any(
-                    h in headers for h in ["X-Forwarded-For", "Via", "X-Real-Ip"]
-                )
-                anonymity = "elite" if is_anonymous else "transparent"
-                return {
-                    "id": proxy_id,
-                    "success": True,
-                    "latency": latency_ms,
-                    "anonymity": anonymity,
-                }
-        except aiohttp.ClientProxyConnectionError as e:
-            # Proxy connection refused/unreachable
-            if self.debug_mode:
-                logger.debug(f"Proxy {proxy_id} connection error: {type(e).__name__}")
-            return {"id": proxy_id, "success": False}
-        except asyncio.TimeoutError:
-            # Request timed out
-            if self.debug_mode:
-                logger.debug(f"Proxy {proxy_id} timeout after {self.validation_timeout_s}s")
-            return {"id": proxy_id, "success": False}
-        except Exception as e:
-            # Other errors
-            if self.debug_mode:
-                logger.debug(f"Proxy {proxy_id} failed: {type(e).__name__}")
-            return {"id": proxy_id, "success": False}
+        async with semaphore:
+            start_time = time.time()
+            try:
+                async with session.get(
+                    self.validation_target,
+                    proxy=proxy_url,
+                    timeout=aiohttp.ClientTimeout(total=self.validation_timeout_s),
+                ) as response:
+                    response.raise_for_status()
+                    latency_ms = int((time.time() - start_time) * 1000)
+                    data = await response.json()
+                    headers = data.get("headers", {})
+                    is_anonymous = not any(
+                        h in headers for h in ["X-Forwarded-For", "Via", "X-Real-Ip"]
+                    )
+                    anonymity = "elite" if is_anonymous else "transparent"
+                    return {
+                        "id": proxy_id,
+                        "success": True,
+                        "latency": latency_ms,
+                        "anonymity": anonymity,
+                    }
+            except aiohttp.ClientProxyConnectionError as e:
+                # Proxy connection refused/unreachable
+                if self.debug_mode:
+                    logger.debug(f"Proxy {proxy_id} connection error: {type(e).__name__}")
+                return {"id": proxy_id, "success": False}
+            except asyncio.TimeoutError:
+                # Request timed out
+                if self.debug_mode:
+                    logger.debug(f"Proxy {proxy_id} timeout after {self.validation_timeout_s}s")
+                return {"id": proxy_id, "success": False}
+            except Exception as e:
+                # Other errors
+                if self.debug_mode:
+                    logger.debug(f"Proxy {proxy_id} failed: {type(e).__name__}")
+                return {"id": proxy_id, "success": False}
 
     async def _validate_proxies_batch_async(self, proxies_to_validate: List[Dict]) -> Tuple[List[Dict], List[int]]:
         """
@@ -622,19 +624,24 @@ class ProxyManager:
         Returns (success_proxies, failure_proxy_ids).
         """
         # No session-level timeout - each request has its own timeout
-        # limit controls max concurrent connections
+        # limit controls max concurrent connections at session level,
+        # but we also need a semaphore to control task execution start time.
+        # We increase connector limit to avoid bottleneck there, relying on semaphore.
         connector = aiohttp.TCPConnector(
-            limit=self.validation_workers,
+            limit=0, # Unlimited at connector level, controlled by semaphore
             force_close=True,
             enable_cleanup_closed=True,
         )
         
+        semaphore = asyncio.Semaphore(self.validation_workers)
+
         async with aiohttp.ClientSession(connector=connector) as session:
             tasks = [
                 self._validate_proxy_async(
                     session,
                     p["id"],
                     f"{p['protocol']}://{p['ip']}:{p['port']}",
+                    semaphore
                 )
                 for p in proxies_to_validate
             ]
