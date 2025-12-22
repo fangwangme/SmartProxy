@@ -392,6 +392,14 @@ class ProxyManager:
             self.config.get("backup", "stats_backup_path", fallback="./data/proxy_stats_backup.json")
         )
 
+        # ELO scoring configuration
+        self.elo_max_window = self.config.getint(
+            "source_pool", "elo_max_window", fallback=100
+        )
+        self.elo_scoring_window = self.config.getint(
+            "source_pool", "elo_scoring_window", fallback=50
+        )
+
         logger.info("Configuration loaded.")
 
     def _initialize_source_pools(self):
@@ -899,11 +907,21 @@ class ProxyManager:
             logger.info("Background scheduler stopped.")
 
     def _get_new_proxy_stat(self) -> Dict:
+        """
+        Create a new proxy stat entry with ELO-inspired scoring fields.
+        
+        Score range: 0-100 (starts at 50 as neutral)
+        - recent_results: sliding window of (timestamp, success, latency_ms)
+        - avg_latency_ms: exponential moving average of latency
+        """
         return {
-            "score": 0,
-            "success_count": 0,
-            "failure_count": 0,
-            "consecutive_failures": 0,
+            "score": 50.0,              # ELO-like score, bounded 0-100
+            "success_count": 0,         # Total historical success
+            "failure_count": 0,         # Total historical failure
+            "consecutive_failures": 0,  # For penalty escalation
+            # NEW: Sliding window for recent performance (last 100 results max)
+            "recent_results": [],       # List of [timestamp, success: bool, latency_ms: int|None]
+            "avg_latency_ms": None,     # Exponential moving average of latency
         }
 
     def backup_stats(self) -> Dict:
@@ -962,12 +980,23 @@ class ProxyManager:
 
                 for source, proxies in snapshot.get("source_stats", {}).items():
                     if source in self.predefined_sources:
-                        self.source_stats[source] = proxies
+                        # Migrate legacy stats to new ELO format
+                        migrated_proxies = {}
+                        legacy_count = 0
+                        for proxy_url, stat in proxies.items():
+                            if "recent_results" not in stat:
+                                legacy_count += 1
+                            migrated_proxies[proxy_url] = self._migrate_legacy_stat(stat)
+                        
+                        self.source_stats[source] = migrated_proxies
                         restored_sources += 1
-                        proxy_count = len(proxies)
+                        proxy_count = len(migrated_proxies)
                         restored_proxies += proxy_count
-                        # Log each source being restored
-                        logger.info(f"  [RESTORED] Source '{source}': {proxy_count} proxies loaded")
+                        
+                        if legacy_count > 0:
+                            logger.info(f"  [RESTORED] Source '{source}': {proxy_count} proxies ({legacy_count} migrated to ELO format)")
+                        else:
+                            logger.info(f"  [RESTORED] Source '{source}': {proxy_count} proxies loaded")
                     else:
                         skipped_sources.append(source)
                         logger.debug(f"  [SKIPPED] Source '{source}': not in predefined_sources")
@@ -1070,7 +1099,12 @@ class ProxyManager:
         """
         Sync premium proxies from source_stats.
         Aggregates proxies across all sources and selects the top N by score.
-        Only considers proxies with usage count > 50 to avoid new proxies with inflated scores.
+        
+        Strategy:
+        1. Prefer proxies with sufficient usage history (>= min_usage_count) to avoid
+           new proxies with inflated initial scores (0 score can rank higher than negative).
+        2. Fallback: If no proxies meet the usage threshold, select from all active proxies
+           by score to ensure we never return an empty premium pool.
         """
         premium_pool_size = self.config.getint(
             "source_pool", "premium_pool_size", fallback=20
@@ -1081,45 +1115,69 @@ class ProxyManager:
 
         with self.lock:
             # Aggregate all proxies with their highest score across all sources
-            # Only consider proxies with sufficient usage history
-            proxy_best_scores: Dict[str, float] = {}
+            # Separate into two pools: battle-tested (sufficient usage) and all proxies
+            battle_tested_scores: Dict[str, float] = {}
+            all_proxy_scores: Dict[str, float] = {}
+            
             for source, stats in self.source_stats.items():
                 for proxy_url, stat in stats.items():
-                    # Calculate total usage count
                     usage_count = stat.get("success_count", 0) + stat.get("failure_count", 0)
-                    
-                    # Skip proxies with insufficient usage history
-                    if usage_count < min_usage_count:
-                        continue
-                    
                     score = stat.get("score", 0)
-                    # Keep the highest score for each proxy across all sources
-                    if proxy_url not in proxy_best_scores or score > proxy_best_scores[proxy_url]:
-                        proxy_best_scores[proxy_url] = score
+                    
+                    # Track all proxy scores
+                    if proxy_url not in all_proxy_scores or score > all_proxy_scores[proxy_url]:
+                        all_proxy_scores[proxy_url] = score
+                    
+                    # Also track battle-tested proxies separately
+                    if usage_count >= min_usage_count:
+                        if proxy_url not in battle_tested_scores or score > battle_tested_scores[proxy_url]:
+                            battle_tested_scores[proxy_url] = score
 
-            # Filter to only active proxies and sort by score descending
-            active_proxy_scores = {
-                url: score for url, score in proxy_best_scores.items()
+            # Filter to only active proxies
+            active_battle_tested = {
+                url: score for url, score in battle_tested_scores.items()
+                if url in self.active_proxies
+            }
+            active_all_proxies = {
+                url: score for url, score in all_proxy_scores.items()
                 if url in self.active_proxies
             }
 
-            sorted_proxies = sorted(
-                active_proxy_scores.items(),
-                key=lambda x: x[1],
-                reverse=True
-            )
-
-            # Take the top N
-            self.premium_proxies = [url for url, _ in sorted_proxies[:premium_pool_size]]
+            # Strategy: prefer battle-tested, fallback to all active proxies
+            if active_battle_tested:
+                # Have enough battle-tested proxies, use them
+                sorted_proxies = sorted(
+                    active_battle_tested.items(),
+                    key=lambda x: x[1],
+                    reverse=True
+                )
+                self.premium_proxies = [url for url, _ in sorted_proxies[:premium_pool_size]]
+                source_type = "battle-tested"
+                score_dict = battle_tested_scores
+            elif active_all_proxies:
+                # Fallback: no battle-tested proxies, use all active proxies
+                sorted_proxies = sorted(
+                    active_all_proxies.items(),
+                    key=lambda x: x[1],
+                    reverse=True
+                )
+                self.premium_proxies = [url for url, _ in sorted_proxies[:premium_pool_size]]
+                source_type = "fallback (all active)"
+                score_dict = all_proxy_scores
+            else:
+                # No proxies at all
+                self.premium_proxies = []
+                source_type = None
+                score_dict = {}
 
         if self.premium_proxies:
-            top_scores = [proxy_best_scores.get(url, 0) for url in self.premium_proxies[:5]]
+            top_scores = [score_dict.get(url, 0) for url in self.premium_proxies[:5]]
             logger.info(
-                f"Premium proxy pool synced: {len(self.premium_proxies)} proxies loaded "
+                f"Premium proxy pool synced ({source_type}): {len(self.premium_proxies)} proxies loaded "
                 f"(top 5 scores: {top_scores})"
             )
         else:
-            logger.warning("No premium proxies found in source_stats.")
+            logger.warning("No premium proxies found: no active proxies available.")
 
     def _flush_feedback_buffer(self):
         """Flushes stats for all fully completed minutes to the database."""
@@ -1158,6 +1216,89 @@ class ProxyManager:
                 "Flush stats task ran, but no completed minutes were found in the buffer."
             )
 
+    def _migrate_legacy_stat(self, stat: Dict) -> Dict:
+        """
+        Migrate legacy stat format to new ELO-based format.
+        Called when restoring stats from backup or encountering old format.
+        """
+        if "recent_results" not in stat:
+            # Legacy format detected, migrate
+            stat["recent_results"] = []
+            stat["avg_latency_ms"] = None
+            
+            # Estimate initial score from historical data
+            total = stat.get("success_count", 0) + stat.get("failure_count", 0)
+            if total > 0:
+                success_rate = stat.get("success_count", 0) / total
+                # Map success rate to 0-100 score
+                stat["score"] = min(100, max(0, success_rate * 100))
+            else:
+                stat["score"] = 50.0  # Neutral for no history
+        return stat
+
+    def _calculate_elo_score(self, stat: Dict, source: str = None) -> float:
+        """
+        Calculate ELO-inspired score based on:
+        1. Recent success rate (sliding window)
+        2. Average latency (lower is better)
+        3. Consistency bonus (stable recent performance)
+        
+        Score range: 0-100
+        
+        Components:
+        - Success rate:   0-60 points (primary factor)
+        - Latency:        0-30 points (secondary factor)
+        - Consistency:    0-10 points (bonus for stability)
+        """
+        # Use configurable window size
+        window_size = self.elo_scoring_window
+        
+        recent = stat.get("recent_results", [])[-window_size:]
+        
+        if not recent:
+            # No recent data, use historical if available
+            total = stat.get("success_count", 0) + stat.get("failure_count", 0)
+            if total > 0:
+                success_rate = stat.get("success_count", 0) / total
+                return min(100, max(0, success_rate * 80 + 10))  # Range 10-90 for historical
+            return 50.0  # Neutral for completely new proxies
+        
+        # 1. Success rate component (0-60 points)
+        successes = sum(1 for r in recent if r[1])
+        success_rate = successes / len(recent)
+        success_score = success_rate * 60
+        
+        # 2. Latency component (0-30 points)
+        # Lower latency = higher score
+        latencies = [r[2] for r in recent if r[1] and r[2] is not None]
+        if latencies:
+            avg_latency = sum(latencies) / len(latencies)
+            # 0-300ms = 30pts, 300-2000ms linear decay to 0, >2000ms = 0
+            if avg_latency <= 300:
+                latency_score = 30
+            elif avg_latency <= 2000:
+                latency_score = max(0, 30 - (avg_latency - 300) / 56.67)
+            else:
+                latency_score = 0
+        else:
+            latency_score = 15  # Neutral if no latency data
+        
+        # 3. Consistency bonus (0-10 points)
+        # Reward proxies with stable recent performance
+        if len(recent) >= 10:
+            recent_10 = recent[-10:]
+            recent_successes = sum(1 for r in recent_10 if r[1])
+            if recent_successes >= 9:
+                consistency_score = 10  # Excellent consistency
+            elif recent_successes >= 7:
+                consistency_score = 7   # Good consistency
+            else:
+                consistency_score = recent_successes * 0.7  # Proportional
+        else:
+            consistency_score = 5  # Neutral for new proxies
+        
+        return min(100, max(0, success_score + latency_score + consistency_score))
+
     def process_feedback(
         self,
         source: str,
@@ -1165,12 +1306,23 @@ class ProxyManager:
         status_code: int,
         response_time_ms: Optional[int] = None,
     ):
+        """
+        Process feedback for a proxy request with ELO-based scoring.
+        
+        Updates:
+        - Adds result to sliding window (recent_results)
+        - Updates exponential moving average of latency
+        - Recalculates ELO score
+        - Maintains historical counters for analytics
+        """
         source = self._get_source_or_default(source)
         is_success = status_code not in FAILED_STATUS_CODES
 
         current_minute = datetime.now().replace(second=0, microsecond=0)
+        current_timestamp = time.time()
 
         with self.lock:
+            # Update feedback buffer for database flush
             if is_success:
                 self.feedback_buffer[current_minute][source]["success"] += 1
             else:
@@ -1179,31 +1331,43 @@ class ProxyManager:
             stat = self.source_stats.get(source, {}).get(proxy_url)
             if not stat:
                 return
+            
+            # Migrate legacy stats if needed
+            stat = self._migrate_legacy_stat(stat)
+            
+            # Update historical counters
             if is_success:
                 stat["success_count"] += 1
-                base_score_gain = 1
-                latency_bonus = max(
-                    0, round((2000 - (response_time_ms or 2000)) / 400.0, 2)
-                )
-                total_gain = base_score_gain + latency_bonus
-                stat["score"] = (
-                    total_gain
-                    if stat["consecutive_failures"] > 0
-                    else stat["score"] + total_gain
-                )
                 stat["consecutive_failures"] = 0
+                
+                # Update exponential moving average of latency
+                if response_time_ms is not None:
+                    alpha = 0.3  # Smoothing factor
+                    if stat["avg_latency_ms"] is None:
+                        stat["avg_latency_ms"] = response_time_ms
+                    else:
+                        stat["avg_latency_ms"] = (
+                            alpha * response_time_ms + 
+                            (1 - alpha) * stat["avg_latency_ms"]
+                        )
             else:
                 stat["failure_count"] += 1
                 stat["consecutive_failures"] += 1
-                penalty_index = min(
-                    stat["consecutive_failures"] - 1, len(self.failure_penalties) - 1
-                )
-                penalty = self.failure_penalties[penalty_index]
-                stat["score"] += penalty
-
-            response_time_str = f"{response_time_ms:.3f}" if response_time_ms is not None else "N/A"
+            
+            # Add to sliding window (keep last elo_max_window results)
+            stat["recent_results"].append([current_timestamp, is_success, response_time_ms])
+            if len(stat["recent_results"]) > self.elo_max_window:
+                stat["recent_results"] = stat["recent_results"][-self.elo_max_window:]
+            
+            # Recalculate ELO score
+            old_score = stat["score"]
+            stat["score"] = self._calculate_elo_score(stat, source)
+            
+            response_time_str = f"{response_time_ms:.0f}" if response_time_ms is not None else "N/A"
             logger.debug(
-                f"Computed Score for {source:<15} | {proxy_url:<30} | {status_code:<4} | {response_time_str:<12}ms -> {stat['score']:<10.4f}"
+                f"ELO Score: {source:<15} | {proxy_url:<30} | "
+                f"{'OK' if is_success else 'FAIL':<4} | {response_time_str:<6}ms | "
+                f"{old_score:.1f} -> {stat['score']:.1f}"
             )
 
 

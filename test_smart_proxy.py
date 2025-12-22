@@ -133,19 +133,24 @@ class TestProxyManager(unittest.TestCase):
         self.manager.predefined_sources.add("source1")
         self.manager.source_stats["source1"] = {
             proxy_url: {
-                "score": 10.0,
+                "score": 50.0,
                 "success_count": 5,
                 "failure_count": 1,
                 "consecutive_failures": 0,
+                "recent_results": [],
+                "avg_latency_ms": None,
             }
         }
         
         self.manager.process_feedback("source1", proxy_url, 200, response_time_ms=500)
         
         stat = self.manager.source_stats["source1"][proxy_url]
-        self.assertGreater(stat["score"], 10.0)
+        # Score should be recalculated based on new sliding window
+        self.assertGreaterEqual(stat["score"], 0)
+        self.assertLessEqual(stat["score"], 100)
         self.assertEqual(stat["success_count"], 6)
         self.assertEqual(stat["consecutive_failures"], 0)
+        self.assertEqual(len(stat["recent_results"]), 1)
 
     def test_process_feedback_updates_score_on_failure(self):
         """Test that process_feedback correctly updates proxy score on failure."""
@@ -153,10 +158,12 @@ class TestProxyManager(unittest.TestCase):
         self.manager.predefined_sources.add("source1")
         self.manager.source_stats["source1"] = {
             proxy_url: {
-                "score": 10.0,
+                "score": 50.0,
                 "success_count": 5,
                 "failure_count": 1,
                 "consecutive_failures": 0,
+                "recent_results": [],
+                "avg_latency_ms": None,
             }
         }
         
@@ -164,9 +171,12 @@ class TestProxyManager(unittest.TestCase):
         self.manager.process_feedback("source1", proxy_url, 0)
         
         stat = self.manager.source_stats["source1"][proxy_url]
-        self.assertLess(stat["score"], 10.0)
+        # Score recalculated based on sliding window (now has 1 failure)
+        self.assertGreaterEqual(stat["score"], 0)
+        self.assertLessEqual(stat["score"], 100)
         self.assertEqual(stat["failure_count"], 2)
         self.assertEqual(stat["consecutive_failures"], 1)
+        self.assertEqual(len(stat["recent_results"]), 1)
 
     def test_process_feedback_handles_unknown_proxy(self):
         """Test that process_feedback handles unknown proxy gracefully."""
@@ -186,7 +196,8 @@ class TestProxyManager(unittest.TestCase):
         
         self.assertIs(lock1, lock1_again)
         self.assertIsNot(lock1, lock2)
-        self.assertIsInstance(lock1, threading.Lock)
+        # threading.Lock is a factory function, use type() to get actual type
+        self.assertIsInstance(lock1, type(threading.Lock()))
 
     def test_rlock_is_reentrant(self):
         """Test that main lock is RLock and reentrant."""
@@ -259,13 +270,15 @@ class TestProxyManager(unittest.TestCase):
     # ========== Stats Proxy Helper Tests ==========
     
     def test_get_new_proxy_stat_returns_correct_structure(self):
-        """Test _get_new_proxy_stat returns correct initial structure."""
+        """Test _get_new_proxy_stat returns correct initial ELO structure."""
         stat = self.manager._get_new_proxy_stat()
         
-        self.assertEqual(stat["score"], 0)
+        self.assertEqual(stat["score"], 50.0)  # ELO neutral starting score
         self.assertEqual(stat["success_count"], 0)
         self.assertEqual(stat["failure_count"], 0)
         self.assertEqual(stat["consecutive_failures"], 0)
+        self.assertEqual(stat["recent_results"], [])  # NEW: sliding window
+        self.assertIsNone(stat["avg_latency_ms"])     # NEW: latency tracking
 
     # ========== FAILED_STATUS_CODES Tests ==========
     
@@ -273,6 +286,144 @@ class TestProxyManager(unittest.TestCase):
         """Test FAILED_STATUS_CODES contains timeout and proxy error codes."""
         self.assertIn(0, FAILED_STATUS_CODES)  # Timeout
         self.assertIn(4, FAILED_STATUS_CODES)  # Proxy error
+
+    # ========== ELO Scoring Algorithm Tests ==========
+
+    def test_elo_score_new_proxy_baseline(self):
+        """Test ELO score for a completely new proxy with no history."""
+        stat = self.manager._get_new_proxy_stat()
+        score = self.manager._calculate_elo_score(stat)
+        # New proxy should get neutral score of 50
+        self.assertEqual(score, 50.0)
+
+    def test_elo_score_perfect_proxy(self):
+        """Test ELO score for a proxy with 100% success rate and low latency."""
+        import time
+        stat = self.manager._get_new_proxy_stat()
+        # Simulate 50 perfect requests with low latency (200ms)
+        for i in range(50):
+            stat["recent_results"].append([time.time() - i, True, 200])
+        
+        score = self.manager._calculate_elo_score(stat)
+        # Should get max or near-max score: 60 (success) + 30 (latency) + 10 (consistency)
+        self.assertGreaterEqual(score, 95)
+        self.assertLessEqual(score, 100)
+
+    def test_elo_score_failing_proxy(self):
+        """Test ELO score for a proxy with 0% success rate."""
+        import time
+        stat = self.manager._get_new_proxy_stat()
+        # Simulate 50 failed requests
+        for i in range(50):
+            stat["recent_results"].append([time.time() - i, False, None])
+        
+        score = self.manager._calculate_elo_score(stat)
+        # Should get low score: 0 (success) + 15 (neutral latency) + 0 (consistency)
+        self.assertLessEqual(score, 20)
+
+    def test_elo_score_80_percent_success_rate(self):
+        """Test ELO score for a proxy with 80% success rate."""
+        import time
+        stat = self.manager._get_new_proxy_stat()
+        # Simulate 40 successes and 10 failures
+        for i in range(40):
+            stat["recent_results"].append([time.time() - i, True, 500])
+        for i in range(10):
+            stat["recent_results"].append([time.time() - 40 - i, False, None])
+        
+        score = self.manager._calculate_elo_score(stat)
+        # 80% success = 48pts, latency ~26pts, consistency varies
+        self.assertGreaterEqual(score, 60)
+        self.assertLessEqual(score, 85)
+
+    def test_elo_score_latency_impact(self):
+        """Test that lower latency results in higher score."""
+        import time
+        
+        # Low latency proxy (200ms)
+        stat_low = self.manager._get_new_proxy_stat()
+        for i in range(50):
+            stat_low["recent_results"].append([time.time() - i, True, 200])
+        
+        # High latency proxy (1500ms)
+        stat_high = self.manager._get_new_proxy_stat()
+        for i in range(50):
+            stat_high["recent_results"].append([time.time() - i, True, 1500])
+        
+        score_low = self.manager._calculate_elo_score(stat_low)
+        score_high = self.manager._calculate_elo_score(stat_high)
+        
+        # Low latency should score higher
+        self.assertGreater(score_low, score_high)
+        # Difference should be meaningful (about 10-20 points)
+        self.assertGreater(score_low - score_high, 8)
+
+    def test_elo_score_legacy_migration(self):
+        """Test that legacy stats are properly migrated and scored."""
+        # Legacy stat format (no recent_results)
+        legacy_stat = {
+            "score": 150.0,  # Old unbounded score
+            "success_count": 80,
+            "failure_count": 20,
+            "consecutive_failures": 0,
+        }
+        
+        migrated = self.manager._migrate_legacy_stat(legacy_stat)
+        
+        # Should have new fields
+        self.assertIn("recent_results", migrated)
+        self.assertIn("avg_latency_ms", migrated)
+        self.assertEqual(migrated["recent_results"], [])
+        
+        # Score should be recalculated based on historical success rate (80%)
+        self.assertGreaterEqual(migrated["score"], 70)
+        self.assertLessEqual(migrated["score"], 90)
+
+    def test_elo_score_consistency_bonus(self):
+        """Test that consistent recent performance gives bonus points."""
+        import time
+        
+        # Consistent proxy: 10/10 recent successes
+        stat_consistent = self.manager._get_new_proxy_stat()
+        for i in range(50):
+            stat_consistent["recent_results"].append([time.time() - i, True, 400])
+        
+        # Inconsistent proxy: 5/10 recent successes (50%)
+        stat_inconsistent = self.manager._get_new_proxy_stat()
+        for i in range(25):
+            stat_inconsistent["recent_results"].append([time.time() - i, True, 400])
+        for i in range(25):
+            stat_inconsistent["recent_results"].append([time.time() - 25 - i, False, None])
+        
+        score_consistent = self.manager._calculate_elo_score(stat_consistent)
+        score_inconsistent = self.manager._calculate_elo_score(stat_inconsistent)
+        
+        # Consistent should score significantly higher
+        self.assertGreater(score_consistent, score_inconsistent)
+        self.assertGreater(score_consistent - score_inconsistent, 30)
+
+    def test_elo_score_bounded_0_to_100(self):
+        """Test that ELO scores are always bounded between 0 and 100."""
+        import time
+        
+        # Test extreme cases
+        test_cases = [
+            # Perfect case
+            [(True, 100)] * 100,
+            # Worst case
+            [(False, None)] * 100,
+            # Mixed case
+            [(True, 500)] * 50 + [(False, None)] * 50,
+        ]
+        
+        for results in test_cases:
+            stat = self.manager._get_new_proxy_stat()
+            for success, latency in results:
+                stat["recent_results"].append([time.time(), success, latency])
+            
+            score = self.manager._calculate_elo_score(stat)
+            self.assertGreaterEqual(score, 0, "Score below 0")
+            self.assertLessEqual(score, 100, "Score above 100")
 
 
 class TestDatabaseManager(unittest.TestCase):
