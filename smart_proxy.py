@@ -12,7 +12,7 @@ import argparse
 import asyncio
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -1620,9 +1620,9 @@ def get_daily_stats_route():
 @app.route("/api/stats/timeseries", methods=["GET"])
 def get_timeseries_stats_route():
     source = request.args.get("source")
-    date = request.args.get("date")
+    date_str = request.args.get("date")
     interval = request.args.get("interval", "10", type=int)
-    if not all([source, date]):
+    if not all([source, date_str]):
         return (
             jsonify({"error": "'source' and 'date' query parameters are required."}),
             400,
@@ -1630,19 +1630,52 @@ def get_timeseries_stats_route():
     valid_intervals = [2, 5, 10, 30, 60]
     if interval not in valid_intervals:
         return jsonify({"error": f"'interval' must be one of {valid_intervals}."}), 400
-    stats = proxy_manager.db.get_timeseries_stats(source, date, interval)
+    
+    # Get raw stats from DB (sparse data)
+    stats = proxy_manager.db.get_timeseries_stats(source, date_str, interval)
+    
+    # Convert stats to dictionary for O(1) lookup
+    # Key: HH:MM string, Value: row data
+    stats_map = {}
+    if stats:
+        for row in stats:
+            time_key = row["interval_start"].strftime("%H:%M")
+            stats_map[time_key] = row
+
+    # Generate full list of time slots for the day
     results = []
-    for row in stats:
-        total = row["success"] + row["failure"]
-        success_rate = (row["success"] / total * 100) if total > 0 else 0
-        results.append(
-            {
-                "time": row["interval_start"].strftime("%H:%M"),
+    try:
+        start_date = datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        return jsonify({"error": "Invalid date format. Use YYYY-MM-DD."}), 400
+
+    current_time = start_date
+    end_time = start_date + timedelta(days=1)
+    
+    while current_time < end_time:
+        time_str = current_time.strftime("%H:%M")
+        
+        if time_str in stats_map:
+            row = stats_map[time_str]
+            total = row["success"] + row["failure"]
+            success_rate = (row["success"] / total * 100) if total > 0 else 0
+            results.append({
+                "time": time_str,
                 "success_rate": round(success_rate, 2),
                 "total_requests": total,
                 "success_count": row["success"],
-            }
-        )
+            })
+        else:
+            # Fill missing data with 0
+            results.append({
+                "time": time_str,
+                "success_rate": 0,
+                "total_requests": 0,
+                "success_count": 0,
+            })
+        
+        current_time += timedelta(minutes=interval)
+
     return jsonify(results)
 
 
