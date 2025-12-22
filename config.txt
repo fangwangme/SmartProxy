@@ -62,6 +62,12 @@ premium_pool_size = 20
 # 最小使用次数要求
 premium_min_usage_count = 50
 
+# ELO 滑动窗口配置  
+# 每个代理保留的最大结果数
+elo_max_window = 100
+# 用于计算分数的结果数         
+elo_scoring_window = 50       
+
 
 [backup]
 stats_backup_enabled = true
