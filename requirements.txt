@@ -1,5 +1,7 @@
-requests
-flask
-flask-cors
-psycopg2-binary
-aiohttp
+requests==2.32.5
+flask==3.1.2
+flask-cors==6.0.2
+psycopg2-binary==2.9.11
+aiohttp==3.13.3
+loguru==0.7.3
+pytest
