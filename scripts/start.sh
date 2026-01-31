@@ -42,6 +42,15 @@ start_server() {
     # 进入项目目录
     cd "$PROJECT_DIR"
 
+    # 检查是否激活了虚拟环境
+    if [ -z "$VIRTUAL_ENV" ]; then
+        echo "=================================================="
+        echo " ERROR: Virtual environment not activated!"
+        echo " Please run: source .venv/bin/activate"
+        echo "=================================================="
+        return 1
+    fi
+
     echo "=================================================="
     echo " Starting SmartProxy Server..."
     echo " Project Path: $PROJECT_DIR"
