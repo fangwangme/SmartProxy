@@ -5,7 +5,8 @@ import configparser
 import threading
 from unittest.mock import MagicMock, patch, AsyncMock
 
-from smart_proxy import ProxyManager, DatabaseManager, FAILED_STATUS_CODES
+from src.core.proxy_manager import ProxyManager, FAILED_STATUS_CODES
+from src.database.db import DatabaseManager
 
 
 class TestProxyManager(unittest.TestCase):
@@ -64,7 +65,8 @@ class TestProxyManager(unittest.TestCase):
         self.addCleanup(patcher_config.stop)
         patcher_config.start()
 
-        patcher_db = patch("smart_proxy.DatabaseManager", spec=DatabaseManager)
+        # PATCH THE IMPORT IN PROXY_MANAGER, NOT THE DEFINITION
+        patcher_db = patch("src.core.proxy_manager.DatabaseManager", spec=DatabaseManager)
         self.addCleanup(patcher_db.stop)
         self.MockDatabaseManager = patcher_db.start()
 
@@ -429,7 +431,7 @@ class TestProxyManager(unittest.TestCase):
 class TestDatabaseManager(unittest.TestCase):
     """Test DatabaseManager methods with mocked psycopg2."""
 
-    @patch("smart_proxy.psycopg2.pool.ThreadedConnectionPool")
+    @patch("src.database.db.psycopg2.pool.ThreadedConnectionPool")
     def test_database_manager_uses_threaded_pool(self, mock_pool_class):
         """Test that DatabaseManager uses ThreadedConnectionPool."""
         mock_config = configparser.ConfigParser()

@@ -137,6 +137,25 @@ proxy_stats.json
 .DS_Store
 
 
+# Local config (keep config/*.ini tracked)
 *.ini
 
+!config/config.example.ini
+
+# Process ID
 .smart_proxy.pid
+
+# Project Structure
+.shared
+.worktrees
+.venv
+node_modules
+
+# Build outputs
+src/**/__pycache__/
+*.pyc
+
+# Local data
+data/
+proxiex.txt
+proxy_stats.json

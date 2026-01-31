@@ -3,8 +3,8 @@
 # SmartProxy 服务管理脚本
 # 用法: ./start.sh {start|stop|restart|status|logs|backup} [--debug]
 
-# 获取脚本所在的绝对路径
-PROJECT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+# 获取项目根目录（脚本所在目录的父目录）
+PROJECT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." && pwd )"
 LOG_DIR="/usr/local/var/log"
 LOG_FILE="$LOG_DIR/proxy_$(date +%Y-%m-%d).log"
 PID_FILE="$PROJECT_DIR/.smart_proxy.pid"
@@ -51,7 +51,7 @@ start_server() {
     echo "=================================================="
 
     # 使用 nohup 后台运行服务器
-    nohup python -u smart_proxy.py $DEBUG_FLAG >> "$LOG_FILE" 2>&1 &
+    nohup python -u -m src.main $DEBUG_FLAG >> "$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
 
     sleep 1
