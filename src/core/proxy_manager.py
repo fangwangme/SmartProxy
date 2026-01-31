@@ -175,6 +175,7 @@ class ProxyManager:
                 }
                 if job["url"]:
                     jobs.append(job)
+        logger.info(f"Loaded {len(jobs)} proxy source fetcher jobs from config.")
         return jobs
 
     def reload_sources(self) -> Dict:
@@ -566,10 +567,18 @@ class ProxyManager:
                 )
 
     def _update_dashboard_sources(self):
-        logger.info("Refreshing dashboard sources from database...")
-        db_sources = self.db.get_distinct_sources()
+        logger.info("Refreshing dashboard sources from config and database...")
+        # 1. Start with sources defined in config
         with self.lock:
-            self.dashboard_sources = set(db_sources)
+            all_sources = {job["name"] for job in self.fetcher_jobs}
+            all_sources.update(self.predefined_sources)
+        
+        # 2. Add sources that exist in database (historical data)
+        db_sources = self.db.get_distinct_sources()
+        all_sources.update(db_sources)
+
+        with self.lock:
+            self.dashboard_sources = all_sources
         logger.info(
             f"Dashboard sources updated: {len(self.dashboard_sources)} sources found."
         )
