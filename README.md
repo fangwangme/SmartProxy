@@ -49,3 +49,37 @@ This project primarily resides in the `main` branch. Dependencies are centralize
     ```bash
     bun run dev
     ```
+
+## Service Management
+
+You can use the provided shell script to manage the backend service (start, stop, restart, etc.).
+
+1.  **Make executable** (first time only):
+    ```bash
+    chmod +x scripts/start.sh
+    ```
+
+2.  **Usage**:
+
+    ```bash
+    # Start service (background)
+    ./scripts/start.sh start
+
+    # Start with debug mode
+    ./scripts/start.sh start --debug
+
+    # Check status
+    ./scripts/start.sh status
+
+    # View logs
+    ./scripts/start.sh logs
+
+    # Restart service
+    ./scripts/start.sh restart
+
+    # Stop service
+    ./scripts/start.sh stop
+    
+    # Manual backup of stats
+    ./scripts/start.sh backup
+    ```
