@@ -275,11 +275,12 @@ class ProxyManager:
         proxies_to_insert = []
         try:
             # Use curl instead of requests to bypass Python's direct rule in Clash Verge
+            # Increased timeout to 30s connection / 60s max time
             result = subprocess.run(
-                ["curl", "-s", "-f", "--connect-timeout", "15", "--max-time", "30", url],
+                ["curl", "-s", "-f", "--connect-timeout", "30", "--max-time", "60", url],
                 capture_output=True,
                 text=True,
-                timeout=35
+                timeout=65
             )
             if result.returncode != 0:
                 raise Exception(f"curl failed with return code {result.returncode}: {result.stderr}")
