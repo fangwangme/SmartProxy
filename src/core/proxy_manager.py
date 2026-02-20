@@ -2,6 +2,7 @@
 import os
 import configparser
 import json
+import math
 import random
 import threading
 import time
@@ -143,6 +144,21 @@ class ProxyManager:
         )
         self.elo_scoring_window = self.config.getint(
             "source_pool", "elo_scoring_window", fallback=50
+        )
+        self.elo_time_decay_enabled = self.config.getboolean(
+            "source_pool", "elo_time_decay_enabled", fallback=True
+        )
+        self.elo_decay_half_life_hours = max(
+            0.1,
+            self.config.getfloat(
+                "source_pool", "elo_decay_half_life_hours", fallback=24.0
+            ),
+        )
+        self.elo_max_result_age_hours = max(
+            0.1,
+            self.config.getfloat(
+                "source_pool", "elo_max_result_age_hours", fallback=168.0
+            ),
         )
 
         logger.info("Configuration loaded.")
@@ -569,14 +585,19 @@ class ProxyManager:
 
     def _update_dashboard_sources(self):
         logger.info("Refreshing dashboard sources from config and database...")
-        # 1. Start with sources defined in config
-        with self.lock:
-            all_sources = {job["name"] for job in self.fetcher_jobs}
-            all_sources.update(self.predefined_sources)
-        
-        # 2. Add sources that exist in database (historical data)
+        # Use only unique sources from stats data (source_stats_by_minute).
+        # This keeps dashboard source options aligned with real observable traffic.
         db_sources = self.db.get_distinct_sources()
-        all_sources.update(db_sources)
+        with self.lock:
+            fetcher_job_names = {job["name"] for job in self.fetcher_jobs}
+
+        all_sources = {
+            source
+            for source in db_sources
+            if source
+            and source not in fetcher_job_names
+            and not source.startswith("proxy_source_")
+        }
 
         with self.lock:
             self.dashboard_sources = all_sources
@@ -677,6 +698,7 @@ class ProxyManager:
             # NEW: Sliding window for recent performance (last 100 results max)
             "recent_results": [],       # List of [timestamp, success: bool, latency_ms: int|None]
             "avg_latency_ms": None,     # Exponential moving average of latency
+            "last_feedback_ts": None,   # Unix timestamp of latest feedback
         }
 
     def backup_stats(self) -> Dict:
@@ -989,6 +1011,16 @@ class ProxyManager:
                 stat["score"] = min(100, max(0, success_rate * 100))
             else:
                 stat["score"] = 50.0  # Neutral for no history
+
+        if "last_feedback_ts" not in stat:
+            recent_results = stat.get("recent_results", [])
+            valid_timestamps = [
+                r[0]
+                for r in recent_results
+                if isinstance(r, list) and len(r) >= 1 and isinstance(r[0], (int, float))
+            ]
+            stat["last_feedback_ts"] = max(valid_timestamps) if valid_timestamps else None
+
         return stat
 
     def _calculate_elo_score(self, stat: Dict, source: str = None) -> float:
@@ -1007,27 +1039,72 @@ class ProxyManager:
         """
         # Use configurable window size
         window_size = self.elo_scoring_window
-        
+
         recent = stat.get("recent_results", [])[-window_size:]
-        
+        now_ts = time.time()
+
+        if self.elo_time_decay_enabled and recent:
+            max_age_seconds = self.elo_max_result_age_hours * 3600
+            recent = [
+                r
+                for r in recent
+                if isinstance(r, list)
+                and len(r) >= 3
+                and isinstance(r[0], (int, float))
+                and now_ts - r[0] <= max_age_seconds
+            ]
+
         if not recent:
             # No recent data, use historical if available
             total = stat.get("success_count", 0) + stat.get("failure_count", 0)
             if total > 0:
                 success_rate = stat.get("success_count", 0) / total
-                return min(100, max(0, success_rate * 80 + 10))  # Range 10-90 for historical
+                historical_score = min(100, max(0, success_rate * 80 + 10))
+
+                if self.elo_time_decay_enabled:
+                    last_feedback_ts = stat.get("last_feedback_ts")
+                    if isinstance(last_feedback_ts, (int, float)):
+                        age_seconds = max(0.0, now_ts - last_feedback_ts)
+                        half_life_seconds = self.elo_decay_half_life_hours * 3600
+                        decay_factor = math.pow(0.5, age_seconds / half_life_seconds)
+                        # Pull old historical scores back to neutral over time.
+                        return 50 + (historical_score - 50) * decay_factor
+                    # Timestamp unknown: treat historical counters as stale.
+                    return 50.0
+
+                return historical_score  # Range 10-90 for historical
             return 50.0  # Neutral for completely new proxies
-        
+
+        if self.elo_time_decay_enabled:
+            half_life_seconds = self.elo_decay_half_life_hours * 3600
+            weights = [
+                math.pow(0.5, max(0.0, now_ts - r[0]) / half_life_seconds)
+                if isinstance(r[0], (int, float))
+                else 1.0
+                for r in recent
+            ]
+        else:
+            weights = [1.0] * len(recent)
+
         # 1. Success rate component (0-60 points)
-        successes = sum(1 for r in recent if r[1])
-        success_rate = successes / len(recent)
+        total_weight = sum(weights) or 1.0
+        successes_weight = sum(
+            w for r, w in zip(recent, weights) if len(r) >= 2 and bool(r[1])
+        )
+        success_rate = successes_weight / total_weight
         success_score = success_rate * 60
-        
+
         # 2. Latency component (0-30 points)
         # Lower latency = higher score
-        latencies = [r[2] for r in recent if r[1] and r[2] is not None]
-        if latencies:
-            avg_latency = sum(latencies) / len(latencies)
+        latency_pairs = [
+            (r[2], w)
+            for r, w in zip(recent, weights)
+            if len(r) >= 3 and r[1] and r[2] is not None
+        ]
+        if latency_pairs:
+            weighted_latency_sum = sum(latency * weight for latency, weight in latency_pairs)
+            latency_weight_sum = sum(weight for _, weight in latency_pairs) or 1.0
+            avg_latency = weighted_latency_sum / latency_weight_sum
             # 0-300ms = 30pts, 300-2000ms linear decay to 0, >2000ms = 0
             if avg_latency <= 300:
                 latency_score = 30
@@ -1037,21 +1114,26 @@ class ProxyManager:
                 latency_score = 0
         else:
             latency_score = 15  # Neutral if no latency data
-        
+
         # 3. Consistency bonus (0-10 points)
         # Reward proxies with stable recent performance
         if len(recent) >= 10:
             recent_10 = recent[-10:]
-            recent_successes = sum(1 for r in recent_10 if r[1])
-            if recent_successes >= 9:
+            weights_10 = weights[-10:]
+            success_weight_10 = sum(
+                w for r, w in zip(recent_10, weights_10) if len(r) >= 2 and bool(r[1])
+            )
+            total_weight_10 = sum(weights_10) or 1.0
+            recent_success_rate = success_weight_10 / total_weight_10
+            if recent_success_rate >= 0.9:
                 consistency_score = 10  # Excellent consistency
-            elif recent_successes >= 7:
+            elif recent_success_rate >= 0.7:
                 consistency_score = 7   # Good consistency
             else:
-                consistency_score = recent_successes * 0.7  # Proportional
+                consistency_score = recent_success_rate * 10  # Proportional
         else:
             consistency_score = 5  # Neutral for new proxies
-        
+
         return min(100, max(0, success_score + latency_score + consistency_score))
 
     def process_feedback(
@@ -1113,6 +1195,7 @@ class ProxyManager:
             stat["recent_results"].append([current_timestamp, is_success, response_time_ms])
             if len(stat["recent_results"]) > self.elo_max_window:
                 stat["recent_results"] = stat["recent_results"][-self.elo_max_window:]
+            stat["last_feedback_ts"] = current_timestamp
             
             # Recalculate ELO score
             old_score = stat["score"]

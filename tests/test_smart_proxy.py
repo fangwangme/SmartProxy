@@ -48,6 +48,9 @@ class TestProxyManager(unittest.TestCase):
                     "weighted_selection_enabled": "false",
                     "top_tier_size": "50",
                     "top_tier_load_percentage": "70",
+                    "elo_time_decay_enabled": "true",
+                    "elo_decay_half_life_hours": "24",
+                    "elo_max_result_age_hours": "168",
                 },
                 "backup": {
                     "stats_backup_enabled": "false",
@@ -228,6 +231,28 @@ class TestProxyManager(unittest.TestCase):
         result = self.manager._get_source_or_default("unknown")
         
         self.assertEqual(result, "source1")
+
+    def test_update_dashboard_sources_uses_only_distinct_stat_sources(self):
+        """Dashboard source list should come from stats unique sources only."""
+        self.manager.predefined_sources = {"source1", "source2"}
+        self.mock_db_instance.get_distinct_sources.return_value = ["legacy_source", "source1"]
+
+        self.manager._update_dashboard_sources()
+
+        self.assertEqual(self.manager.dashboard_sources, {"legacy_source", "source1"})
+
+    def test_update_dashboard_sources_filters_internal_fetcher_names(self):
+        """Internal fetcher section names should not leak to dashboard source options."""
+        self.mock_db_instance.get_distinct_sources.return_value = [
+            "default",
+            "proxy_source_socks5_list_B",
+            "proxy_source_A",
+            "",
+        ]
+
+        self.manager._update_dashboard_sources()
+
+        self.assertEqual(self.manager.dashboard_sources, {"default"})
 
     # ========== Validation Cycle Tests ==========
     
@@ -426,6 +451,67 @@ class TestProxyManager(unittest.TestCase):
             score = self.manager._calculate_elo_score(stat)
             self.assertGreaterEqual(score, 0, "Score below 0")
             self.assertLessEqual(score, 100, "Score above 100")
+
+    def test_elo_score_ignores_stale_recent_results(self):
+        """Old recent results should age out and return neutral score when no fresh data exists."""
+        import time
+
+        self.manager.elo_time_decay_enabled = True
+        self.manager.elo_max_result_age_hours = 24
+        stat = self.manager._get_new_proxy_stat()
+
+        stale_ts = time.time() - (3 * 24 * 3600)
+        for _ in range(50):
+            stat["recent_results"].append([stale_ts, True, 200])
+
+        score = self.manager._calculate_elo_score(stat)
+        self.assertEqual(score, 50.0)
+
+    def test_elo_score_prefers_fresh_failures_over_old_successes(self):
+        """Recent failures should dominate when old successes are out of age window."""
+        import time
+
+        self.manager.elo_time_decay_enabled = True
+        self.manager.elo_max_result_age_hours = 24
+        stat = self.manager._get_new_proxy_stat()
+
+        old_ts = time.time() - (8 * 24 * 3600)
+        for _ in range(40):
+            stat["recent_results"].append([old_ts, True, 200])
+
+        for _ in range(10):
+            stat["recent_results"].append([time.time(), False, None])
+
+        score = self.manager._calculate_elo_score(stat)
+        self.assertLessEqual(score, 25)
+
+    def test_elo_score_historical_data_decays_toward_neutral(self):
+        """Historical counters should decay toward neutral when feedback is very old."""
+        import time
+
+        self.manager.elo_time_decay_enabled = True
+        self.manager.elo_decay_half_life_hours = 24
+
+        stat = self.manager._get_new_proxy_stat()
+        stat["success_count"] = 80
+        stat["failure_count"] = 20
+        stat["last_feedback_ts"] = time.time() - (10 * 24 * 3600)
+
+        score = self.manager._calculate_elo_score(stat)
+        self.assertGreaterEqual(score, 49)
+        self.assertLessEqual(score, 52)
+
+    def test_elo_score_historical_without_timestamp_is_neutral(self):
+        """If historical data has no timestamp, treat it as stale under decay mode."""
+        self.manager.elo_time_decay_enabled = True
+
+        stat = self.manager._get_new_proxy_stat()
+        stat["success_count"] = 95
+        stat["failure_count"] = 5
+        stat["last_feedback_ts"] = None
+
+        score = self.manager._calculate_elo_score(stat)
+        self.assertEqual(score, 50.0)
 
 
 class TestDatabaseManager(unittest.TestCase):

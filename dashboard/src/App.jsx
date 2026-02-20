@@ -9,9 +9,11 @@ import { toLocalYYYYMMDD } from './utils/dateUtils';
 function App() {
   const {
     sources,
+    allSourceOption,
     dailyStats,
     setDailyStats,
     timeseriesData,
+    chartSources,
     setTimeseriesData,
     loading,
     error,
@@ -19,19 +21,19 @@ function App() {
     fetchData
   } = useDashboardData();
 
-  const [selectedSource, setSelectedSource] = useState('');
+  const [selectedSource, setSelectedSource] = useState('ALL');
   const [selectedDate, setSelectedDate] = useState(toLocalYYYYMMDD(new Date()));
   const [interval, setIntervalVal] = useState(5); // Default 5 minutes
   const [autoRefresh, setAutoRefresh] = useState(true); // Default auto-refresh ON
 
   const validIntervals = [2, 5, 10, 30, 60];
 
-  // Set default source when sources are loaded
+  // Keep selected source valid when source list changes.
   useEffect(() => {
-    if (sources.length > 0 && !selectedSource) {
-      setSelectedSource(sources[0]);
+    if (sources.length > 0 && !sources.includes(selectedSource)) {
+      setSelectedSource(allSourceOption);
     }
-  }, [sources, selectedSource]);
+  }, [sources, selectedSource, allSourceOption]);
 
   // Handle manual search
   const handleSearch = useCallback(() => {
@@ -99,6 +101,9 @@ function App() {
 
         <Charts
           timeseriesData={timeseriesData}
+          selectedSource={selectedSource}
+          allSourceOption={allSourceOption}
+          chartSources={chartSources}
           loading={loading}
           interval={interval}
           setInterval={setIntervalVal}
