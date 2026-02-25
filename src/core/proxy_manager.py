@@ -67,6 +67,11 @@ class ProxyManager:
 
     def _load_config(self):
         self.server_port = self.config.getint("server", "port", fallback=6942)
+        allowed_ips_str = self.config.get("server", "allowed_dashboard_ips", fallback="")
+        self.allowed_dashboard_ips = [
+            ip.strip() for ip in allowed_ips_str.split(",") if ip.strip()
+        ]
+
         self.validation_workers = self.config.getint(
             "validator", "validation_workers", fallback=100
         )
