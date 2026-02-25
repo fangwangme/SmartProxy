@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 
-const API_BASE_URL = 'http://127.0.0.1:6942/api';
+const API_BASE_URL = `${window.location.origin}/api`;
 const ALL_SOURCES_OPTION = 'ALL';
 
 export const useDashboardData = () => {

@@ -38,7 +38,10 @@ def create_app(proxy_manager: ProxyManager):
         is_frontend = path == "/" or path not in proxy_apis
         
         if is_dashboard_api or is_monitoring or is_frontend:
-            client_ip = request.remote_addr
+            # Support X-Forwarded-For header for getting real client IP behind proxy
+            client_ip = request.headers.get('X-Forwarded-For', request.remote_addr)
+            if ',' in client_ip:
+                client_ip = client_ip.split(',')[0].strip()
             
             # Always allow local loopback addresses
             if client_ip in ["127.0.0.1", "::1"]:
