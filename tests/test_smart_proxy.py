@@ -76,6 +76,29 @@ class TestProxyManager(unittest.TestCase):
         self.manager = ProxyManager("dummy_path.ini")
         self.mock_db_instance = self.MockDatabaseManager.return_value
 
+    # ========== Config Loading Tests ==========
+
+    def test_load_allowed_ips_from_new_key(self):
+        """allowed_ips should be loaded from [server]."""
+        if not self.manager.config.has_section("server"):
+            self.manager.config.add_section("server")
+        self.manager.config.set("server", "allowed_ips", "10.0.0.1, 10.0.0.2")
+
+        self.manager._load_config()
+
+        self.assertEqual(self.manager.allowed_ips, ["10.0.0.1", "10.0.0.2"])
+
+    def test_load_allowed_ips_falls_back_to_legacy_key(self):
+        """Fallback to allowed_dashboard_ips for backward compatibility."""
+        if not self.manager.config.has_section("server"):
+            self.manager.config.add_section("server")
+        self.manager.config.remove_option("server", "allowed_ips")
+        self.manager.config.set("server", "allowed_dashboard_ips", "192.168.0.10")
+
+        self.manager._load_config()
+
+        self.assertEqual(self.manager.allowed_ips, ["192.168.0.10"])
+
     # ========== Core Proxy Selection Tests ==========
     
     def test_get_proxy_returns_proxy_from_pool(self):

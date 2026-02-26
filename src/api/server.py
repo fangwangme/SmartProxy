@@ -12,41 +12,61 @@ from flask_cors import CORS
 from src.utils.logger import logger, setup_logging
 from src.core.proxy_manager import ProxyManager
 
+LOCALHOST_IPS = {"127.0.0.1", "::1"}
+INTERNAL_ONLY_ENDPOINTS = {"/health", "/metrics", "/reload-sources", "/backup-stats"}
+
+
+def _normalize_path(path: str) -> str:
+    if path == "/":
+        return path
+    return path.rstrip("/")
+
+
 def create_app(proxy_manager: ProxyManager):
     app = Flask(__name__, static_folder="../../dashboard/dist")
     CORS(app)
     
     @app.before_request
-    def restrict_dashboard_access():
-        """Restrict access to the dashboard and dashboard-specific APIs by IP."""
-        # Only apply restriction if allowed_ips is configured
-        if not proxy_manager.allowed_dashboard_ips:
+    def restrict_api_access():
+        """
+        Apply IP restrictions for every endpoint.
+
+        - Internal management endpoints: localhost only.
+        - All other endpoints: configured allowed IPs + localhost.
+        """
+        path = _normalize_path(request.path)
+        client_ip = request.remote_addr or ""
+
+        if path in INTERNAL_ONLY_ENDPOINTS:
+            if client_ip not in LOCALHOST_IPS:
+                logger.warning(
+                    f"Unauthorized internal API access attempt from IP: {client_ip} for path: {request.path}"
+                )
+                return (
+                    jsonify(
+                        {
+                            "error": "Forbidden: Internal endpoint is only accessible from localhost."
+                        }
+                    ),
+                    403,
+                )
             return
 
-        # Define paths that are considered part of the dashboard/monitoring
-        # 1. Root and frontend static files (handled by serve_frontend)
-        # 2. Dashboard-specific APIs starting with /api/
-        # 3. Monitoring endpoints /health and /metrics (optional, but usually part of dashboard)
-        path = request.path
-        is_dashboard_api = path.startswith("/api/")
-        is_monitoring = path in ["/health", "/metrics"]
-        
-        # We also need to check if it's hitting the serve_frontend route (root or file paths)
-        # In Flask, the static folder and catch-all routes cover the frontend.
-        # If it's not a proxy/feedback/reload API, it's likely dashboard-related.
-        proxy_apis = ["/get-proxy", "/get-premium-proxy", "/feedback", "/reload-sources", "/backup-stats"]
-        is_frontend = path == "/" or path not in proxy_apis
-        
-        if is_dashboard_api or is_monitoring or is_frontend:
-            client_ip = request.remote_addr
-            
-            # Always allow local loopback addresses
-            if client_ip in ["127.0.0.1", "::1"]:
-                return
+        allowed_ips = set(getattr(proxy_manager, "allowed_ips", []) or [])
+        allowed_ips.update(LOCALHOST_IPS)
 
-            if client_ip not in proxy_manager.allowed_dashboard_ips:
-                logger.warning(f"Unauthorized dashboard access attempt from IP: {client_ip} for path: {path}")
-                return jsonify({"error": "Forbidden: Your IP is not authorized to access the dashboard."}), 403
+        if client_ip not in allowed_ips:
+            logger.warning(
+                f"Unauthorized API access attempt from IP: {client_ip} for path: {request.path}"
+            )
+            return (
+                jsonify(
+                    {
+                        "error": "Forbidden: Your IP is not authorized to access this endpoint."
+                    }
+                ),
+                403,
+            )
 
     # Store proxy_manager in app config or closure, but here passing it explicitly 
     # to routes via closure or global usage might be cleaner if we use a blueprint.
