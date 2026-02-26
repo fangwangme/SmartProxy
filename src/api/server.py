@@ -22,6 +22,14 @@ def _normalize_path(path: str) -> str:
     return path.rstrip("/")
 
 
+def _get_client_ip() -> str:
+    """Prefer real client IP from X-Forwarded-For when behind a reverse proxy."""
+    forwarded_for = request.headers.get("X-Forwarded-For", "")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+    return request.remote_addr or ""
+
+
 def create_app(proxy_manager: ProxyManager):
     app = Flask(__name__, static_folder="../../dashboard/dist")
     CORS(app)
@@ -35,7 +43,7 @@ def create_app(proxy_manager: ProxyManager):
         - All other endpoints: configured allowed IPs + localhost.
         """
         path = _normalize_path(request.path)
-        client_ip = request.remote_addr or ""
+        client_ip = _get_client_ip()
 
         if path in INTERNAL_ONLY_ENDPOINTS:
             if client_ip not in LOCALHOST_IPS:
