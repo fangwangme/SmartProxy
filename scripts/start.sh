@@ -59,8 +59,8 @@ start_server() {
     [ -n "$DEBUG_FLAG" ] && echo " Debug Mode: ENABLED"
     echo "=================================================="
 
-    # 使用 nohup 后台运行服务器
-    nohup python -u -m src.main $DEBUG_FLAG >> "$LOG_FILE" 2>&1 &
+    # 使用 setsid + nohup 完全脱离当前会话，避免父会话退出时子进程被连带终止
+    nohup setsid python -u -m src.main $DEBUG_FLAG </dev/null >> "$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
 
     sleep 1

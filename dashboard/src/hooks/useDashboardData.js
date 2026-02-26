@@ -11,26 +11,29 @@ export const useDashboardData = () => {
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState(null);
 
-    useEffect(() => {
-        const fetchSources = async () => {
-            try {
-                setLoading(true);
-                const response = await fetch(`${API_BASE_URL}/sources`);
-                if (!response.ok) throw new Error('Failed to fetch source list');
-                const data = await response.json();
-                const normalized = Array.from(
-                    new Set((data || []).filter((s) => s && s !== ALL_SOURCES_OPTION))
-                );
-                setSources([ALL_SOURCES_OPTION, ...normalized]);
-            } catch (err) {
-                setError('Could not connect to the backend. Please ensure the proxy service is running.');
-                console.error(err);
-            } finally {
-                setLoading(false);
-            }
-        };
-        fetchSources();
+    const fetchSources = useCallback(async (silent = false) => {
+        try {
+            if (!silent) setLoading(true);
+            const response = await fetch(`${API_BASE_URL}/sources`);
+            if (!response.ok) throw new Error('Failed to fetch source list');
+            const data = await response.json();
+            const normalized = Array.from(
+                new Set((data || []).filter((s) => s && s !== ALL_SOURCES_OPTION))
+            );
+            setSources([ALL_SOURCES_OPTION, ...normalized]);
+        } catch (err) {
+            setError('Could not connect to the backend. Please ensure the proxy service is running.');
+            console.error(err);
+        } finally {
+            if (!silent) setLoading(false);
+        }
     }, []);
+
+    useEffect(() => {
+        fetchSources(false);
+        const timer = setInterval(() => fetchSources(true), 30000);
+        return () => clearInterval(timer);
+    }, [fetchSources]);
 
     const fetchData = useCallback(async (source, date, interval) => {
         if (!source || !date) return;

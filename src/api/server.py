@@ -43,6 +43,8 @@ def create_app(proxy_manager: ProxyManager):
         - All other endpoints: configured allowed IPs + localhost.
         """
         path = _normalize_path(request.path)
+        x_forwarded_for = request.headers.get("X-Forwarded-For", "")
+        remote_addr = request.remote_addr or ""
         client_ip = _get_client_ip()
 
         if path in INTERNAL_ONLY_ENDPOINTS:
@@ -63,9 +65,24 @@ def create_app(proxy_manager: ProxyManager):
         allowed_ips = set(getattr(proxy_manager, "allowed_ips", []) or [])
         allowed_ips.update(LOCALHOST_IPS)
 
+        if getattr(proxy_manager, "debug_mode", False):
+            logger.debug(
+                "Access check path={} remote_addr={} x_forwarded_for={} resolved_client_ip={} allowed_ips={}",
+                request.path,
+                remote_addr,
+                x_forwarded_for,
+                client_ip,
+                sorted(allowed_ips),
+            )
+
         if client_ip not in allowed_ips:
             logger.warning(
-                f"Unauthorized API access attempt from IP: {client_ip} for path: {request.path}"
+                "Unauthorized API access attempt: resolved_client_ip={} remote_addr={} x_forwarded_for={} path={} allowed_ips={}",
+                client_ip,
+                remote_addr,
+                x_forwarded_for,
+                request.path,
+                sorted(allowed_ips),
             )
             return (
                 jsonify(
@@ -240,6 +257,8 @@ smartproxy_is_validating {1 if proxy_manager.is_validating else 0}
 
     @app.route("/api/sources", methods=["GET"])
     def get_sources():
+        # Keep source list fresh for dashboard clients instead of waiting for scheduler refresh.
+        proxy_manager._update_dashboard_sources()
         return jsonify(sorted(list(proxy_manager.dashboard_sources)))
 
     @app.route("/api/stats/daily", methods=["GET"])
