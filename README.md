@@ -130,6 +130,9 @@ The service is configured via the config.ini file.
 
 * **\[database\]**: Credentials for your PostgreSQL database.  
 * **\[server\]**: port for the API and dashboard.  
+  * allowed\_ips: Comma-separated remote IP allowlist for external APIs and dashboard pages.
+  * localhost (127.0.0.1 / ::1) is always allowed automatically.
+  * internal endpoints `/health`, `/metrics`, `/reload-sources`, `/backup-stats` are localhost-only.
 * **\[validator\]**:  
   * validation\_target: URL used to test proxy connectivity.  
   * validation\_workers: Number of concurrent threads for validation.  
