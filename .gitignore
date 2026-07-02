@@ -146,8 +146,12 @@ proxy_stats.json
 .smart_proxy.pid
 
 # Project Structure
-.shared
-.worktrees
+.worktrees/
+.local/
+.agents
+.agents/
+.antigravitycli/
+.sisyphus/
 .venv
 node_modules
 
@@ -156,6 +160,5 @@ src/**/__pycache__/
 *.pyc
 
 # Local data
-data/
 proxiex.txt
 proxy_stats.json

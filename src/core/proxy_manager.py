@@ -147,7 +147,7 @@ class ProxyManager:
             "backup", "stats_backup_interval_seconds", fallback=3600  # 1 hour
         )
         self.stats_backup_path = Path(
-            self.config.get("backup", "stats_backup_path", fallback="./.shared/data/proxy_stats_backup.json")
+            self.config.get("backup", "stats_backup_path", fallback="./.local/data/proxy_stats_backup.json")
         )
 
         # ELO scoring configuration

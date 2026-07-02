@@ -23,10 +23,8 @@ SmartProxy is a sophisticated proxy management system designed to provide reliab
 
 ## **Project Structure**
 
-This project primarily resides in the `main` branch. Dependencies are centralized to save disk space.
-
-- **`.shared/`**: Contains shared resources like the Python virtual environment (`.venv`) and Node.js modules.
-- **`.venv`**: Symbolic link pointing to `.shared/.venv`.
+- **`.local/`**: Contains local data, build outputs, and temporary files (git-ignored).
+- **`.venv/`**: Local Python virtual environment.
 - **`dashboard/`**: React-based frontend application.
 
 ## **Installation and Setup**
@@ -43,7 +41,6 @@ This project primarily resides in the `main` branch. Dependencies are centralize
 
     ```bash
     source .venv/bin/activate
-    # If the symlink is missing, use: source .shared/.venv/bin/activate
     ```
 
 2.  **Install Dependencies** (if needed):
