@@ -10,11 +10,15 @@ const StatCard = ({ title, value }) => (
 const StatsCards = ({ dailyStats }) => {
     if (!dailyStats) return null;
 
+    const totalRequests = Number(dailyStats?.total_requests ?? 0);
+    const totalSuccess = Number(dailyStats?.total_success ?? 0);
+    const successRate = Number(dailyStats?.success_rate ?? 0);
+
     return (
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-2">
-            <StatCard title="Total Requests (Day)" value={dailyStats.total_requests.toLocaleString()} />
-            <StatCard title="Successful (Day)" value={dailyStats.total_success.toLocaleString()} />
-            <StatCard title="Success Rate (Day)" value={`${dailyStats.success_rate}%`} />
+            <StatCard title="Total Requests (Day)" value={totalRequests.toLocaleString()} />
+            <StatCard title="Successful (Day)" value={totalSuccess.toLocaleString()} />
+            <StatCard title="Success Rate (Day)" value={`${successRate}%`} />
         </div>
     );
 };

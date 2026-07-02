@@ -54,9 +54,9 @@ const CustomTooltip = ({ active, payload, label, mode, sourceColors, chartSource
         return (
             <div className="bg-gray-800 p-3 rounded-lg border border-gray-700 shadow-lg text-sm">
                 <p className="label text-gray-300">{`Time : ${label}`}</p>
-                <p className="intro text-cyan-400">{`Interval Success Rate : ${row.success_rate}%`}</p>
-                <p className="desc text-gray-400">{`Successful Requests: ${row.success_count.toLocaleString()}`}</p>
-                <p className="desc text-gray-400">{`Interval Requests: ${row.total_requests.toLocaleString()}`}</p>
+                <p className="intro text-cyan-400">{`Interval Success Rate : ${Number(row?.success_rate ?? 0)}%`}</p>
+                <p className="desc text-gray-400">{`Successful Requests: ${Number(row?.success_count ?? 0).toLocaleString()}`}</p>
+                <p className="desc text-gray-400">{`Interval Requests: ${Number(row?.total_requests ?? 0).toLocaleString()}`}</p>
             </div>
         );
     }
@@ -69,6 +69,7 @@ const Charts = ({
     allSourceOption,
     chartSources,
     loading,
+    isRefreshing,
     interval,
     setInterval,
     validIntervals,
@@ -85,10 +86,10 @@ const Charts = ({
     }, [chartSources]);
 
     // Generate ticks for every 2 hours: 00:00, 02:00, ... 22:00
-    const ticks = Array.from({ length: 12 }, (_, i) => {
+    const ticks = useMemo(() => Array.from({ length: 12 }, (_, i) => {
         const hour = i * 2;
         return `${String(hour).padStart(2, '0')}:00`;
-    });
+    }), []);
 
     const hasChartData = timeseriesData.length > 0 && (!isAllMode || chartSources.length > 0);
 
@@ -97,6 +98,7 @@ const Charts = ({
             <div className="flex justify-between items-center mb-4">
                 <h2 className="text-xl font-semibold text-gray-200">Success Rate by Time Interval</h2>
                 <div className="flex items-center gap-2 flex-wrap">
+                    {isRefreshing && <span className="text-xs text-cyan-300">Refreshing</span>}
                     <span className="text-sm text-gray-400">Interval:</span>
                     {validIntervals.map(val => (
                         <button

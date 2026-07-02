@@ -3,6 +3,7 @@ import Header from './components/Header';
 import Controls from './components/Controls';
 import StatsCards from './components/StatsCards';
 import Charts from './components/Charts';
+import ErrorBoundary from './components/ErrorBoundary';
 import { useDashboardData } from './hooks/useDashboardData';
 import { toLocalYYYYMMDD } from './utils/dateUtils';
 
@@ -16,6 +17,7 @@ function App() {
     chartSources,
     setTimeseriesData,
     loading,
+    isRefreshing,
     error,
     setError,
     fetchData
@@ -63,10 +65,7 @@ function App() {
     let intervalId;
     if (autoRefresh && selectedSource && selectedDate) {
       intervalId = setInterval(() => {
-        // Silent fetch (maybe don't clear data?)
-        // fetchData handles loading state which might trigger spinner. 
-        // That's fine for now.
-        fetchData(selectedSource, selectedDate, interval);
+        fetchData(selectedSource, selectedDate, interval, { silent: true });
       }, 30000);
     }
     return () => clearInterval(intervalId);
@@ -76,6 +75,7 @@ function App() {
   return (
     <div className="bg-gray-900 text-white min-h-screen font-sans p-4 sm:p-6 lg:p-8">
       <div className="max-w-7xl mx-auto">
+        <ErrorBoundary>
         <Header />
 
         {error && (
@@ -92,6 +92,7 @@ function App() {
           selectedDate={selectedDate}
           setSelectedDate={setSelectedDate}
           loading={loading}
+          isRefreshing={isRefreshing}
           handleSearch={handleSearch}
           autoRefresh={autoRefresh}
           setAutoRefresh={setAutoRefresh}
@@ -105,11 +106,13 @@ function App() {
           allSourceOption={allSourceOption}
           chartSources={chartSources}
           loading={loading}
+          isRefreshing={isRefreshing}
           interval={interval}
           setInterval={setIntervalVal}
           validIntervals={validIntervals}
           dailyStats={dailyStats}
         />
+        </ErrorBoundary>
       </div>
     </div>
   );

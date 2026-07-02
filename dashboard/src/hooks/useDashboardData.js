@@ -1,7 +1,11 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 
-const API_BASE_URL = `${window.location.origin}/api`;
+const API_BASE_URL = '/api';
 const ALL_SOURCES_OPTION = 'ALL';
+
+const sameArray = (left, right) => (
+    left.length === right.length && left.every((item, index) => item === right[index])
+);
 
 export const useDashboardData = () => {
     const [sources, setSources] = useState([]);
@@ -9,7 +13,16 @@ export const useDashboardData = () => {
     const [timeseriesData, setTimeseriesData] = useState([]);
     const [chartSources, setChartSources] = useState([]);
     const [loading, setLoading] = useState(false);
+    const [isRefreshing, setIsRefreshing] = useState(false);
     const [error, setError] = useState(null);
+
+    const sourcesRef = useRef([]);
+    const requestIdRef = useRef(0);
+    const activeControllerRef = useRef(null);
+
+    useEffect(() => {
+        sourcesRef.current = sources;
+    }, [sources]);
 
     const fetchSources = useCallback(async (silent = false) => {
         try {
@@ -18,9 +31,10 @@ export const useDashboardData = () => {
             if (!response.ok) throw new Error('Failed to fetch source list');
             const data = await response.json();
             const normalized = Array.from(
-                new Set((data || []).filter((s) => s && s !== ALL_SOURCES_OPTION))
+                new Set((data || []).filter((source) => source && source !== ALL_SOURCES_OPTION))
             );
-            setSources([ALL_SOURCES_OPTION, ...normalized]);
+            const nextSources = [ALL_SOURCES_OPTION, ...normalized];
+            setSources((previous) => (sameArray(previous, nextSources) ? previous : nextSources));
         } catch (err) {
             setError('Could not connect to the backend. Please ensure the proxy service is running.');
             console.error(err);
@@ -35,51 +49,45 @@ export const useDashboardData = () => {
         return () => clearInterval(timer);
     }, [fetchSources]);
 
-    const fetchData = useCallback(async (source, date, interval) => {
+    const fetchData = useCallback(async (source, date, interval, options = {}) => {
         if (!source || !date) return;
 
-        setLoading(true);
+        const { silent = false } = options;
+        if (activeControllerRef.current) {
+            activeControllerRef.current.abort();
+        }
+
+        const controller = new AbortController();
+        activeControllerRef.current = controller;
+        const requestId = requestIdRef.current + 1;
+        requestIdRef.current = requestId;
+
+        if (silent) {
+            setIsRefreshing(true);
+        } else {
+            setLoading(true);
+        }
         setError(null);
+
+        const isLatestRequest = () => requestIdRef.current === requestId && !controller.signal.aborted;
 
         try {
             if (source === ALL_SOURCES_OPTION) {
-                const requestedSources = sources.filter((s) => s !== ALL_SOURCES_OPTION);
-                if (requestedSources.length === 0) {
+                const overviewRes = await fetch(
+                    `${API_BASE_URL}/stats/overview?date=${encodeURIComponent(date)}&interval=${interval}`,
+                    { signal: controller.signal }
+                );
+                if (!overviewRes.ok) throw new Error('Failed to fetch overview stats');
+
+                const overview = await overviewRes.json();
+                if (!isLatestRequest()) return;
+
+                const fulfilled = overview?.sources || [];
+                if (fulfilled.length === 0) {
                     setDailyStats({ total_requests: 0, total_success: 0, success_rate: 0 });
                     setTimeseriesData([]);
                     setChartSources([]);
                     return;
-                }
-
-                const settled = await Promise.allSettled(
-                    requestedSources.map(async (src) => {
-                        const [dailyRes, timeseriesRes] = await Promise.all([
-                            fetch(`${API_BASE_URL}/stats/daily?source=${src}&date=${date}`),
-                            fetch(`${API_BASE_URL}/stats/timeseries?source=${src}&date=${date}&interval=${interval}`),
-                        ]);
-
-                        if (!dailyRes.ok || !timeseriesRes.ok) {
-                            throw new Error(`Failed to fetch data for ${src}`);
-                        }
-
-                        const [daily, timeseries] = await Promise.all([dailyRes.json(), timeseriesRes.json()]);
-                        return { source: src, daily, timeseries };
-                    })
-                );
-
-                const fulfilled = settled
-                    .filter((item) => item.status === 'fulfilled')
-                    .map((item) => item.value);
-                const failed = settled
-                    .filter((item) => item.status === 'rejected')
-                    .map((item) => item.reason?.message || 'unknown source');
-
-                if (fulfilled.length === 0) {
-                    throw new Error('Failed to fetch data for all sources.');
-                }
-
-                if (failed.length > 0) {
-                    setError(`Some sources failed to load: ${failed.join(', ')}`);
                 }
 
                 const activeSources = fulfilled
@@ -104,11 +112,11 @@ export const useDashboardData = () => {
                             timeMap.set(point.time, { time: point.time, _meta: {} });
                         }
                         const row = timeMap.get(point.time);
-                        row[item.source] = point.success_rate;
-                        row[`${item.source}__req`] = point.total_requests;
+                        row[item.source] = point.success_rate || 0;
+                        row[`${item.source}__req`] = point.total_requests || 0;
                         row._meta[item.source] = {
-                            total_requests: point.total_requests,
-                            success_count: point.success_count,
+                            total_requests: point.total_requests || 0,
+                            success_count: point.success_count || 0,
                         };
                     }
                 }
@@ -126,23 +134,38 @@ export const useDashboardData = () => {
                 return;
             }
 
-            const dailyRes = await fetch(`${API_BASE_URL}/stats/daily?source=${source}&date=${date}`);
+            const dailyRes = await fetch(
+                `${API_BASE_URL}/stats/daily?source=${encodeURIComponent(source)}&date=${encodeURIComponent(date)}`,
+                { signal: controller.signal }
+            );
             if (!dailyRes.ok) throw new Error(`Failed to fetch daily stats for ${source}`);
             const dailyData = await dailyRes.json();
+            if (!isLatestRequest()) return;
             setDailyStats(dailyData);
 
-            const timeseriesRes = await fetch(`${API_BASE_URL}/stats/timeseries?source=${source}&date=${date}&interval=${interval}`);
+            const timeseriesRes = await fetch(
+                `${API_BASE_URL}/stats/timeseries?source=${encodeURIComponent(source)}&date=${encodeURIComponent(date)}&interval=${interval}`,
+                { signal: controller.signal }
+            );
             if (!timeseriesRes.ok) throw new Error(`Failed to fetch timeseries data for ${source}`);
             const tsData = await timeseriesRes.json();
+            if (!isLatestRequest()) return;
             setTimeseriesData(tsData);
             setChartSources([source]);
         } catch (err) {
-            setError(err.message);
+            if (err.name === 'AbortError') return;
+            if (isLatestRequest()) {
+                setError(err.message);
+            }
             console.error(err);
         } finally {
-            setLoading(false);
+            if (isLatestRequest()) {
+                activeControllerRef.current = null;
+                setLoading(false);
+                setIsRefreshing(false);
+            }
         }
-    }, [sources]);
+    }, []);
 
     return {
         sources,
@@ -153,6 +176,7 @@ export const useDashboardData = () => {
         chartSources,
         setTimeseriesData,
         loading,
+        isRefreshing,
         error,
         setError,
         fetchData

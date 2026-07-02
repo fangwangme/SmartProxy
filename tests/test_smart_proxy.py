@@ -44,8 +44,9 @@ class TestProxyManager(unittest.TestCase):
                 "source_pool": {
                     "max_pool_size": "100",
                     "stats_pool_max_multiplier": "10",
-                    "failure_penalties": "-1, -5",
                     "weighted_selection_enabled": "false",
+                    "selection_strategy": "uniform",
+                    "proxy_cooldown_ms": "0",
                     "top_tier_size": "50",
                     "top_tier_load_percentage": "70",
                     "elo_time_decay_enabled": "true",
@@ -137,6 +138,40 @@ class TestProxyManager(unittest.TestCase):
         
         self.assertEqual(proxy, "http://1.1.1.1:80")
 
+    def test_get_proxy_respects_cooldown(self):
+        """Recently handed out proxies should be skipped until cooldown expires."""
+        now = __import__("time").time()
+        self.manager.proxy_cooldown_ms = 10000
+        self.manager.predefined_sources.add("source1")
+        self.manager.available_proxies["source1"] = {
+            "top_tier": ["http://1.1.1.1:80", "http://2.2.2.2:80"],
+            "bottom_tier": [],
+        }
+        self.manager.proxy_last_handed_out_ts["source1"]["http://1.1.1.1:80"] = now
+
+        proxy = self.manager.get_proxy("source1")
+
+        self.assertEqual(proxy, "http://2.2.2.2:80")
+
+    def test_weighted_selection_uses_scores(self):
+        """Weighted strategy should pass score-derived weights to random.choices."""
+        self.manager.selection_strategy = "weighted"
+        self.manager.predefined_sources.add("source1")
+        self.manager.available_proxies["source1"] = {
+            "top_tier": ["http://1.1.1.1:80", "http://2.2.2.2:80"],
+            "bottom_tier": [],
+        }
+        self.manager.source_stats["source1"] = {
+            "http://1.1.1.1:80": {"score": 10},
+            "http://2.2.2.2:80": {"score": 90},
+        }
+
+        with patch("src.core.proxy_manager.random.choices", return_value=["http://2.2.2.2:80"]) as choices:
+            proxy = self.manager.get_proxy("source1")
+
+        self.assertEqual(proxy, "http://2.2.2.2:80")
+        self.assertEqual(choices.call_args.kwargs["weights"], [10.0, 90.0])
+
     def test_get_premium_proxy_returns_proxy_when_available(self):
         """Test get_premium_proxy returns a proxy when premium pool is available."""
         self.manager.premium_proxies = ["http://premium1:80", "http://premium2:80"]
@@ -206,6 +241,14 @@ class TestProxyManager(unittest.TestCase):
         self.assertEqual(stat["consecutive_failures"], 1)
         self.assertEqual(len(stat["recent_results"]), 1)
 
+    def test_feedback_status_classification(self):
+        """Feedback status should reject unknown values and classify HTTP failures."""
+        self.assertTrue(self.manager.classify_feedback_status(200))
+        self.assertTrue(self.manager.classify_feedback_status(2))
+        self.assertFalse(self.manager.classify_feedback_status(0))
+        self.assertFalse(self.manager.classify_feedback_status(500))
+        self.assertFalse(self.manager.is_valid_feedback_status(999))
+
     def test_process_feedback_handles_unknown_proxy(self):
         """Test that process_feedback handles unknown proxy gracefully."""
         self.manager.predefined_sources.add("source1")
@@ -216,17 +259,6 @@ class TestProxyManager(unittest.TestCase):
 
     # ========== Lock Tests ==========
     
-    def test_get_source_lock_creates_and_returns_lock(self):
-        """Test that _get_source_lock creates a new lock for each source."""
-        lock1 = self.manager._get_source_lock("source1")
-        lock2 = self.manager._get_source_lock("source2")
-        lock1_again = self.manager._get_source_lock("source1")
-        
-        self.assertIs(lock1, lock1_again)
-        self.assertIsNot(lock1, lock2)
-        # threading.Lock is a factory function, use type() to get actual type
-        self.assertIsInstance(lock1, type(threading.Lock()))
-
     def test_rlock_is_reentrant(self):
         """Test that main lock is RLock and reentrant."""
         self.assertIsInstance(self.manager.lock, type(threading.RLock()))
@@ -316,6 +348,23 @@ class TestProxyManager(unittest.TestCase):
         
         # Should have called get_eligible_failed_proxies since we're below threshold
         self.mock_db_instance.get_eligible_failed_proxies.assert_called_once()
+
+    def test_sync_keeps_existing_pool_when_active_proxy_query_fails(self):
+        """A transient DB read failure should not clear the in-memory pool."""
+        self.manager.active_proxies = {"http://1.1.1.1:80"}
+        self.manager.available_proxies["source1"] = {
+            "top_tier": ["http://1.1.1.1:80"],
+            "bottom_tier": [],
+        }
+        self.mock_db_instance.get_active_proxies.return_value = None
+
+        self.manager._sync_and_select_top_proxies()
+
+        self.assertEqual(self.manager.active_proxies, {"http://1.1.1.1:80"})
+        self.assertEqual(
+            self.manager.available_proxies["source1"]["top_tier"],
+            ["http://1.1.1.1:80"],
+        )
 
     # ========== Stats Proxy Helper Tests ==========
     

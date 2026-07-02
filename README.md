@@ -17,8 +17,8 @@ SmartProxy is a sophisticated proxy management system designed to provide reliab
 
 1. **Fetch**: The service periodically fetches proxy lists from various sources defined in config.ini.  
 2. **Validate**: A validation cycle runs regularly. It prioritizes new and previously successful proxies. To avoid overwhelming unreliable proxies, it supplements the validation queue with failed proxies that have not been tested more than a configured number of times within a specific time window (e.g., 5 times in 30 minutes).  
-3. **Score**: Proxies are managed in memory for each source. When a proxy is used, feedback is sent to the /feedback endpoint. Successful requests increase the proxy's score (with a bonus for low latency), while failures apply a penalty. The penalty becomes more severe with consecutive failures.  
-4. **Select**: When a client requests a proxy for a specific source via /get-proxy, the system provides a random proxy from the pool of top-scoring candidates for that source.  
+3. **Score**: Proxies are managed in memory for each source. Feedback updates an ELO-inspired 0-100 score from recent success rate, latency, consistency, and optional time decay. Consecutive failures are kept only as diagnostic data; candidates are not hard-deleted by a failure threshold.  
+4. **Select**: When a client requests a proxy for a specific source via /get-proxy, the system filters candidates by optional per-proxy cooldown, then selects from the current top pool using the configured strategy (`uniform`, `tiered`, `weighted`, or `softmax`).  
 5. **Adapt**: Through continuous validation and feedback, low-quality proxies are phased out, and high-performing ones are prioritized, ensuring the overall quality of the pool constantly improves.
 
 ## **Project Structure**
@@ -128,19 +128,26 @@ The service is configured via the config.ini file.
 * **\[database\]**: Credentials for your PostgreSQL database.  
 * **\[server\]**: port for the API and dashboard.  
   * allowed\_ips: Comma-separated remote IP allowlist for external APIs and dashboard pages.
+  * trust\_proxy\_headers / trusted\_proxy\_ips: Only trust X-Forwarded-For when the direct peer is explicitly trusted.
   * localhost (127.0.0.1 / ::1) is always allowed automatically.
   * internal endpoints `/health`, `/metrics`, `/reload-sources`, `/backup-stats` are localhost-only.
+* **\[logging\]**:
+  * log\_dir: Log directory. Relative paths are resolved from the project root. Defaults to `./.local/logs`.
 * **\[validator\]**:  
-  * validation\_target: URL used to test proxy connectivity.  
+  * validation\_target / validation\_targets: URL(s) used to test proxy connectivity and anonymity. Use an endpoint that returns request headers, such as `http://httpbin.org/get`, if anonymity classification matters.
+  * validation\_success\_threshold: Number of targets a proxy must pass.  
   * validation\_workers: Number of concurrent threads for validation.  
+  * validation\_batch\_limit: Maximum proxies pulled into one validation cycle.  
   * validation\_supplement\_threshold: If the number of new/active proxies to test is below this, the queue will be supplemented with failed proxies.  
   * validation\_window\_minutes: The time window (in minutes) for the validation attempt limit.  
   * max\_validations\_per\_window: The maximum number of times a failed proxy will be re-tested within the time window.  
+* **\[fetcher\]**:
+  * use\_curl: Defaults to `false`. Enable only for local environments that intentionally route `curl` differently from Python.
 * **\[scheduler\]**: Intervals for background tasks like fetching, validation, and flushing stats.  
 * **\[sources\]**:  
   * predefined\_sources: A comma-separated list of logical names for your proxy pools (e.g., google\_search, web\_scraping).  
   * default\_source: The pool to use if a requested source doesn't exist.  
-* **\[source\_pool\]**: Parameters for the scoring and selection algorithm.  
+* **\[source\_pool\]**: Parameters for the scoring and selection algorithm, including `selection_strategy`, `proxy_cooldown_ms`, ELO window/decay settings, and latency scoring thresholds.  
 * **\[proxy\_source\_\*\]**: Define your proxy sources here. Each source should have its own section (e.g., \[proxy\_source\_freeproxies\]).  
   * url: The URL to fetch the proxy list from.  
   * update\_interval\_minutes: How often to fetch from this source.  
@@ -159,7 +166,8 @@ Fetches an available proxy for a specific use case.
 ```json
   {  
     "http": "http://1.2.3.4:8080",  
-    "https": "http://1.2.3.4:8080"  
+    "https": "http://1.2.3.4:8080",
+    "protocol": "http"
   }
 ```
 
@@ -172,8 +180,9 @@ Submits feedback on a proxy's performance. This is crucial for the scoring syste
 * **Request Body** (JSON):  
   * source (string, required): The source pool the proxy belongs to.  
   * proxy (string, required): The full proxy URL (e.g., http://1.2.3.4:8080).  
-  * status (integer, required): A status code representing the outcome. 0 and 4 are treated as failures; all other codes are successes.  
+  * status (integer, required): 0 and 4 are legacy failures; 1/2/3 and HTTP 1xx-3xx are successes; HTTP 4xx-5xx are failures; other values are rejected.  
   * response\_time\_ms (integer, optional): The response time in milliseconds for successful requests. Lower times result in a higher score bonus.  
+  * failure\_kind (string, optional): One of `timeout`, `proxy_error`, `dead`, `blocked`, `slow`, or `content_error`. `dead` applies the failure to every source where that proxy is tracked; other kinds affect only the reported source.
 * **Success Response (200)**:  
 
 ```json
