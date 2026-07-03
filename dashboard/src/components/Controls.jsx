@@ -1,14 +1,14 @@
-import React, { useEffect } from 'react';
+import React, { useCallback, useEffect } from 'react';
 import { toLocalYYYYMMDD } from '../utils/dateUtils';
 
 const Controls = ({
     sources, selectedSource, setSelectedSource,
     selectedDate, setSelectedDate,
-    loading, handleSearch,
+    loading, isRefreshing, handleSearch,
     autoRefresh, setAutoRefresh
 }) => {
 
-    const handleDateChange = (offset) => {
+    const handleDateChange = useCallback((offset) => {
         const parts = selectedDate.split('-');
         // Create date in local time (using constructor with year, month index, day)
         // Note: Month is 0-indexed
@@ -25,15 +25,24 @@ const Controls = ({
         }
 
         setSelectedDate(toLocalYYYYMMDD(current));
-    };
+    }, [selectedDate, setSelectedDate]);
 
     const isLatestDate = selectedDate === toLocalYYYYMMDD(new Date());
 
     // Keyboard support for date switching
     useEffect(() => {
         const handleKeyDown = (e) => {
-            // Only trigger if no input is focused (optional, but good practice usually, though date picker is focusable)
-            // Let's just allow it globally for now as requested.
+            const target = e.target;
+            const tagName = target?.tagName?.toLowerCase();
+            if (
+                tagName === 'input' ||
+                tagName === 'select' ||
+                tagName === 'textarea' ||
+                target?.isContentEditable
+            ) {
+                return;
+            }
+
             if (e.key === 'ArrowLeft') {
                 handleDateChange(-1);
             } else if (e.key === 'ArrowRight') {
@@ -43,7 +52,7 @@ const Controls = ({
 
         window.addEventListener('keydown', handleKeyDown);
         return () => window.removeEventListener('keydown', handleKeyDown);
-    }, [selectedDate]); // Re-bind on state change to capture latest date
+    }, [handleDateChange]);
 
     return (
         <div className="bg-gray-800 p-2 rounded-lg mb-2 flex flex-wrap items-end gap-4 shadow-lg">
@@ -113,6 +122,9 @@ const Controls = ({
                         </div>
                         <div className="ml-3 text-gray-300 font-medium text-sm">Auto-refresh (30s)</div>
                     </label>
+                    {isRefreshing && (
+                        <span className="text-xs text-cyan-300" aria-live="polite">Refreshing...</span>
+                    )}
                 </div>
             </div>
         </div>

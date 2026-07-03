@@ -4,7 +4,7 @@ import configparser
 import psycopg2
 import psycopg2.pool
 import psycopg2.extras
-from typing import List, Dict, Set, Tuple
+from typing import List, Dict, Optional, Set, Tuple
 from src.utils.logger import logger
 
 class DatabaseManager:
@@ -186,14 +186,12 @@ class DatabaseManager:
             if conn:
                 self.pool.putconn(conn)
 
-    def get_active_proxies(self) -> Set[str]:
+    def get_active_proxies(self) -> Optional[Set[str]]:
         query = "SELECT protocol, ip, port FROM proxies WHERE is_active = true;"
         rows = self._execute(query, fetch="all")
-        return (
-            {f"{row['protocol']}://{row['ip']}:{row['port']}" for row in rows}
-            if rows
-            else set()
-        )
+        if rows is None:
+            return None
+        return {f"{row['protocol']}://{row['ip']}:{row['port']}" for row in rows}
 
     def flush_feedback_stats(self, stats_buffer: List[Tuple]):
         if not stats_buffer:
@@ -244,6 +242,42 @@ class DatabaseManager:
             {"source": source, "date": date, "interval": interval_minutes},
             fetch="all",
         )
+
+    def get_overview_stats(self, date: str, interval_minutes: int):
+        daily_query = """
+            SELECT
+                source_name,
+                COALESCE(SUM(success_count), 0) as total_success,
+                COALESCE(SUM(failure_count), 0) as total_failure
+            FROM source_stats_by_minute
+            WHERE DATE(minute) = %s
+            GROUP BY source_name
+            ORDER BY source_name;
+        """
+        timeseries_query = """
+            SELECT
+                source_name,
+                date_trunc('hour', minute) + (EXTRACT(minute FROM minute)::int / %(interval)s * %(interval)s) * interval '1 minute' AS interval_start,
+                SUM(success_count) as success,
+                SUM(failure_count) as failure
+            FROM source_stats_by_minute
+            WHERE DATE(minute) = %(date)s
+            GROUP BY source_name, interval_start
+            ORDER BY source_name, interval_start;
+        """
+        daily_rows = self._execute(daily_query, (date,), fetch="all")
+        if daily_rows is None:
+            return None
+
+        timeseries_rows = self._execute(
+            timeseries_query,
+            {"date": date, "interval": interval_minutes},
+            fetch="all",
+        )
+        if timeseries_rows is None:
+            return None
+
+        return {"daily": daily_rows, "timeseries": timeseries_rows}
 
     def get_distinct_sources(self) -> List[str]:
         query = "SELECT DISTINCT source_name FROM source_stats_by_minute ORDER BY source_name;"

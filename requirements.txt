@@ -1,7 +1,7 @@
-requests==2.32.5
 flask==3.1.2
 flask-cors==6.0.2
 psycopg2-binary==2.9.11
 aiohttp==3.13.3
+aiohttp-socks==0.10.1
 loguru==0.7.3
 pytest

@@ -5,6 +5,7 @@ import argparse
 import signal
 import threading
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Optional
 
 from flask import Flask, jsonify, request, send_from_directory
@@ -14,6 +15,7 @@ from src.core.proxy_manager import ProxyManager
 
 LOCALHOST_IPS = {"127.0.0.1", "::1"}
 INTERNAL_ONLY_ENDPOINTS = {"/health", "/metrics", "/reload-sources", "/backup-stats"}
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _normalize_path(path: str) -> str:
@@ -22,16 +24,20 @@ def _normalize_path(path: str) -> str:
     return path.rstrip("/")
 
 
-def _get_client_ip() -> str:
-    """Prefer real client IP from X-Forwarded-For when behind a reverse proxy."""
+def _get_client_ip(proxy_manager: ProxyManager) -> str:
+    """Resolve the client IP, trusting proxy headers only from configured proxies."""
+    remote_addr = request.remote_addr or ""
+    trust_proxy_headers = getattr(proxy_manager, "trust_proxy_headers", False)
+    trusted_proxy_ips = set(getattr(proxy_manager, "trusted_proxy_ips", []) or [])
     forwarded_for = request.headers.get("X-Forwarded-For", "")
-    if forwarded_for:
+
+    if trust_proxy_headers and remote_addr in trusted_proxy_ips and forwarded_for:
         return forwarded_for.split(",")[0].strip()
-    return request.remote_addr or ""
+    return remote_addr
 
 
 def create_app(proxy_manager: ProxyManager):
-    app = Flask(__name__, static_folder="../../dashboard/dist")
+    app = Flask(__name__, static_folder=str(PROJECT_ROOT / ".local" / "dist"))
     CORS(app)
     
     @app.before_request
@@ -45,12 +51,15 @@ def create_app(proxy_manager: ProxyManager):
         path = _normalize_path(request.path)
         x_forwarded_for = request.headers.get("X-Forwarded-For", "")
         remote_addr = request.remote_addr or ""
-        client_ip = _get_client_ip()
+        client_ip = _get_client_ip(proxy_manager)
 
         if path in INTERNAL_ONLY_ENDPOINTS:
-            if client_ip not in LOCALHOST_IPS:
+            if remote_addr not in LOCALHOST_IPS:
                 logger.warning(
-                    f"Unauthorized internal API access attempt from IP: {client_ip} for path: {request.path}"
+                    "Unauthorized internal API access attempt: remote_addr={} x_forwarded_for={} path={}",
+                    remote_addr,
+                    x_forwarded_for,
+                    request.path,
                 )
                 return (
                     jsonify(
@@ -170,7 +179,8 @@ smartproxy_is_validating {1 if proxy_manager.is_validating else 0}
             return jsonify({"error": "Query parameter 'source' is required."}), 400
         proxy_url = proxy_manager.get_proxy(source)
         if proxy_url:
-            return jsonify({"http": proxy_url, "https": proxy_url})
+            protocol = proxy_url.split("://", 1)[0] if "://" in proxy_url else "http"
+            return jsonify({"http": proxy_url, "https": proxy_url, "protocol": protocol})
         else:
             return (
                 jsonify(
@@ -184,7 +194,8 @@ smartproxy_is_validating {1 if proxy_manager.is_validating else 0}
         """Get a premium (highest quality) proxy for Playwright and high-reliability use cases."""
         proxy_url = proxy_manager.get_premium_proxy()
         if proxy_url:
-            return jsonify({"http": proxy_url, "https": proxy_url, "premium": True})
+            protocol = proxy_url.split("://", 1)[0] if "://" in proxy_url else "http"
+            return jsonify({"http": proxy_url, "https": proxy_url, "protocol": protocol, "premium": True})
         else:
             return (
                 jsonify(
@@ -195,11 +206,15 @@ smartproxy_is_validating {1 if proxy_manager.is_validating else 0}
 
     @app.route("/feedback", methods=["POST"])
     def feedback_route():
-        data = request.json
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({"error": "Invalid JSON body."}), 400
+
         source = data.get("source")
         proxy_url = data.get("proxy")
         status_code = data.get("status")
         resp_time = data.get("response_time_ms")
+        failure_kind = data.get("failure_kind")
         logger.debug(
             f"Handled feedback: {source} - {status_code} - {proxy_url} - {resp_time}"
         )
@@ -212,7 +227,17 @@ smartproxy_is_validating {1 if proxy_manager.is_validating else 0}
                 ),
                 400,
             )
-        proxy_manager.process_feedback(source, proxy_url, status_code, resp_time)
+        if not proxy_manager.is_valid_feedback_status(status_code):
+            return (
+                jsonify(
+                    {
+                        "error": "Invalid feedback status. Use 0/4 for legacy failures, 1/2/3 or HTTP 1xx-3xx for success, and HTTP 4xx-5xx for failure."
+                    }
+                ),
+                400,
+            )
+
+        proxy_manager.process_feedback(source, proxy_url, status_code, resp_time, failure_kind)
         return jsonify({"message": "Feedback received."})
 
     @app.route("/reload-sources", methods=["POST"])
@@ -343,6 +368,92 @@ smartproxy_is_validating {1 if proxy_manager.is_validating else 0}
             current_time += timedelta(minutes=interval)
 
         return jsonify(results)
+
+    @app.route("/api/stats/overview", methods=["GET"])
+    def get_stats_overview_route():
+        date_str = request.args.get("date")
+        interval = request.args.get("interval", "10", type=int)
+        if not date_str:
+            return jsonify({"error": "'date' query parameter is required."}), 400
+
+        valid_intervals = [2, 5, 10, 30, 60]
+        if interval not in valid_intervals:
+            return jsonify({"error": f"'interval' must be one of {valid_intervals}."}), 400
+
+        try:
+            start_date = datetime.strptime(date_str, "%Y-%m-%d")
+        except ValueError:
+            return jsonify({"error": "Invalid date format. Use YYYY-MM-DD."}), 400
+
+        raw_overview = proxy_manager.db.get_overview_stats(date_str, interval)
+        daily_rows = raw_overview.get("daily", []) if raw_overview else []
+        timeseries_rows = raw_overview.get("timeseries", []) if raw_overview else []
+
+        daily_by_source = {}
+        for row in daily_rows:
+            total_success = row["total_success"] or 0
+            total_failure = row["total_failure"] or 0
+            total = total_success + total_failure
+            daily_by_source[row["source_name"]] = {
+                "total_requests": total,
+                "total_success": total_success,
+                "success_rate": round((total_success / total * 100) if total > 0 else 0, 2),
+            }
+
+        timeseries_by_source = {}
+        for row in timeseries_rows:
+            source_name = row["source_name"]
+            interval_start = row["interval_start"]
+            success = row["success"] or 0
+            failure = row["failure"] or 0
+            total = success + failure
+            timeseries_by_source.setdefault(source_name, {})[
+                interval_start.strftime("%H:%M")
+            ] = {
+                "success_rate": round((success / total * 100) if total > 0 else 0, 2),
+                "total_requests": total,
+                "success_count": success,
+            }
+
+        configured_sources = sorted(list(proxy_manager.dashboard_sources))
+        observed_sources = sorted(set(daily_by_source) | set(timeseries_by_source))
+        source_names = observed_sources or configured_sources
+
+        time_slots = []
+        current_time = start_date
+        end_time = start_date + timedelta(days=1)
+        while current_time < end_time:
+            time_slots.append(current_time.strftime("%H:%M"))
+            current_time += timedelta(minutes=interval)
+
+        sources_payload = []
+        for source_name in source_names:
+            source_points = timeseries_by_source.get(source_name, {})
+            sources_payload.append(
+                {
+                    "source": source_name,
+                    "daily": daily_by_source.get(
+                        source_name,
+                        {"total_requests": 0, "total_success": 0, "success_rate": 0},
+                    ),
+                    "timeseries": [
+                        {
+                            "time": time_key,
+                            **source_points.get(
+                                time_key,
+                                {
+                                    "success_rate": 0,
+                                    "total_requests": 0,
+                                    "success_count": 0,
+                                },
+                            ),
+                        }
+                        for time_key in time_slots
+                    ],
+                }
+            )
+
+        return jsonify({"sources": sources_payload})
 
     @app.route("/", defaults={"path": ""})
     @app.route("/<path:path>")

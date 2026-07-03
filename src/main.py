@@ -4,6 +4,7 @@ import sys
 import argparse
 import signal
 import threading
+import configparser
 from concurrent.futures import as_completed
 
 # Local imports
@@ -13,6 +14,14 @@ from src.api.server import create_app
 
 # --- Configuration ---
 CONFIG_FILE_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config", "config.ini")
+
+
+def configure_logging_from_file(config_path: str, level: str):
+    config = configparser.ConfigParser()
+    config.read(config_path, encoding="utf-8")
+    log_dir = config.get("logging", "log_dir", fallback="./.local/logs")
+    log_file_base_name = config.get("logging", "log_file_base_name", fallback="proxy")
+    setup_logging(level, log_dir=log_dir, log_file_base_name=log_file_base_name)
 
 def load_proxy_manager(config_path: str) -> ProxyManager:
     logger.info("Initializing ProxyManager...")
@@ -69,13 +78,12 @@ def main():
     parser.add_argument("--debug", action="store_true", help="Enable debug logging for validation")
     args = parser.parse_args()
     
-    # Setup logging (if not already handled, usually good to ensure base logging)
+    # Setup logging from config after CLI flags are known. The logger module has a
+    # project-local import-time default so tests and direct imports remain safe.
+    log_level = "DEBUG" if args.debug else "INFO"
+    configure_logging_from_file(CONFIG_FILE_PATH, log_level)
     if args.debug:
-        setup_logging("DEBUG")
         logger.info("Debug mode enabled - verbose validation logging active")
-    else:
-        # Default logging (INFO is usually default in logger.py)
-        pass
 
     # Suppress Werkzeug's default access logs for per-request noise reduction
     import logging

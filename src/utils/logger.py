@@ -12,29 +12,26 @@ daily rotating file with compression and retention policies.
 
 import sys
 import os
+from pathlib import Path
 from loguru import logger
 
 # --- Configuration ---
-# You can easily configure the log directory and base filename here.
-LOG_DIR = "/usr/local/var/log"
-LOG_FILE_BASE_NAME = "proxy"
-# The full path template for the log file. {time} is automatically replaced by Loguru.
-LOG_FILE_PATH = os.path.join(LOG_DIR, f"{LOG_FILE_BASE_NAME}_{{time:YYYY-MM-DD}}.log")
-
-# --- Ensure Log Directory Exists ---
-# Note: Ensure the application has write permissions for the specified LOG_DIR.
-try:
-    os.makedirs(LOG_DIR, exist_ok=True)
-except PermissionError:
-    sys.stderr.write(
-        f"Error: Permission denied to create log directory: {LOG_DIR}\n"
-        "Please check directory permissions or run with appropriate privileges.\n"
-    )
-    sys.exit(1)
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_LOG_DIR = PROJECT_ROOT / ".local" / "logs"
+DEFAULT_LOG_FILE_BASE_NAME = "proxy"
 
 
+def _resolve_log_dir(log_dir=None) -> Path:
+    if not log_dir:
+        return DEFAULT_LOG_DIR
 
-def setup_logging(level="INFO"):
+    path = Path(log_dir).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return path.resolve()
+
+
+def setup_logging(level="INFO", log_dir=None, log_file_base_name=None):
     """
     Configures the logger with the specified log level.
     """
@@ -58,19 +55,32 @@ def setup_logging(level="INFO"):
         )
 
     # --- Configure File Log Handler ---
-    # This handler writes logs to a file and manages rotation, retention, and compression.
-    logger.add(
-        LOG_FILE_PATH,  # Sink: path to the log file
-        level=level,  # Log level
-        format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}",
-        rotation="00:00",  # Rotate the log file at midnight every day
-        retention="3 days",  # Keep logs for the last 7 days
-        compression="zip",  # Compress old log files into .zip format
-        encoding="utf-8",  # File encoding
-        enqueue=True,  # Make logging asynchronous to prevent blocking the main thread
-        backtrace=True,  # Include full stack trace in exception logs
-        diagnose=True,  # Add extended diagnostic information for exceptions
-    )
+    # Keep logs inside the project by default so imports and tests do not require
+    # system-level write permissions.
+    base_name = log_file_base_name or DEFAULT_LOG_FILE_BASE_NAME
+    resolved_log_dir = _resolve_log_dir(log_dir)
+    log_file_path = resolved_log_dir / f"{base_name}_{{time:YYYY-MM-DD}}.log"
+
+    try:
+        resolved_log_dir.mkdir(parents=True, exist_ok=True)
+        logger.add(
+            str(log_file_path),  # Sink: path to the log file
+            level=level,  # Log level
+            format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}",
+            rotation="00:00",  # Rotate the log file at midnight every day
+            retention="3 days",  # Keep logs for the last 3 days
+            compression="zip",  # Compress old log files into .zip format
+            encoding="utf-8",  # File encoding
+            enqueue=True,  # Make logging asynchronous to prevent blocking the main thread
+            backtrace=True,  # Include full stack trace in exception logs
+            diagnose=True,  # Add extended diagnostic information for exceptions
+        )
+    except OSError as exc:
+        logger.warning(
+            "File logging disabled: cannot write to {} ({})",
+            resolved_log_dir,
+            exc,
+        )
     
     logger.info(f"Logger configured with level: {level}")
 

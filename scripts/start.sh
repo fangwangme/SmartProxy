@@ -5,7 +5,7 @@
 
 # 获取项目根目录（脚本所在目录的父目录）
 PROJECT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." && pwd )"
-LOG_DIR="/usr/local/var/log"
+LOG_DIR="$PROJECT_DIR/.local/logs"
 LOG_FILE="$LOG_DIR/proxy_$(date +%Y-%m-%d).log"
 PID_FILE="$PROJECT_DIR/.smart_proxy.pid"
 PORT=6942
