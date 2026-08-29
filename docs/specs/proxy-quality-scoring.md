@@ -106,11 +106,32 @@ so it collects no feedback and has nothing to recover *with*, apart from the
 7 days it started at, because a week below baseline for a single failure is
 punitive enough to recreate the exile this system exists to prevent.
 
+Two things have to hold for that sentence to be true, and both are easy to break
+by accident:
+
+- **The cumulative counters are not a fallback for an expired window.**
+  `success_count` / `failure_count` never expire. Reading them when the window
+  has emptied re-applies the very result `elo_max_result_age_hours` just forgave,
+  and a single failure then decays asymptotically toward 50 without ever
+  arriving — 40.3 at 49 hours with the shipped half-life. So the scorer
+  distinguishes *never observed* (fall back to the counters; a stat restored
+  from an old backup has nothing else) from *observed, then aged out* (return
+  the 50 baseline outright).
+- **Expiry and exploration eligibility use one definition.** The exploration
+  budget is the only way back for a proxy scoring below the baseline, so if it
+  asks "does this proxy have a result?" while the scorer asks "does it have a
+  result that still counts?", a proxy is exiled by evidence the scorer has
+  already discarded. `_unexpired_results()` is that single definition, and both
+  call it.
+
 Note the recovery curve has a discontinuity at that threshold (the result is
 dropped outright rather than fading out). Smoothing it would mean blending the
 whole score toward 50 by evidence weight, which measurably pushes a 48-of-50
 proxy below the 90-point target above — i.e. it requires re-tuning the
 component weights, not just adding a blend. Deliberately not done.
+
+The measured curve for one failure at the shipped defaults: 29.0 fresh, 31.7 at
+24h, 33.2 at 47h, 50.0 from 48h on.
 
 ### What this forbids
 
@@ -148,22 +169,27 @@ hard-deletion threshold would add a second, non-recoverable path with its own
 edge cases — and would interact badly with the decoupling in §1, because a
 transient run of client-side failures is not evidence that a proxy is dead.
 
-Reputation must also survive pool maintenance. When the stats pool exceeds its
-cap, eviction has to avoid two opposite mistakes:
+Reputation must also survive pool maintenance. **Eviction from the stats pool is
+reputation loss**, because the record does not survive it: `_sync_and_select_top_proxies`
+re-seeds any active proxy missing from the pool with `_get_new_proxy_stat()`, so
+an evicted-but-still-active proxy returns one cycle later as a pristine
+`score=50 / failure_count=0` candidate.
 
-- **Never evict by score.** A proxy dropped for scoring badly re-enters on the
-  next sync as a pristine `score=50 / failure_count=0` candidate and displaces
-  peers that still carry their record — laundering exactly the history the score
-  exists to remember.
-- **Never evict by staleness alone.** A freshly discovered *live* proxy has no
-  `last_feedback_ts` at all, so pure staleness ranks it below every *dead* proxy
-  that still carries an old timestamp. At the cap that quietly evicts the entire
-  live pool and `get_proxy()` starts returning `None`.
+That makes the eviction *order* the wrong thing to tune. Any order that can
+evict a live proxy launders a bad record on a two-sync delay — which is the same
+defect as evicting by score outright, just slower to observe. So:
 
-So the order is: live proxies are retained ahead of dead ones, and staleness
-decides only within a group. When the live set alone overflows the cap, a slice
-proportional to `exploration_ratio` is reserved for unproven live proxies, so
-incumbents cannot crowd out newcomers permanently.
+**Live proxies do not participate in the cap.** It applies to dead history
+alone, oldest feedback first. Dead history is the part that is safe to drop: a
+dead proxy that comes back has to pass validation again anyway, and until it
+does it cannot be handed out.
+
+The consequence is that `max_pool_size × stats_pool_max_multiplier` bounds
+retained *dead* history, not total memory — the live half tracks however many
+proxies are genuinely active. When the live set alone reaches the cap, all dead
+entries are dropped and a warning names the number, so the operator can raise
+`stats_pool_max_multiplier` or lower `max_pool_size` rather than silently
+trading away reputation.
 
 ---
 

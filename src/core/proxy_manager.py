@@ -37,6 +37,11 @@ MAX_PROTOCOL_LENGTH = 10
 MAX_IP_LENGTH = 45  # Matches the proxies.ip VARCHAR(45) column.
 MIN_PORT = 1
 MAX_PORT = 65535
+# A latency is a request duration in milliseconds; anything past a day is not
+# one. The bound exists so the value can be range-checked with pure integer
+# comparisons before math.isfinite() or any arithmetic converts it to a float -
+# a JSON body may legally carry 10**400, and float(10**400) raises OverflowError.
+MAX_LATENCY_MS = 24 * 60 * 60 * 1000
 
 FAILED_STATUS_CODES = {
     0,
@@ -299,7 +304,7 @@ class ProxyManager:
         self.elo_max_result_age_hours = max(
             0.1,
             self.config.getfloat(
-                "source_pool", "elo_max_result_age_hours", fallback=168.0
+                "source_pool", "elo_max_result_age_hours", fallback=48.0
             ),
         )
         # Beta prior on the observed success rate. It shrinks small samples
@@ -462,10 +467,18 @@ class ProxyManager:
             old_config = self.config
             attribute_snapshot = dict(self.__dict__)
             old_predefined_sources_before_reload = self.predefined_sources.copy()
+            old_job_names = {job["name"] for job in self.fetcher_jobs}
 
             self.config = new_config
             try:
                 self._load_config()
+                # Parsed inside the protected block, assigned outside it.
+                # _load_fetcher_jobs() calls int() on update_interval_minutes,
+                # so a typo in one [proxy_source_*] section raises here - after
+                # _load_config() has already committed ~40 tunables. Leaving the
+                # assignment out here is what keeps a failure from producing the
+                # new-tunables / old-jobs hybrid that README rules out.
+                new_fetcher_jobs = self._load_fetcher_jobs()
             except Exception as e:
                 self.__dict__.update(attribute_snapshot)
                 self.config = old_config
@@ -479,8 +492,7 @@ class ProxyManager:
 
             self.check_config_drift()
 
-            old_job_names = {job["name"] for job in self.fetcher_jobs}
-            self.fetcher_jobs = self._load_fetcher_jobs()
+            self.fetcher_jobs = new_fetcher_jobs
             new_job_names = {job["name"] for job in self.fetcher_jobs}
             added_jobs = list(new_job_names - old_job_names)
             removed_jobs = list(old_job_names - new_job_names)
@@ -629,11 +641,20 @@ class ProxyManager:
         # on the whole execute_values batch, taking every valid row with it.
         # The ip column is VARCHAR(45) - exactly max IPv6 length - so the schema
         # already intends literals, not hostnames.
-        if ip.startswith("[") and ip.endswith("]"):
-            ip = ip[1:-1]
+        host = ip[1:-1] if ip.startswith("[") and ip.endswith("]") else ip
         try:
-            ipaddress.ip_address(ip)
+            parsed_ip = ipaddress.ip_address(host)
         except ValueError:
+            return None
+
+        # An IPv6 literal must keep its brackets. The stored value is
+        # interpolated straight into "{protocol}://{ip}:{port}" by the
+        # validator, by get_active_proxies() and by the API, and without them
+        # "http://2001:db8::1:8080" has no parseable port - yarl rejects it, so
+        # the proxy can be neither validated nor handed out. Normalising here,
+        # at the only writer, keeps every one of those call sites correct.
+        ip = f"[{host}]" if parsed_ip.version == 6 else host
+        if len(ip) > MAX_IP_LENGTH:
             return None
 
         try:
@@ -1102,9 +1123,44 @@ class ProxyManager:
         """
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             return None
-        if not math.isfinite(value) or value < 0:
+        # Integer comparisons first: they are exact for arbitrarily large ints,
+        # whereas math.isfinite() would already have raised OverflowError.
+        if value < 0 or value > MAX_LATENCY_MS:
+            return None
+        # NaN escapes both comparisons above, so it still needs the finite check.
+        if not math.isfinite(value):
             return None
         return int(value)
+
+    def _unexpired_results(self, stat: Dict) -> List:
+        """
+        The results inside the scoring window that have not aged out yet.
+
+        Single source of truth for "does this proxy have evidence against it".
+        _calculate_elo_score and _maybe_select_exploration_candidate must agree:
+        if a stale failure no longer counts against the score, it must not keep
+        the proxy out of the exploration budget either, or the proxy is exiled
+        by a result the scorer has already forgiven and has no way to earn its
+        way back - the exact failure mode this pool exists to prevent.
+
+        Entries are filtered, never deleted: the raw list is what tells
+        _calculate_elo_score the difference between "never observed" (neutral
+        50) and "observed, then aged out" (back to 50 by the recovery rule).
+        """
+        recent = stat.get("recent_results", [])[-self.elo_scoring_window :]
+        if not self.elo_time_decay_enabled or not recent:
+            return recent
+
+        now_ts = time.time()
+        max_age_seconds = self.elo_max_result_age_hours * 3600
+        return [
+            r
+            for r in recent
+            if isinstance(r, list)
+            and len(r) >= 3
+            and isinstance(r[0], (int, float))
+            and now_ts - r[0] <= max_age_seconds
+        ]
 
     @staticmethod
     def _feedback_ts(stat: Dict) -> float:
@@ -1113,24 +1169,23 @@ class ProxyManager:
 
     def _truncate_stats_pool(self, source: str, stats_pool: Dict[str, Dict]) -> Dict[str, Dict]:
         """
-        Cap the stats pool, keeping live proxies first and evicting by staleness.
+        Cap the stats pool by evicting dead history only.
 
-        Two failure modes have to be avoided at once:
+        Eviction is reputation loss, because the record does not survive it:
+        _sync_and_select_top_proxies re-seeds any active proxy missing from the
+        pool with _get_new_proxy_stat(), so an evicted-but-still-active proxy
+        returns one cycle later as a pristine score=50 / failure_count=0
+        candidate. Whatever the eviction order is, if a live proxy can be
+        evicted at all then a bad record can be laundered by waiting two syncs -
+        which is the failure this pool exists to prevent.
 
-        1. Evicting by score launders reputation - a proxy with a long failure
-           history is dropped, then re-enters on the next sync as a pristine
-           score=50 / failure_count=0 candidate and displaces peers that still
-           carry their record.
-        2. Evicting purely by staleness starves the pool of live proxies - a
-           freshly discovered active proxy has no last_feedback_ts at all, so it
-           ranks below every dead proxy that still carries an old timestamp. At
-           the cap that silently evicts the entire live pool and get_proxy()
-           starts returning None.
-
-        So: live proxies are retained ahead of dead ones, and only within a
-        group does staleness decide. When even the live set overflows the cap, a
-        slice proportional to exploration_ratio is reserved for unproven live
-        proxies so they cannot be crowded out by incumbents forever.
+        So live proxies do not participate in the cap. It applies to dead
+        history alone, oldest feedback first; that is the part which is safe to
+        drop, because a dead proxy that comes back has to pass validation again
+        anyway. The cap therefore bounds retained *dead* history, not total
+        memory: the live half tracks however many proxies are genuinely active,
+        and the pool logs a warning when that alone exceeds the configured size
+        so the operator can raise it or lower max_pool_size.
         """
         max_stats_size = self.max_pool_size * self.stats_pool_max_multiplier
         if len(stats_pool) <= max_stats_size:
@@ -1140,26 +1195,29 @@ class ProxyManager:
         for item in stats_pool.items():
             (live if item[0] in self.active_proxies else dead).append(item)
 
-        by_staleness = lambda item: (self._feedback_ts(item[1]), float(item[1].get("score", 0.0)))
-
-        if len(live) <= max_stats_size:
-            retained = sorted(live, key=by_staleness, reverse=True)
-            remaining = max_stats_size - len(retained)
-            if remaining > 0:
-                retained += sorted(dead, key=by_staleness, reverse=True)[:remaining]
+        room_for_dead = max_stats_size - len(live)
+        if room_for_dead <= 0:
+            retained = live
+            logger.warning(
+                f"Stats pool for source '{source}' holds {len(live)} live proxies, "
+                f"at or above the configured limit of {max_stats_size} "
+                f"(max_pool_size x stats_pool_max_multiplier). Dropping all "
+                f"{len(dead)} dead entries and keeping every live one: evicting a "
+                f"live proxy would reset its failure history on the next sync. "
+                f"Raise stats_pool_max_multiplier or lower max_pool_size."
+            )
         else:
-            proven = [i for i in live if self._feedback_ts(i[1]) > 0]
-            unproven = [i for i in live if self._feedback_ts(i[1]) == 0]
-            reserve = min(len(unproven), max(1, int(max_stats_size * self.exploration_ratio)))
-            retained = sorted(proven, key=by_staleness, reverse=True)[: max_stats_size - reserve]
-            retained += unproven[: max_stats_size - len(retained)]
-
-        logger.info(
-            f"Stats pool for source '{source}' exceeds limit "
-            f"({len(stats_pool)} > {max_stats_size}). Evicting "
-            f"{len(stats_pool) - len(retained)} proxies (dead first, then oldest "
-            f"feedback); {len(live)} live proxies in the pool."
-        )
+            by_staleness = lambda item: (
+                self._feedback_ts(item[1]),
+                float(item[1].get("score", 0.0)),
+            )
+            retained = live + sorted(dead, key=by_staleness, reverse=True)[:room_for_dead]
+            logger.info(
+                f"Stats pool for source '{source}' exceeds limit "
+                f"({len(stats_pool)} > {max_stats_size}). Evicting "
+                f"{len(dead) - room_for_dead} dead proxies (oldest feedback first); "
+                f"{len(live)} live proxies retained."
+            )
         return dict(retained)
 
     def _update_dashboard_sources(self):
@@ -1287,6 +1345,14 @@ class ProxyManager:
 
     def _backup_stats_locked(self) -> Dict:
         with self.lock:
+            # Snapshot the destination together with the data, and before the
+            # deep copy rather than after it - the copy is the slow part, and
+            # reload_sources() can move stats_backup_path at any point. The
+            # write is a mkstemp-next-to-target plus os.replace, so re-reading
+            # the attribute later would create the temp file beside the old path
+            # and then rename it onto the new one: that fails across directories
+            # and leaves neither file written.
+            backup_path = self.stats_backup_path
             # Deep copy: a shallow dict() still shares every stat dict and its
             # recent_results list with the live pool, which json.dump then walks
             # outside the lock while feedback threads mutate them.
@@ -1297,13 +1363,13 @@ class ProxyManager:
 
         try:
             # Create directory if it doesn't exist
-            self.stats_backup_path.parent.mkdir(parents=True, exist_ok=True)
+            backup_path.parent.mkdir(parents=True, exist_ok=True)
 
             # Atomic write: a crash or SIGKILL mid-dump would otherwise leave a
             # truncated file, and restore_stats() would drop all scoring state.
             tmp_fd, tmp_path = tempfile.mkstemp(
-                dir=str(self.stats_backup_path.parent),
-                prefix=self.stats_backup_path.name + ".",
+                dir=str(backup_path.parent),
+                prefix=backup_path.name + ".",
                 suffix=".tmp",
             )
             try:
@@ -1311,7 +1377,7 @@ class ProxyManager:
                     json.dump(stats_snapshot, f, ensure_ascii=False, indent=2)
                     f.flush()
                     os.fsync(f.fileno())
-                os.replace(tmp_path, self.stats_backup_path)
+                os.replace(tmp_path, backup_path)
             except Exception:
                 if os.path.exists(tmp_path):
                     os.unlink(tmp_path)
@@ -1320,11 +1386,11 @@ class ProxyManager:
             total_proxies = sum(len(proxies) for proxies in stats_snapshot["source_stats"].values())
             logger.info(
                 f"Stats backup completed: {len(stats_snapshot['source_stats'])} sources, "
-                f"{total_proxies} proxy stats saved to {self.stats_backup_path}"
+                f"{total_proxies} proxy stats saved to {backup_path}"
             )
             return {
                 "status": "success",
-                "path": str(self.stats_backup_path),
+                "path": str(backup_path),
                 "sources": len(stats_snapshot["source_stats"]),
                 "total_proxies": total_proxies,
             }
@@ -1482,10 +1548,13 @@ class ProxyManager:
 
         # Exploration candidates come from the whole stats pool, not the top
         # pool, but must still be alive (see the active_proxies gate in sync).
+        # "Unproven" means no result that still counts - not merely an empty
+        # raw list. A proxy whose only result has aged out is scored as untried
+        # (see _calculate_elo_score), so it has to be explorable as untried too.
         unproven = [
             proxy_url
             for proxy_url, stat in stats_pool.items()
-            if proxy_url in self.active_proxies and not stat.get("recent_results")
+            if proxy_url in self.active_proxies and not self._unexpired_results(stat)
         ]
         if not unproven:
             return None
@@ -1741,25 +1810,26 @@ class ProxyManager:
         - 50/50 failures:    ~2
         - 35% success rate:  ~32     (below the untried baseline)
         """
-        # Use configurable window size
         window_size = self.elo_scoring_window
-
-        recent = stat.get("recent_results", [])[-window_size:]
         now_ts = time.time()
 
-        if self.elo_time_decay_enabled and recent:
-            max_age_seconds = self.elo_max_result_age_hours * 3600
-            recent = [
-                r
-                for r in recent
-                if isinstance(r, list)
-                and len(r) >= 3
-                and isinstance(r[0], (int, float))
-                and now_ts - r[0] <= max_age_seconds
-            ]
+        raw_recent = stat.get("recent_results", [])[-window_size:]
+        recent = self._unexpired_results(stat)
+
+        if not recent and raw_recent:
+            # Observed, then aged out. The cumulative success_count /
+            # failure_count counters below are NOT a fallback here: they never
+            # expire, so reading them would re-apply the very result that
+            # elo_max_result_age_hours just forgave and leave a single failure
+            # decaying asymptotically toward 50 without ever arriving. The
+            # recovery contract in docs/specs/proxy-quality-scoring.md is that
+            # the proxy returns to the untried baseline, so return it.
+            return 50.0
 
         if not recent:
-            # No recent data, use historical if available
+            # Never had a windowed result: fall back to the historical counters
+            # (a stat restored from an old backup, or one whose window was
+            # trimmed away) rather than to the neutral baseline.
             total = stat.get("success_count", 0) + stat.get("failure_count", 0)
             if total > 0:
                 success_rate = stat.get("success_count", 0) / total

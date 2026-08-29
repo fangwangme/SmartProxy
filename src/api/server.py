@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-import math
 import os
 import sys
 import argparse
@@ -12,7 +11,7 @@ from typing import Optional
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 from src.utils.logger import logger, setup_logging
-from src.core.proxy_manager import ProxyManager
+from src.core.proxy_manager import ProxyManager, MAX_LATENCY_MS
 
 LOCALHOST_IPS = {"127.0.0.1", "::1"}
 INTERNAL_ONLY_ENDPOINTS = {"/health", "/metrics", "/reload-sources", "/backup-stats"}
@@ -238,14 +237,24 @@ smartproxy_is_validating {1 if proxy_manager.is_validating else 0}
                 ),
                 400,
             )
-        if resp_time is not None:
-            if type(resp_time) not in (int, float) or not math.isfinite(resp_time) or resp_time < 0:
-                return (
-                    jsonify(
-                        {"error": "'response_time_ms' must be a finite, non-negative number."}
-                    ),
-                    400,
-                )
+        # One normalizer for both entry points. The API and restore_stats() feed
+        # the same recent_results window, so a value the API waves through is a
+        # value that will be replayed out of a backup later; they must agree on
+        # what a latency is. It also keeps math.isfinite() off unbounded ints -
+        # a body carrying 10**400 would otherwise raise OverflowError here and
+        # turn a bad request into a 500.
+        if resp_time is not None and ProxyManager._coerce_latency(resp_time) is None:
+            return (
+                jsonify(
+                    {
+                        "error": (
+                            "'response_time_ms' must be a finite, non-negative "
+                            f"number of milliseconds no greater than {MAX_LATENCY_MS}."
+                        )
+                    }
+                ),
+                400,
+            )
         if failure_kind is not None and not isinstance(failure_kind, str):
             return jsonify({"error": "'failure_kind' must be a string."}), 400
         if not proxy_manager.is_valid_feedback_status(status_code):

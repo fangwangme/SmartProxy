@@ -160,10 +160,14 @@ The service is configured via the config.ini file.
   * elo\_prior\_successes / elo\_prior\_failures: Beta prior that shrinks small samples toward the neutral score.  
   * rescore\_on\_sync\_enabled: Recompute every score during pool sync so time decay applies to idle proxies.  
   * ELO window/decay settings and latency scoring thresholds (`elo_max_window`, `elo_scoring_window`, `elo_decay_half_life_hours`, `elo_max_result_age_hours`, `latency_full_score_ms`, `latency_zero_score_ms`).  
+  * elo\_max\_result\_age\_hours: How long one bad result costs a proxy its traffic. Past this age the result stops counting entirely and the proxy returns to the neutral baseline, so this is the real knob for failure recovery. Defaults to 48.  
+  * max\_pool\_size x stats\_pool\_max\_multiplier: The cap on retained **dead** proxy history - not on total memory. Proxies that passed the latest validation are never evicted, because evicting one would reset its failure history to zero on the next sync, so the stats pool grows with the number of genuinely active proxies. If the live set alone reaches the cap, all dead history is dropped and a warning is logged.  
 * **\[proxy\_source\_\*\]**: Define your proxy sources here. Each source should have its own section (e.g., \[proxy\_source\_freeproxies\]).  
   * url: The URL to fetch the proxy list from.  
   * update\_interval\_minutes: How often to fetch from this source.  
   * default\_protocol: The protocol (http, https etc.) if not specified in the source file.
+
+Proxy list lines are parsed into `(protocol, ip, port)` and `ip` must be an IP literal, not a hostname. IPv6 literals are stored bracketed (`[2001:db8::1]`) whether or not the source list brackets them, so the `protocol://ip:port` URL built from them everywhere downstream still has a parseable port.
 
 ## **API Documentation**
 
@@ -195,7 +199,7 @@ Submits feedback on a proxy's performance. This is crucial for the scoring syste
   * source (string, required): The source pool the proxy belongs to.  
   * proxy (string, required): The full proxy URL (e.g., http://1.2.3.4:8080).  
   * status (integer, required): 0 and 4 are legacy failures; 1/2/3 and HTTP 1xx-3xx are successes; HTTP 4xx-5xx are failures; other values are rejected.  
-  * response\_time\_ms (integer, optional): The response time in milliseconds for successful requests. Lower times result in a higher score bonus.  
+  * response\_time\_ms (integer, optional): The response time in milliseconds for successful requests. Lower times result in a higher score bonus. Must be finite, non-negative, and no larger than one day in milliseconds (86400000); anything else is rejected with a 400.  
   * failure\_kind (string, optional): One of `timeout`, `proxy_error`, `dead`, `blocked`, `slow`, or `content_error`. `dead` applies the failure to every source where that proxy is tracked; other kinds affect only the reported source.
 * **Success Response (200)**:  
 
@@ -209,7 +213,7 @@ Triggers a hot-reload of config.ini. Every tunable is re-read - `[source_pool]`,
 
 The reload is **authoritative**: the file is re-parsed into a fresh parser, so a key or a whole `[proxy_source_*]` section you delete from the file is genuinely dropped and reverts to its built-in default, rather than keeping its old in-memory value.
 
-It is also **transactional**: the new configuration is applied as a unit. If any value fails to parse, the service rolls back to the configuration it was running and returns an error, instead of being left on a mix of old and new settings.
+It is also **transactional**: the new configuration is applied as a unit. If any value fails to parse - including an `update_interval_minutes` in a `[proxy_source_*]` section, which is parsed separately from the tunables - the service rolls back to the configuration it was running and returns an error, instead of being left on a mix of old and new settings.
 
 Three settings are **not** reloadable, because they are consumed once at startup: the `[database]` connection pool, `[server] port`, and `[logging]`. Changing any of them requires a restart; the response lists them under `restart_required_for`.
 
