@@ -1735,6 +1735,62 @@ class TestValidationQueueSQL(unittest.TestCase):
         self.assertNotIn("1/", logged)
 
 
+class TestStatsQueryIndexability(unittest.TestCase):
+    """
+    The stats queries filtered on DATE(minute), which is not indexable, and the
+    schema's matching functional index could not even be created (DATE() on a
+    TIMESTAMPTZ is not IMMUTABLE, so database_setup.sql aborted there).
+    """
+
+    def setUp(self):
+        with patch("src.database.db.psycopg2.pool.ThreadedConnectionPool"):
+            config = configparser.ConfigParser()
+            config.read_dict({"database": {"host": "h", "port": "5432", "dbname": "d",
+                                           "user": "u", "password": "p"}})
+            self.db = DatabaseManager(config)
+
+    def _capture(self, call):
+        with patch.object(self.db, "_execute", return_value=[]) as execute:
+            call()
+        return execute.call_args
+
+    def test_no_stats_query_filters_on_a_function_call(self):
+        calls = [
+            lambda: self.db.get_daily_stats("s", "2026-08-29"),
+            lambda: self.db.get_timeseries_stats("s", "2026-08-29", 10),
+            lambda: self.db.get_overview_stats("2026-08-29", 10),
+        ]
+        for call in calls:
+            with self.subTest(call=call):
+                query = " ".join(self._capture(call)[0][0].split())
+                self.assertNotIn("DATE(minute)", query)
+                self.assertIn("minute >=", query)
+                self.assertIn("minute <", query)
+
+    def test_daily_stats_binds_the_date_twice(self):
+        args = self._capture(lambda: self.db.get_daily_stats("s", "2026-08-29"))
+        self.assertEqual(args[0][1], ("s", "2026-08-29", "2026-08-29"))
+
+    def test_overview_daily_binds_the_date_twice(self):
+        with patch.object(self.db, "_execute", return_value=[]) as execute:
+            self.db.get_overview_stats("2026-08-29", 10)
+        self.assertEqual(execute.call_args_list[0][0][1], ("2026-08-29", "2026-08-29"))
+
+    def test_schema_index_is_immutable(self):
+        """database_setup.sql must not reference DATE() in an index expression."""
+        schema = (Path(__file__).resolve().parents[1] / "config" / "database_setup.sql").read_text(
+            encoding="utf-8"
+        )
+        index_lines = [
+            line for line in schema.splitlines()
+            if line.strip().upper().startswith("CREATE INDEX")
+        ]
+        self.assertTrue(index_lines)
+        for line in index_lines:
+            with self.subTest(line=line):
+                self.assertNotIn("DATE(", line.upper())
+
+
 class TestDatabaseManager(unittest.TestCase):
     """Test DatabaseManager methods with mocked psycopg2."""
 

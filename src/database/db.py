@@ -297,8 +297,18 @@ class DatabaseManager:
                 self.pool.putconn(conn)
 
     def get_daily_stats(self, source: str, date: str):
-        query = "SELECT COALESCE(SUM(success_count), 0) as total_success, COALESCE(SUM(failure_count), 0) as total_failure FROM source_stats_by_minute WHERE source_name = %s AND DATE(minute) = %s;"
-        return self._execute(query, (source, date), fetch="one")
+        # Range predicate rather than DATE(minute) = %s: the function call is
+        # not indexable, so the old form forced a bitmap heap scan and filtered
+        # every row of the source. Semantics are unchanged -- both forms resolve
+        # the date boundary in the session TimeZone.
+        query = """
+            SELECT COALESCE(SUM(success_count), 0) as total_success,
+                   COALESCE(SUM(failure_count), 0) as total_failure
+            FROM source_stats_by_minute
+            WHERE source_name = %s
+              AND minute >= %s::date AND minute < %s::date + 1;
+        """
+        return self._execute(query, (source, date, date), fetch="one")
 
     def get_timeseries_stats(self, source: str, date: str, interval_minutes: int):
         query = """
@@ -307,7 +317,8 @@ class DatabaseManager:
                 SUM(success_count) as success,
                 SUM(failure_count) as failure
             FROM source_stats_by_minute
-            WHERE source_name = %(source)s AND DATE(minute) = %(date)s
+            WHERE source_name = %(source)s
+              AND minute >= %(date)s::date AND minute < %(date)s::date + 1
             GROUP BY interval_start ORDER BY interval_start;
         """
         return self._execute(
@@ -323,7 +334,7 @@ class DatabaseManager:
                 COALESCE(SUM(success_count), 0) as total_success,
                 COALESCE(SUM(failure_count), 0) as total_failure
             FROM source_stats_by_minute
-            WHERE DATE(minute) = %s
+            WHERE minute >= %s::date AND minute < %s::date + 1
             GROUP BY source_name
             ORDER BY source_name;
         """
@@ -334,11 +345,11 @@ class DatabaseManager:
                 SUM(success_count) as success,
                 SUM(failure_count) as failure
             FROM source_stats_by_minute
-            WHERE DATE(minute) = %(date)s
+            WHERE minute >= %(date)s::date AND minute < %(date)s::date + 1
             GROUP BY source_name, interval_start
             ORDER BY source_name, interval_start;
         """
-        daily_rows = self._execute(daily_query, (date,), fetch="all")
+        daily_rows = self._execute(daily_query, (date, date), fetch="all")
         if daily_rows is None:
             return None
 

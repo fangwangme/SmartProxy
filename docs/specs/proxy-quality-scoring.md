@@ -92,6 +92,26 @@ The rule that ties these together: a small sample must land strictly between the
 untried baseline and a proven proxy. Never below (that removes the incentive to
 try anything new), never above (that hands the pool to noise).
 
+### Recovery from a single failure
+
+The mirror image of "one success must not crown" is "one failure must not
+exile". A single fresh failure scores ~29, climbs slowly as the result decays,
+and returns to the 50 baseline once the result passes
+`elo_max_result_age_hours`.
+
+That threshold is therefore the real knob for how long one bad result costs a
+proxy its traffic — while it sits below the baseline it is outside the top pool,
+so it collects no feedback and has nothing to recover *with*, apart from the
+`exploration_ratio` budget. The shipped default is 48 hours rather than the
+7 days it started at, because a week below baseline for a single failure is
+punitive enough to recreate the exile this system exists to prevent.
+
+Note the recovery curve has a discontinuity at that threshold (the result is
+dropped outright rather than fading out). Smoothing it would mean blending the
+whole score toward 50 by evidence weight, which measurably pushes a 48-of-50
+proxy below the 90-point target above — i.e. it requires re-tuning the
+component weights, not just adding a blend. Deliberately not done.
+
 ### What this forbids
 
 Making new proxies start low, or start at zero, or serve a probationary sentence
@@ -129,10 +149,21 @@ edge cases — and would interact badly with the decoupling in §1, because a
 transient run of client-side failures is not evidence that a proxy is dead.
 
 Reputation must also survive pool maintenance. When the stats pool exceeds its
-cap it is truncated by **staleness** (`last_feedback_ts`), never by score: a
-proxy evicted for scoring badly would re-enter on the next sync as a pristine
-`score=50 / failure_count=0` candidate and displace peers that still carry their
-record — laundering exactly the history the score exists to remember.
+cap, eviction has to avoid two opposite mistakes:
+
+- **Never evict by score.** A proxy dropped for scoring badly re-enters on the
+  next sync as a pristine `score=50 / failure_count=0` candidate and displaces
+  peers that still carry their record — laundering exactly the history the score
+  exists to remember.
+- **Never evict by staleness alone.** A freshly discovered *live* proxy has no
+  `last_feedback_ts` at all, so pure staleness ranks it below every *dead* proxy
+  that still carries an old timestamp. At the cap that quietly evicts the entire
+  live pool and `get_proxy()` starts returning `None`.
+
+So the order is: live proxies are retained ahead of dead ones, and staleness
+decides only within a group. When the live set alone overflows the cap, a slice
+proportional to `exploration_ratio` is reserved for unproven live proxies, so
+incumbents cannot crowd out newcomers permanently.
 
 ---
 
