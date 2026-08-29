@@ -8,6 +8,10 @@ PROJECT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." && pwd )"
 LOG_DIR="$PROJECT_DIR/.local/logs"
 LOG_FILE="$LOG_DIR/proxy_$(date +%Y-%m-%d).log"
 PID_FILE="$PROJECT_DIR/.smart_proxy.pid"
+# Always the project's own interpreter. A bare `python` resolves to whatever the
+# calling shell has activated - or to the system interpreter, which has none of
+# the dependencies installed.
+PYTHON="$PROJECT_DIR/.venv/bin/python"
 PORT=6942
 DEBUG_FLAG=""
 
@@ -18,10 +22,10 @@ backup_stats() {
     # 备份代理统计数据
     echo "Triggering stats backup..."
     if curl -s -X POST "http://localhost:$PORT/backup-stats" -o /tmp/backup_response.json 2>/dev/null; then
-        status=$(python -c "import json; d=json.load(open('/tmp/backup_response.json')); print(d.get('status', 'unknown'))" 2>/dev/null)
+        status=$("$PYTHON" -c "import json; d=json.load(open('/tmp/backup_response.json')); print(d.get('status', 'unknown'))" 2>/dev/null)
         if [ "$status" = "success" ]; then
-            sources=$(python -c "import json; d=json.load(open('/tmp/backup_response.json')); print(d.get('sources', 'N/A'))" 2>/dev/null)
-            proxies=$(python -c "import json; d=json.load(open('/tmp/backup_response.json')); print(d.get('total_proxies', 'N/A'))" 2>/dev/null)
+            sources=$("$PYTHON" -c "import json; d=json.load(open('/tmp/backup_response.json')); print(d.get('sources', 'N/A'))" 2>/dev/null)
+            proxies=$("$PYTHON" -c "import json; d=json.load(open('/tmp/backup_response.json')); print(d.get('total_proxies', 'N/A'))" 2>/dev/null)
             echo "Backup successful: $sources sources, $proxies proxies"
         else
             echo "Backup failed or service not responding"
@@ -42,11 +46,13 @@ start_server() {
     # 进入项目目录
     cd "$PROJECT_DIR"
 
-    # 检查是否激活了虚拟环境
-    if [ -z "$VIRTUAL_ENV" ]; then
+    # 检查项目虚拟环境是否存在（不要求当前 shell 已 activate）
+    if [ ! -x "$PYTHON" ]; then
         echo "=================================================="
-        echo " ERROR: Virtual environment not activated!"
-        echo " Please run: source .venv/bin/activate"
+        echo " ERROR: Project virtual environment not found!"
+        echo " Expected interpreter at: $PYTHON"
+        echo " Create it with: uv sync"
+        echo " (without uv: python3.14 -m venv .venv && .venv/bin/pip install -r requirements.txt)"
         echo "=================================================="
         return 1
     fi
@@ -60,7 +66,7 @@ start_server() {
     echo "=================================================="
 
     # 使用 setsid + nohup 完全脱离当前会话，避免父会话退出时子进程被连带终止
-    nohup setsid python -u -m src.main $DEBUG_FLAG </dev/null >> "$LOG_FILE" 2>&1 &
+    nohup setsid "$PYTHON" -u -m src.main $DEBUG_FLAG </dev/null >> "$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
 
     sleep 1

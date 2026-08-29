@@ -1,6 +1,6 @@
 ## Development Environment
 
-- Python: `source .venv/bin/activate`
+- Python: **3.14**, managed by **uv**. `uv sync` then run tools through `.venv/bin/...`
 - Node.js: `cd dashboard && bun install`
 
 ### Creating the Python `.venv`
@@ -11,13 +11,34 @@ main checkout's environment, and a venv copied or moved between paths breaks
 path). Create one in each checkout you work in:
 
 ```bash
-uv venv --python 3.12 .venv
-uv pip install -r requirements.txt --python .venv/bin/python
+uv sync
+```
+
+That reads `pyproject.toml` + `uv.lock` and creates `.venv` on the interpreter
+pinned in `.python-version`, installing uv's own 3.14 build if the machine has
+none. `uv lock` is the only thing that may change the resolution; `uv sync`
+never does.
+
+**Without uv**, the pip path still works:
+
+```bash
+python3.14 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+```
+
+`requirements.txt` is **generated** — it is the fully-pinned pip-compatible
+export of the lockfile, kept only so a machine without uv can install. Never
+hand-edit it. Dependencies are declared in `pyproject.toml`; after changing them
+run:
+
+```bash
+uv lock
+uv export --no-hashes --no-emit-project -o requirements.txt
 ```
 
 Run tools through `.venv/bin/...` (e.g. `.venv/bin/python -m pytest tests/ -q`)
-rather than relying on an activated shell, so the right interpreter is used
-regardless of which checkout the shell was activated in.
+rather than relying on an activated shell, or on a bare `python3` — that resolves
+to the system interpreter, not the project's, and it is the wrong one.
 
 If an existing `.venv` misbehaves, check whether it is stale before debugging
 anything else — `ls -l .venv/bin/python` pointing at a non-existent interpreter,

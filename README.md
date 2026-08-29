@@ -36,23 +36,41 @@ SmartProxy is a sophisticated proxy management system designed to provide reliab
 
 ### **Prerequisites**
 
-* Python 3.8+  
+* Python 3.14, managed with [uv](https://docs.astral.sh/uv/) (a plain `venv` + `pip` also works — see below)
 * PostgreSQL
 * Node.js / Bun (for Dashboard)
 
 ### **Backend Setup (Python)**
 
-1.  **Activate Virtual Environment**:
+1.  **Create the environment and install dependencies**:
 
     ```bash
-    source .venv/bin/activate
+    uv sync
     ```
 
-2.  **Install Dependencies** (if needed):
+    This reads `pyproject.toml` and `uv.lock` and builds `.venv` on the
+    interpreter pinned in `.python-version`, fetching that Python itself if the
+    machine does not have it.
+
+    Without uv, the pip path installs the same pinned set:
 
     ```bash
-    pip install -r requirements.txt
+    python3.14 -m venv .venv
+    .venv/bin/pip install -r requirements.txt
     ```
+
+    `requirements.txt` is generated from the lockfile (`uv export --no-hashes
+    --no-emit-project -o requirements.txt`) and exists only for that fallback —
+    declare dependencies in `pyproject.toml`, not there.
+
+2.  **Run commands through the venv**:
+
+    ```bash
+    .venv/bin/python -m pytest tests/ -q
+    ```
+
+    Prefer `.venv/bin/...` over activating the shell, so the project interpreter
+    is used regardless of the current shell state.
 
 3.  **Set up the database:**  
    * Ensure your PostgreSQL server is running.  
@@ -68,7 +86,7 @@ SmartProxy is a sophisticated proxy management system designed to provide reliab
 
 5.  **Run Application**:
     ```bash
-    python run.py
+    uv run run.py      # or: .venv/bin/python run.py
     ```
     *Or use the management script below.*
 

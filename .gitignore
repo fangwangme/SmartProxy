@@ -83,6 +83,9 @@ ipython_config.py
 
 # pyenv
 .python-version
+# ...but uv reads .python-version as the project's interpreter pin, and `uv sync`
+# is only reproducible if every checkout gets the same one. Tracked on purpose.
+!.python-version
 
 # pipenv
 #   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
