@@ -62,9 +62,14 @@ class DatabaseManager:
         try:
             conn = self.pool.getconn()
             with conn.cursor() as cur:
-                psycopg2.extras.execute_values(cur, query, proxies)
-                logger.info(f"Inserted {cur.rowcount}/ {len(proxies)} new proxies.")
+                # page_size defaults to 100, which turns a 5k-row insert into
+                # 50 round trips.
+                psycopg2.extras.execute_values(cur, query, proxies, page_size=1000)
                 conn.commit()
+                # NOTE: cursor.rowcount is deliberately not reported here.
+                # psycopg2 documents that after execute_values it "will not
+                # contain a total result" - it only reflects the last page.
+                logger.info(f"Committed {len(proxies)} proxy rows for insertion.")
         except Exception as e:
             logger.error(f"Database batch insert failed: {e}")
             if conn:
@@ -74,31 +79,99 @@ class DatabaseManager:
                 self.pool.putconn(conn)
 
     def get_proxies_to_validate(self, interval_minutes=30, limit=2000) -> List[Tuple]:
-        query = "SELECT id, protocol, ip, port FROM proxies WHERE last_validated_at IS NULL OR (is_active = true AND last_validated_at < NOW() - INTERVAL '%s minutes') LIMIT %s;"
-        return self._execute(query, (interval_minutes, limit), fetch="all") or []
-
-    def get_eligible_failed_proxies(
-        self, window_minutes: int, max_attempts: int, limit: int
-    ) -> List[Tuple]:
         """
-        Gets recently failed proxies that are eligible for re-validation based on the time window and attempt count.
+        Combined validation queue (never-validated + live proxies due for a
+        re-check).
+
+        Prefer get_new_proxies_to_validate / get_active_proxies_to_revalidate,
+        which let the caller budget the two populations explicitly. This method
+        is kept for callers that want one undifferentiated batch; the ORDER BY
+        at least makes which rows the LIMIT keeps deterministic instead of
+        whatever the planner returns first.
         """
         query = """
             SELECT id, protocol, ip, port
             FROM proxies
+            WHERE last_validated_at IS NULL
+               OR (is_active = true AND last_validated_at < NOW() - INTERVAL '%s minutes')
+            ORDER BY last_validated_at ASC NULLS FIRST, id ASC
+            LIMIT %s;
+        """
+        return self._execute(query, (interval_minutes, limit), fetch="all") or []
+
+    def get_new_proxies_to_validate(self, limit: int) -> List[Tuple]:
+        """Proxies that have never been validated, oldest discovery first."""
+        if limit <= 0:
+            return []
+        query = """
+            SELECT id, protocol, ip, port
+            FROM proxies
+            WHERE last_validated_at IS NULL
+            ORDER BY created_at ASC, id ASC
+            LIMIT %(limit)s;
+        """
+        return self._execute(query, {"limit": limit}, fetch="all") or []
+
+    def get_active_proxies_to_revalidate(
+        self, interval_minutes: int, limit: int
+    ) -> List[Tuple]:
+        """Live proxies whose liveness check has gone stale, oldest first."""
+        if limit <= 0:
+            return []
+        query = """
+            SELECT id, protocol, ip, port
+            FROM proxies
+            WHERE is_active = true
+              AND last_validated_at IS NOT NULL
+              AND last_validated_at < NOW() - INTERVAL '%(window)s minutes'
+            ORDER BY last_validated_at ASC, id ASC
+            LIMIT %(limit)s;
+        """
+        params = {"window": interval_minutes, "limit": limit}
+        return self._execute(query, params, fetch="all") or []
+
+    def get_eligible_failed_proxies(
+        self,
+        window_minutes: int,
+        max_attempts: int,
+        limit: int,
+        exclude_ids: Optional[List[int]] = None,
+    ) -> List[Tuple]:
+        """
+        Gets previously failed proxies that are eligible for re-validation based
+        on the time window and attempt count.
+
+        Ordering is ASC on last_validated_at: the proxies worth re-testing are
+        the ones nobody has touched in a while, not the ones that just failed
+        (batch_update_proxy_results stamps those with NOW()).
+
+        Rows with last_validated_at IS NULL are excluded - those have never been
+        validated and belong to get_new_proxies_to_validate. Including them here
+        made this query return candidates the main query had already claimed,
+        which were then deduplicated in Python *after* the SQL LIMIT had
+        already spent the budget on them.
+        """
+        if limit <= 0:
+            return []
+        query = """
+            SELECT id, protocol, ip, port
+            FROM proxies
             WHERE is_active = false
+            AND last_validated_at IS NOT NULL
             AND (
                 window_start_time IS NULL OR
                 NOW() > window_start_time + INTERVAL '%(window)s minutes' OR
                 validation_attempts_in_window < %(max_attempts)s
             )
-            ORDER BY last_validated_at DESC NULLS FIRST, created_at DESC
+            AND (%(exclude_ids)s::int[] IS NULL OR NOT (id = ANY(%(exclude_ids)s::int[])))
+            ORDER BY last_validated_at ASC, created_at ASC
             LIMIT %(limit)s;
         """
         params = {
             "window": window_minutes,
             "max_attempts": max_attempts,
             "limit": limit,
+            "exclude_ids": list(exclude_ids) if exclude_ids else None,
         }
         return self._execute(query, params, fetch="all") or []
 

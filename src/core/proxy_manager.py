@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 import os
 import configparser
+import copy
 import json
 import math
 import random
+import tempfile
 import threading
 import time
 import asyncio
@@ -24,6 +26,17 @@ except ImportError:  # pragma: no cover - dependency is declared in requirements
     ProxyConnector = None
 
 # --- Constants ---
+# Relative paths in config are resolved from here, not from the process CWD.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+CONFIG_EXAMPLE_PATH = PROJECT_ROOT / "config" / "config.example.ini"
+
+# Protocols accepted by the fetcher parser. The DB column is VARCHAR(10).
+VALID_PROXY_PROTOCOLS = {"http", "https", "socks4", "socks5"}
+MAX_PROTOCOL_LENGTH = 10
+MAX_IP_LENGTH = 45  # Matches the proxies.ip VARCHAR(45) column.
+MIN_PORT = 1
+MAX_PORT = 65535
+
 FAILED_STATUS_CODES = {
     0,
     4,
@@ -66,6 +79,12 @@ class ProxyManager:
         self.last_source_refresh_time = 0
 
         self._load_config()
+        self.check_config_drift()
+        logger.info(
+            "Stats backup path resolved to {} (exists: {}).",
+            self.stats_backup_path,
+            self.stats_backup_path.exists(),
+        )
         self._initialize_source_pools()
 
         self.fetcher_jobs = self._load_fetcher_jobs()
@@ -124,6 +143,18 @@ class ProxyManager:
         )
         self.validation_batch_limit = self.config.getint(
             "validator", "validation_batch_limit", fallback=2000
+        )
+        # Share of validation_batch_limit reserved for never-validated proxies.
+        # The rest goes to re-validating proxies that are currently alive, so a
+        # flood of freshly fetched proxies cannot starve the liveness re-checks.
+        self.validation_new_proxy_ratio = min(
+            1.0,
+            max(
+                0.0,
+                self.config.getfloat(
+                    "validator", "validation_new_proxy_ratio", fallback=0.5
+                ),
+            ),
         )
         self.validation_supplement_threshold = self.config.getint(
             "validator", "validation_supplement_threshold", fallback=1000
@@ -185,6 +216,18 @@ class ProxyManager:
         self.proxy_cooldown_ms = max(
             0, self.config.getint("source_pool", "proxy_cooldown_ms", fallback=0)
         )
+        # Share of get_proxy calls spent on proxies that have never been handed
+        # out, so newly discovered candidates can earn a ranking instead of
+        # being permanently stuck behind the incumbent top pool.
+        self.exploration_ratio = min(
+            1.0,
+            max(
+                0.0,
+                self.config.getfloat(
+                    "source_pool", "exploration_ratio", fallback=0.05
+                ),
+            ),
+        )
         self.selection_weight_floor = max(
             0.01,
             self.config.getfloat("source_pool", "selection_weight_floor", fallback=1.0),
@@ -223,8 +266,12 @@ class ProxyManager:
         self.stats_backup_interval_s = self.config.getint(
             "backup", "stats_backup_interval_seconds", fallback=3600  # 1 hour
         )
-        self.stats_backup_path = Path(
-            self.config.get("backup", "stats_backup_path", fallback="./.local/data/proxy_stats_backup.json")
+        self.stats_backup_path = self._resolve_project_path(
+            self.config.get(
+                "backup",
+                "stats_backup_path",
+                fallback="./.local/data/proxy_stats_backup.json",
+            )
         )
 
         # ELO scoring configuration
@@ -249,8 +296,97 @@ class ProxyManager:
                 "source_pool", "elo_max_result_age_hours", fallback=168.0
             ),
         )
+        # Beta prior on the observed success rate. It shrinks small samples
+        # toward the neutral 0.5 baseline so a single lucky observation cannot
+        # outrank a proxy with a full window of successes.
+        self.elo_prior_successes = max(
+            0.0,
+            self.config.getfloat("source_pool", "elo_prior_successes", fallback=2.0),
+        )
+        self.elo_prior_failures = max(
+            0.0,
+            self.config.getfloat("source_pool", "elo_prior_failures", fallback=2.0),
+        )
+        # Recompute every stat's score during pool sync so time decay actually
+        # applies to idle proxies instead of freezing their last score.
+        self.rescore_on_sync_enabled = self.config.getboolean(
+            "source_pool", "rescore_on_sync_enabled", fallback=True
+        )
 
         logger.info("Configuration loaded.")
+
+    @staticmethod
+    def _resolve_project_path(raw_path: str) -> Path:
+        """Resolve a config path against the project root, not the process CWD."""
+        path = Path(raw_path).expanduser()
+        if not path.is_absolute():
+            path = PROJECT_ROOT / path
+        return path.resolve()
+
+    def check_config_drift(self, example_path: Path = CONFIG_EXAMPLE_PATH) -> Dict:
+        """
+        Compare the live config against config.example.ini and warn about drift.
+
+        Silent config drift is how this service lost its scoring state for weeks:
+        keys that exist in the example but not in config.ini quietly fall back to
+        code defaults. Report them loudly at startup instead.
+        """
+        example = configparser.ConfigParser()
+        try:
+            if not example.read(example_path, encoding="utf-8"):
+                logger.warning(
+                    "Config drift check skipped: example config not found at {}",
+                    example_path,
+                )
+                return {"missing": [], "unknown": [], "checked": False}
+        except configparser.Error as e:
+            logger.warning("Config drift check skipped: cannot parse example: {}", e)
+            return {"missing": [], "unknown": [], "checked": False}
+
+        def _is_user_defined(section: str) -> bool:
+            # Proxy source sections are per-deployment; never diff them.
+            return section.startswith("proxy_source_")
+
+        missing: List[str] = []
+        unknown: List[str] = []
+
+        for section in example.sections():
+            if _is_user_defined(section):
+                continue
+            if not self.config.has_section(section):
+                missing.append(f"[{section}] (entire section)")
+                continue
+            for option in example.options(section):
+                if not self.config.has_option(section, option):
+                    missing.append(f"[{section}] {option}")
+
+        for section in self.config.sections():
+            if _is_user_defined(section) or not example.has_section(section):
+                continue
+            for option in self.config.options(section):
+                if not example.has_option(section, option):
+                    unknown.append(f"[{section}] {option}")
+
+        if missing:
+            logger.warning(
+                "Config drift: {} key(s) present in config.example.ini are missing from "
+                "the live config and fall back to code defaults.",
+                len(missing),
+            )
+            for entry in missing:
+                logger.warning("  [config-drift] missing: {}", entry)
+        if unknown:
+            logger.warning(
+                "Config drift: {} key(s) in the live config are absent from "
+                "config.example.ini (possibly deprecated).",
+                len(unknown),
+            )
+            for entry in unknown:
+                logger.warning("  [config-drift] unknown: {}", entry)
+        if not missing and not unknown:
+            logger.info("Config drift check passed: live config matches the example.")
+
+        return {"missing": missing, "unknown": unknown, "checked": True}
 
     def _initialize_source_pools(self):
         with self.lock:
@@ -283,13 +419,28 @@ class ProxyManager:
         logger.info(f"Loaded {len(jobs)} proxy source fetcher jobs from config.")
         return jobs
 
+    # Config that cannot be applied without a restart, because it is consumed
+    # once at construction time.
+    RESTART_REQUIRED_CONFIG = ("[database] connection pool", "[server] port")
+
     def reload_sources(self) -> Dict:
         """
-        Dynamically reloads proxy sources and fetcher jobs from the config file.
+        Reloads the config file: all tunables via _load_config(), plus proxy
+        sources and fetcher jobs.
+
+        Everything in the config is re-read except the settings listed in
+        RESTART_REQUIRED_CONFIG, which are consumed once during construction.
         """
-        logger.info("Attempting to reload sources from config file...")
+        logger.info("Attempting to reload configuration from config file...")
         with self.lock:
             self.config.read(self.config_path, encoding="utf-8")
+
+            # Re-apply every tunable. _load_config() also refreshes
+            # predefined_sources/default_source; the diff below is computed
+            # against the snapshot taken before this call.
+            old_predefined_sources_before_reload = self.predefined_sources.copy()
+            self._load_config()
+            self.check_config_drift()
 
             old_job_names = {job["name"] for job in self.fetcher_jobs}
             self.fetcher_jobs = self._load_fetcher_jobs()
@@ -303,18 +454,7 @@ class ProxyManager:
             else:
                 logger.info("Fetcher jobs reloaded. No changes detected.")
 
-            old_predefined_sources = self.predefined_sources.copy()
-            sources_str = self.config.get(
-                "sources", "predefined_sources", fallback="default"
-            )
-            self.predefined_sources = {
-                s.strip() for s in sources_str.split(",") if s.strip()
-            }
-            self.default_source = self.config.get(
-                "sources", "default_source", fallback="default"
-            )
-            if self.default_source not in self.predefined_sources:
-                self.predefined_sources.add(self.default_source)
+            old_predefined_sources = old_predefined_sources_before_reload
 
             added_sources = list(self.predefined_sources - old_predefined_sources)
             removed_sources = list(old_predefined_sources - self.predefined_sources)
@@ -368,6 +508,7 @@ class ProxyManager:
             "removed_fetcher_jobs": removed_jobs,
             "added_predefined_sources": added_sources,
             "removed_predefined_sources": removed_sources,
+            "restart_required_for": list(self.RESTART_REQUIRED_CONFIG),
         }
 
     def _fetch_and_parse_source(self, job: Dict) -> List:
@@ -379,24 +520,25 @@ class ProxyManager:
         url = job["url"]
         logger.info(f"Fetching proxy source: {job['name']} from {url}")
         proxies_to_insert = []
+        rejected_count = 0
         try:
             response_text = self._fetch_source_text(url)
             for line in response_text.splitlines():
                 line = line.strip()
                 if not line:
                     continue
-                try:
-                    if "://" in line:
-                        protocol, rest = line.split("://", 1)
-                        ip, port_str = rest.rsplit(":", 1)
-                        proxies_to_insert.append((protocol.lower(), ip, int(port_str)))
-                    elif job["default_protocol"]:
-                        ip, port_str = line.rsplit(":", 1)
-                        proxies_to_insert.append(
-                            (job["default_protocol"].lower(), ip, int(port_str))
-                        )
-                except ValueError:
+                parsed = self._parse_proxy_line(line, job["default_protocol"])
+                if parsed is None:
+                    rejected_count += 1
                     continue
+                proxies_to_insert.append(parsed)
+            if rejected_count:
+                logger.warning(
+                    "Fetcher job '{}' discarded {} malformed proxy line(s) out of {}.",
+                    job["name"],
+                    rejected_count,
+                    rejected_count + len(proxies_to_insert),
+                )
         except Exception as e:
             logger.error(f"Failed to fetch from {job['name']} ({url}): {e}")
             failures = job.get("failure_count", 0) + 1
@@ -412,6 +554,47 @@ class ProxyManager:
         else:
             job["failure_count"] = 0
         return proxies_to_insert
+
+    @staticmethod
+    def _parse_proxy_line(
+        line: str, default_protocol: Optional[str]
+    ) -> Optional[Tuple[str, str, int]]:
+        """
+        Parse one proxy list line into (protocol, ip, port), or None if invalid.
+
+        Every value is validated against the DB column constraints before it can
+        reach insert_proxies(): that INSERT is a single transaction, so one row
+        that PostgreSQL rejects would roll back the whole fetch cycle.
+        """
+        if "://" in line:
+            protocol, rest = line.split("://", 1)
+        elif default_protocol:
+            protocol, rest = default_protocol, line
+        else:
+            return None
+
+        protocol = protocol.strip().lower()
+        if protocol not in VALID_PROXY_PROTOCOLS or len(protocol) > MAX_PROTOCOL_LENGTH:
+            return None
+
+        if ":" not in rest:
+            return None
+        ip, port_str = rest.rsplit(":", 1)
+        ip = ip.strip()
+
+        # Credentials are not supported; "user:pass@host" would otherwise be
+        # stored verbatim as the IP.
+        if not ip or "@" in ip or len(ip) > MAX_IP_LENGTH:
+            return None
+
+        try:
+            port = int(port_str.strip())
+        except ValueError:
+            return None
+        if not MIN_PORT <= port <= MAX_PORT:
+            return None
+
+        return (protocol, ip, port)
 
     def _fetch_source_text(self, url: str) -> str:
         if self.fetcher_use_curl:
@@ -661,6 +844,63 @@ class ProxyManager:
         
         return success_proxies, failure_proxy_ids
 
+    def _collect_validation_batch(self) -> List[Dict]:
+        """
+        Build the validation batch with an explicit budget split.
+
+        Never-validated proxies and live proxies due for a re-check compete for
+        the same validation_batch_limit. Splitting the budget stops a flood of
+        freshly fetched proxies from starving the liveness re-checks; whichever
+        side under-uses its share donates the remainder to the other.
+        """
+        limit = self.validation_batch_limit
+        new_budget = int(limit * self.validation_new_proxy_ratio)
+        revalidate_budget = limit - new_budget
+
+        new_proxies = self.db.get_new_proxies_to_validate(limit=new_budget) or []
+        revalidate_proxies = (
+            self.db.get_active_proxies_to_revalidate(
+                interval_minutes=self.validation_window_minutes,
+                limit=revalidate_budget,
+            )
+            or []
+        )
+
+        # Donate unused budget in both directions so the cycle still fills up.
+        unused_new = new_budget - len(new_proxies)
+        if unused_new > 0 and len(revalidate_proxies) == revalidate_budget:
+            revalidate_proxies += (
+                self.db.get_active_proxies_to_revalidate(
+                    interval_minutes=self.validation_window_minutes,
+                    limit=revalidate_budget + unused_new,
+                )
+                or []
+            )[revalidate_budget:]
+
+        unused_revalidate = revalidate_budget - len(revalidate_proxies)
+        if unused_revalidate > 0 and len(new_proxies) == new_budget:
+            new_proxies += (
+                self.db.get_new_proxies_to_validate(limit=new_budget + unused_revalidate)
+                or []
+            )[new_budget:]
+
+        logger.info(
+            "Validation budget: {} new (of {}) + {} re-validation (of {}).",
+            len(new_proxies),
+            new_budget,
+            len(revalidate_proxies),
+            revalidate_budget,
+        )
+
+        batch: List[Dict] = []
+        seen_ids = set()
+        for proxy in list(new_proxies) + list(revalidate_proxies):
+            if proxy["id"] in seen_ids:
+                continue
+            seen_ids.add(proxy["id"])
+            batch.append(proxy)
+        return batch
+
     def _run_validation_cycle(self):
         with self.lock:
             if self.is_validating:
@@ -670,10 +910,7 @@ class ProxyManager:
                 return
             self.is_validating = True
         try:
-            proxies_to_validate = self.db.get_proxies_to_validate(
-                interval_minutes=self.validation_window_minutes,
-                limit=self.validation_batch_limit,
-            )
+            proxies_to_validate = self._collect_validation_batch()
             logger.info(
                 f"There are {len(proxies_to_validate)} proxies need to be validated"
             )
@@ -684,18 +921,24 @@ class ProxyManager:
                 logger.info(
                     f"Validation pool below threshold. Supplementing with eligible failed proxies."
                 )
+                existing_ids = {p["id"] for p in proxies_to_validate}
                 eligible_failed = self.db.get_eligible_failed_proxies(
                     window_minutes=self.validation_window_minutes,
                     max_attempts=self.max_validations_per_window,
                     limit=supplement_needed,
+                    exclude_ids=sorted(existing_ids),
                 )
-                existing_ids = {p["id"] for p in proxies_to_validate}
                 for p in eligible_failed:
                     if p["id"] not in existing_ids:
                         proxies_to_validate.append(p)
 
             if not proxies_to_validate:
-                logger.info("Validation cycle skipped: no proxies to validate.")
+                # The in-memory pool must still be refreshed: an empty batch is
+                # not a reason to keep handing out a stale (possibly dead) pool.
+                logger.info(
+                    "No proxies to validate this cycle; refreshing pools anyway."
+                )
+                self._sync_and_select_top_proxies()
                 return
 
             proxy_ids_to_update = [p["id"] for p in proxies_to_validate]
@@ -756,26 +999,29 @@ class ProxyManager:
                     if proxy_url not in stats_pool:
                         stats_pool[proxy_url] = self._get_new_proxy_stat()
 
+                # Recompute every score before ranking. Scores are otherwise only
+                # refreshed inside _apply_feedback_to_stat, which freezes idle
+                # proxies: time decay never applies, and a proxy knocked out of
+                # the pool by one failure can never earn its way back.
+                if self.rescore_on_sync_enabled:
+                    for proxy_url, stat in stats_pool.items():
+                        stat["score"] = self._calculate_elo_score(stat, source)
+
+                stats_pool = self._truncate_stats_pool(source, stats_pool)
+                self.source_stats[source] = stats_pool
+
                 sorted_proxies = sorted(
                     stats_pool.items(), key=lambda item: item[1]["score"], reverse=True
                 )
 
-                max_stats_size = self.max_pool_size * self.stats_pool_max_multiplier
-                if len(sorted_proxies) > max_stats_size:
-                    proxies_to_delete_count = len(sorted_proxies) - max_stats_size
-                    logger.info(
-                        f"Stats pool for source '{source}' exceeds limit ({len(sorted_proxies)} > {max_stats_size}). "
-                        f"Removing {proxies_to_delete_count} lowest-scoring proxies."
-                    )
-                    sorted_proxies = sorted_proxies[:max_stats_size]
-                    self.source_stats[source] = dict(sorted_proxies)
-                else:
-                    self.source_stats[source] = dict(sorted_proxies)
-
-                # Select all proxies up to the max_pool_size for potential use
+                # Only proxies that survived the latest validation may be handed
+                # out. Their stats stay in the pool either way, so a proxy that
+                # comes back to life keeps its history.
                 usable_proxies = [
-                    p_url for p_url, _ in sorted_proxies[: self.max_pool_size]
-                ]
+                    p_url
+                    for p_url, _ in sorted_proxies
+                    if p_url in self.active_proxies
+                ][: self.max_pool_size]
 
                 # NEW: Split the usable proxies into tiers
                 top_tier = usable_proxies[: self.top_tier_size]
@@ -786,12 +1032,45 @@ class ProxyManager:
 
                 logger.info(
                     f"Source '{source}' synced. "
-                    f"Total : {len(sorted_proxies)} proxies."
+                    f"Stats pool: {len(sorted_proxies)} proxies, "
+                    f"of which {len(usable_proxies)} are alive and usable. "
                     f"Top Tier: {len(top_tier)} proxies. "
                     f"Bottom Tier: {len(bottom_tier)} proxies."
                 )
 
             self._sync_premium_proxies_locked()
+
+    def _truncate_stats_pool(self, source: str, stats_pool: Dict[str, Dict]) -> Dict[str, Dict]:
+        """
+        Cap the stats pool, evicting by staleness rather than by score.
+
+        Evicting the lowest scores looks right but launders reputation: a proxy
+        with a long failure history is dropped, then re-enters on the next sync
+        as a pristine score=50 / failure_count=0 candidate and displaces peers
+        that still carry their record. Proxies with the oldest (or no) feedback
+        are the ones that can be dropped without losing information.
+        """
+        max_stats_size = self.max_pool_size * self.stats_pool_max_multiplier
+        if len(stats_pool) <= max_stats_size:
+            return stats_pool
+
+        def _retention_key(item: Tuple[str, Dict]) -> Tuple[float, float]:
+            stat = item[1]
+            last_feedback_ts = stat.get("last_feedback_ts")
+            if not isinstance(last_feedback_ts, (int, float)):
+                last_feedback_ts = 0.0
+            return (float(last_feedback_ts), float(stat.get("score", 0.0)))
+
+        retained = sorted(stats_pool.items(), key=_retention_key, reverse=True)[
+            :max_stats_size
+        ]
+        logger.info(
+            f"Stats pool for source '{source}' exceeds limit "
+            f"({len(stats_pool)} > {max_stats_size}). "
+            f"Evicting {len(stats_pool) - max_stats_size} proxies with the "
+            f"oldest feedback."
+        )
+        return dict(retained)
 
     def _update_dashboard_sources(self):
         logger.info("Refreshing dashboard sources from config and database...")
@@ -914,17 +1193,35 @@ class ProxyManager:
     def backup_stats(self) -> Dict:
         """Backup source_stats to a JSON file."""
         with self.lock:
+            # Deep copy: a shallow dict() still shares every stat dict and its
+            # recent_results list with the live pool, which json.dump then walks
+            # outside the lock while feedback threads mutate them.
             stats_snapshot = {
                 "timestamp": datetime.now().isoformat(),
-                "source_stats": {source: dict(proxies) for source, proxies in self.source_stats.items()},
+                "source_stats": copy.deepcopy(self.source_stats),
             }
 
         try:
             # Create directory if it doesn't exist
             self.stats_backup_path.parent.mkdir(parents=True, exist_ok=True)
 
-            with open(self.stats_backup_path, "w", encoding="utf-8") as f:
-                json.dump(stats_snapshot, f, ensure_ascii=False, indent=2)
+            # Atomic write: a crash or SIGKILL mid-dump would otherwise leave a
+            # truncated file, and restore_stats() would drop all scoring state.
+            tmp_fd, tmp_path = tempfile.mkstemp(
+                dir=str(self.stats_backup_path.parent),
+                prefix=self.stats_backup_path.name + ".",
+                suffix=".tmp",
+            )
+            try:
+                with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                    json.dump(stats_snapshot, f, ensure_ascii=False, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, self.stats_backup_path)
+            except Exception:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+                raise
 
             total_proxies = sum(len(proxies) for proxies in stats_snapshot["source_stats"].values())
             logger.info(
@@ -944,8 +1241,19 @@ class ProxyManager:
     def restore_stats(self) -> Dict:
         """Restore source_stats from JSON file on startup."""
         if not self.stats_backup_path.exists():
-            logger.info(f"No backup file found at {self.stats_backup_path}, starting with fresh stats.")
-            return {"status": "skipped", "message": "No backup file found"}
+            # WARNING, not INFO: every restart that hits this path silently
+            # discards the entire scoring history.
+            logger.warning(
+                "No stats backup found at {} - starting with fresh scores. "
+                "All accumulated proxy scoring history is lost. Check "
+                "[backup] stats_backup_path if this is unexpected.",
+                self.stats_backup_path,
+            )
+            return {
+                "status": "skipped",
+                "message": f"No backup file found at {self.stats_backup_path}",
+                "path": str(self.stats_backup_path),
+            }
 
         try:
             # Log file info before loading
@@ -1034,6 +1342,11 @@ class ProxyManager:
                 logger.warning(f"No available proxy for source '{source}' after cooldown filtering.")
                 return None
 
+            explored = self._maybe_select_exploration_candidate(source)
+            if explored is not None:
+                self.proxy_last_handed_out_ts[source][explored] = time.time()
+                return explored
+
             if self.selection_strategy == "uniform":
                 selected = random.choice(candidates)
             elif self.selection_strategy == "tiered":
@@ -1045,6 +1358,42 @@ class ProxyManager:
 
             self.proxy_last_handed_out_ts[source][selected] = time.time()
             return selected
+
+    def _maybe_select_exploration_candidate(self, source: str) -> Optional[str]:
+        """
+        Spend a small share of traffic on proxies that have never been used.
+
+        Thousands of proxies sit at the identical 50.0 starting score, so the
+        stable sort in _sync_and_select_top_proxies decides the top pool by dict
+        insertion order and then re-freezes it every cycle. Without an explicit
+        exploration budget, a proxy that was not in the first sync can never
+        collect the feedback it needs to be ranked at all.
+
+        Caller must hold self.lock.
+        """
+        if self.exploration_ratio <= 0:
+            return None
+        if random.random() >= self.exploration_ratio:
+            return None
+
+        stats_pool = self.source_stats.get(source, {})
+        if not stats_pool:
+            return None
+
+        # Exploration candidates come from the whole stats pool, not the top
+        # pool, but must still be alive (see the active_proxies gate in sync).
+        unproven = [
+            proxy_url
+            for proxy_url, stat in stats_pool.items()
+            if proxy_url in self.active_proxies and not stat.get("recent_results")
+        ]
+        if not unproven:
+            return None
+
+        candidates = self._filter_cooldown_candidates(source, unproven)
+        if not candidates:
+            return None
+        return random.choice(candidates)
 
     def _filter_cooldown_candidates(self, source: str, proxy_urls: List[str]) -> List[str]:
         if self.proxy_cooldown_ms <= 0:
@@ -1263,16 +1612,24 @@ class ProxyManager:
     def _calculate_elo_score(self, stat: Dict, source: str = None) -> float:
         """
         Calculate ELO-inspired score based on:
-        1. Recent success rate (sliding window)
-        2. Average latency (lower is better)
+        1. Recent success rate (sliding window, shrunk toward 0.5 by a Beta prior)
+        2. Average latency (lower is better, scaled by the success rate)
         3. Consistency bonus (stable recent performance)
-        
+
         Score range: 0-100
-        
+
         Components:
         - Success rate:   0-60 points (primary factor)
-        - Latency:        0-30 points (secondary factor)
+        - Latency:        0-30 points, multiplied by the smoothed success rate
         - Consistency:    0-10 points (bonus for stability)
+
+        Calibration (defaults, fresh results, 200ms latency):
+        - no observations:   50.0    (neutral baseline)
+        - 1 success:         ~59     (optimistic, but not a coronation)
+        - 1 failure:         ~29     (punished, but recoverable)
+        - 48/50 successes:   ~90-93  (depending on where the failures land)
+        - 50/50 failures:    ~2
+        - 35% success rate:  ~32     (below the untried baseline)
         """
         # Use configurable window size
         window_size = self.elo_scoring_window
@@ -1324,12 +1681,21 @@ class ProxyManager:
             weights = [1.0] * len(recent)
 
         # 1. Success rate component (0-60 points)
+        # The raw ratio lets one lucky observation reach 1.0, so shrink it
+        # toward the 0.5 baseline with a Beta prior. With the default a=b=2 a
+        # single success yields 0.6 rather than 1.0, while 48/50 still yields
+        # 0.93 - new proxies keep their exploration bonus above the 50-point
+        # baseline without instantly outranking a proven one.
         total_weight = sum(weights) or 1.0
         successes_weight = sum(
             w for r, w in zip(recent, weights) if len(r) >= 2 and bool(r[1])
         )
-        success_rate = successes_weight / total_weight
-        success_score = success_rate * 60
+        prior_a = self.elo_prior_successes
+        prior_b = self.elo_prior_failures
+        smoothed_success_rate = (successes_weight + prior_a) / (
+            total_weight + prior_a + prior_b
+        )
+        success_score = smoothed_success_rate * 60
 
         # 2. Latency component (0-30 points)
         # Lower latency = higher score
@@ -1355,8 +1721,21 @@ class ProxyManager:
                 )
             else:
                 latency_score = 0
+            # Latency is measured on successful requests only, so on its own it
+            # is blind to how often the proxy fails. Scale it by reliability:
+            # otherwise a 35%-success proxy keeps a full 30 latency points and
+            # holds a pool slot above untried candidates.
+            latency_score *= smoothed_success_rate
+        elif successes_weight > 0:
+            # Succeeded, but no latency was reported with those results. Nothing
+            # measured means nothing to discount, so stay neutral.
+            latency_score = 15
+        elif recent:
+            # The window has results and none of them succeeded. This is not a
+            # "no data yet" proxy; it is a broken one, and it gets no credit.
+            latency_score = 0
         else:
-            latency_score = 15  # Neutral if no latency data
+            latency_score = 15  # Neutral for a proxy with no results at all
 
         # 3. Consistency bonus (0-10 points)
         # Reward proxies with stable recent performance

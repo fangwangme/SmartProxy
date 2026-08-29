@@ -5,9 +5,9 @@ SmartProxy is a sophisticated proxy management system designed to provide reliab
 ## **Core Features**
 
 * **Automated Proxy Fetching**: Gathers proxies from multiple user-defined sources.  
-* **Intelligent Validation & Scoring**: Continuously validates proxies and assigns a dynamic score based on performance (latency, success rate) and feedback.  
-* **Feedback-Driven Adaptation**: A scoring system that penalizes failures and rewards success, allowing the pool to adapt based on real-world usage.  
-* **Dynamic Source Reloading**: A hot-reload endpoint (/reload-sources) allows adding or removing proxy sources without restarting the service.  
+* **Intelligent Validation & Scoring**: Validation is a liveness gate (`is_active`); ranking is owned entirely by client feedback, which drives a 0-100 ELO-style score over a sliding window.  
+* **Feedback-Driven Adaptation**: Success and failure both move the score, with small samples shrunk toward the neutral baseline so a single observation cannot crown or exile a proxy.  
+* **Dynamic Configuration Reloading**: A hot-reload endpoint (/reload-sources) re-reads the whole config file - sources, fetcher jobs, and every tunable - without restarting the service.  
 * **Sustainable Validation Logic**: Employs a time-window-based attempt limit for re-validating failed proxies. This prevents proxy burnout, reduces database load, and ensures long-term service stability.  
 * **Source-Specific Pools**: Maintains separate proxy pools for different sources/use cases.  
 * **RESTful API**: Simple endpoints for fetching proxies and submitting feedback.  
@@ -17,8 +17,13 @@ SmartProxy is a sophisticated proxy management system designed to provide reliab
 
 1. **Fetch**: The service periodically fetches proxy lists from various sources defined in config.ini.  
 2. **Validate**: A validation cycle runs regularly. It prioritizes new and previously successful proxies. To avoid overwhelming unreliable proxies, it supplements the validation queue with failed proxies that have not been tested more than a configured number of times within a specific time window (e.g., 5 times in 30 minutes).  
-3. **Score**: Proxies are managed in memory for each source. Feedback updates an ELO-inspired 0-100 score from recent success rate, latency, consistency, and optional time decay. Consecutive failures are kept only as diagnostic data; candidates are not hard-deleted by a failure threshold.  
-4. **Select**: When a client requests a proxy for a specific source via /get-proxy, the system filters candidates by optional per-proxy cooldown, then selects from the current top pool using the configured strategy (`uniform`, `tiered`, `weighted`, or `softmax`).  
+3. **Score**: Proxies are managed in memory for each source, with an ELO-inspired 0-100 score built from three additive components over a sliding window of recent results:
+   * **Success rate (0-60)** - the weighted success rate, shrunk toward 0.5 by a Beta prior (`elo_prior_successes` / `elo_prior_failures`). This is what keeps one lucky success from outranking a proven proxy: with the defaults, 1 success scores about 59 and 48-of-50 successes about 90, while an untried proxy sits at the neutral 50.
+   * **Latency (0-30)** - a linear ramp between `latency_full_score_ms` and `latency_zero_score_ms`, then **multiplied by the smoothed success rate**. Latency is only ever measured on successful requests, so on its own it says nothing about how often a proxy fails; scaling it means a fast-but-unreliable proxy cannot hold a pool slot. A window with results but zero successes scores 0 here, not a neutral value.
+   * **Consistency (0-10)** - a bonus for a stable success rate across the last 10 results.
+
+   Results are weighted by age (`elo_decay_half_life_hours`) and dropped entirely past `elo_max_result_age_hours`. Scores are recomputed for the whole pool on every sync (`rescore_on_sync_enabled`), not only when feedback arrives - otherwise idle proxies freeze at their last score, time decay never fires, and a proxy knocked down by one failure can never earn its way back. Consecutive failures are kept only as diagnostic data; candidates are not hard-deleted by a failure threshold.
+4. **Select**: When a client requests a proxy for a specific source via /get-proxy, the system serves only proxies that passed the most recent validation, filters them by the optional per-proxy cooldown, and selects from the current top pool using the configured strategy (`uniform`, `tiered`, `weighted`, or `softmax`). A configurable share of requests (`exploration_ratio`) instead goes to a proxy that has never been handed out, so newly discovered candidates can earn a ranking rather than being stuck behind the incumbent pool forever.
 5. **Adapt**: Through continuous validation and feedback, low-quality proxies are phased out, and high-performing ones are prioritized, ensuring the overall quality of the pool constantly improves.
 
 ## **Project Structure**
@@ -134,10 +139,11 @@ The service is configured via the config.ini file.
 * **\[logging\]**:
   * log\_dir: Log directory. Relative paths are resolved from the project root. Defaults to `./.local/logs`.
 * **\[validator\]**:  
-  * validation\_target / validation\_targets: URL(s) used to test proxy connectivity and anonymity. Use an endpoint that returns request headers, such as `http://httpbin.org/get`, if anonymity classification matters.
+  * validation\_target / validation\_targets: URL(s) used to test proxy connectivity and anonymity. Anonymity is detected by looking for `X-Forwarded-For` / `Via` / `X-Real-IP` in a `headers` object in the JSON response, so the target **must echo request headers**: `http://httpbin.org/get` does, `http://httpbin.org/ip` does not and leaves `anonymity_level` permanently `unknown`. Prefer configuring several `validation_targets` - a single target that rate-limits (httpbin does) marks good proxies dead.
   * validation\_success\_threshold: Number of targets a proxy must pass.  
   * validation\_workers: Number of concurrent threads for validation.  
   * validation\_batch\_limit: Maximum proxies pulled into one validation cycle.  
+  * validation\_new\_proxy\_ratio: Share of that budget reserved for never-validated proxies; the rest re-checks proxies that are currently alive. Unused budget is donated to the other side. Defaults to `0.5`.  
   * validation\_supplement\_threshold: If the number of new/active proxies to test is below this, the queue will be supplemented with failed proxies.  
   * validation\_window\_minutes: The time window (in minutes) for the validation attempt limit.  
   * max\_validations\_per\_window: The maximum number of times a failed proxy will be re-tested within the time window.  
@@ -147,7 +153,13 @@ The service is configured via the config.ini file.
 * **\[sources\]**:  
   * predefined\_sources: A comma-separated list of logical names for your proxy pools (e.g., google\_search, web\_scraping).  
   * default\_source: The pool to use if a requested source doesn't exist.  
-* **\[source\_pool\]**: Parameters for the scoring and selection algorithm, including `selection_strategy`, `proxy_cooldown_ms`, ELO window/decay settings, and latency scoring thresholds.  
+* **\[source\_pool\]**: Parameters for the scoring and selection algorithm.  
+  * selection\_strategy: `uniform`, `tiered`, `weighted`, or `softmax`. Note that `uniform` draws every proxy in the pool with equal probability, so the score only decides pool membership and the ranking is otherwise discarded; `weighted` is recommended.  
+  * proxy\_cooldown\_ms: Minimum delay before the same proxy is handed out again for the same source.  
+  * exploration\_ratio: Share of requests spent on proxies that have never been handed out. Set to `0` to disable.  
+  * elo\_prior\_successes / elo\_prior\_failures: Beta prior that shrinks small samples toward the neutral score.  
+  * rescore\_on\_sync\_enabled: Recompute every score during pool sync so time decay applies to idle proxies.  
+  * ELO window/decay settings and latency scoring thresholds (`elo_max_window`, `elo_scoring_window`, `elo_decay_half_life_hours`, `elo_max_result_age_hours`, `latency_full_score_ms`, `latency_zero_score_ms`).  
 * **\[proxy\_source\_\*\]**: Define your proxy sources here. Each source should have its own section (e.g., \[proxy\_source\_freeproxies\]).  
   * url: The URL to fetch the proxy list from.  
   * update\_interval\_minutes: How often to fetch from this source.  
@@ -173,6 +185,8 @@ Fetches an available proxy for a specific use case.
 
 * **Error Response (404)**: Returned if no proxies are currently available for the requested source.
 
+**Note**: the `https` field is the same proxy URL, offered for convenience as the `https` entry of a `requests`-style proxies dict. Validation only exercises the configured `validation_target`(s); it never tests `CONNECT` tunnelling, so HTTPS support through a returned proxy is not verified. Report failures via `/feedback` so the score reflects it.
+
 ### **POST /feedback**
 
 Submits feedback on a proxy's performance. This is crucial for the scoring system.
@@ -191,7 +205,9 @@ Submits feedback on a proxy's performance. This is crucial for the scoring syste
 
 ### **POST /reload-sources**
 
-Triggers a hot-reload of the proxy source configuration from config.ini. This allows you to add or remove \[proxy\_source\_\*\] sections and update predefined\_sources without restarting the service.
+Triggers a hot-reload of config.ini. Every tunable is re-read - `[source_pool]`, `[validator]`, `[scheduler]`, `[backup]`, `[sources]` and the `[proxy_source_*]` sections - so you can add or remove proxy sources, update `predefined_sources`, and retune scoring or selection without restarting the service.
+
+Two settings are **not** reloadable, because they are consumed once at startup: the `[database]` connection pool and `[server] port`. Changing either requires a restart; the response lists them under `restart_required_for`.
 
 ```bash
 curl -X POST -H "Content-Type: application/json" http://127.0.0.1:6942/reload-sources
@@ -208,7 +224,8 @@ curl -X POST -H "Content-Type: application/json" http://127.0.0.1:6942/reload-so
       "added_fetcher_jobs": ["proxy_source_new"],  
       "removed_fetcher_jobs": [],  
       "added_predefined_sources": ["new_pool"],  
-      "removed_predefined_sources": []  
+      "removed_predefined_sources": [],  
+      "restart_required_for": ["[database] connection pool", "[server] port"]  
     }  
   }  
 ```

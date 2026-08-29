@@ -85,8 +85,9 @@ stop_server() {
             echo "Stopping SmartProxy (PID: $PID)..."
             kill $PID
             
-            # 等待进程结束
-            for i in {1..10}; do
+            # 等待进程结束。SIGTERM 处理里要先 flush feedback 再写 stats 备份，
+            # 5s 宽限不够，会在备份写完前被 kill -9。
+            for i in {1..30}; do
                 if ! kill -0 $PID 2>/dev/null; then
                     break
                 fi

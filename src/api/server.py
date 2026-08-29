@@ -282,9 +282,12 @@ smartproxy_is_validating {1 if proxy_manager.is_validating else 0}
 
     @app.route("/api/sources", methods=["GET"])
     def get_sources():
-        # Keep source list fresh for dashboard clients instead of waiting for scheduler refresh.
-        proxy_manager._update_dashboard_sources()
-        return jsonify(sorted(list(proxy_manager.dashboard_sources)))
+        # Read the cache the scheduler maintains (source_refresh_interval_seconds,
+        # and once at startup). Refreshing here ran a SELECT DISTINCT on every
+        # dashboard poll for a list that changes on the order of hours.
+        with proxy_manager.lock:
+            sources = sorted(proxy_manager.dashboard_sources)
+        return jsonify(sources)
 
     @app.route("/api/stats/daily", methods=["GET"])
     def get_daily_stats_route():

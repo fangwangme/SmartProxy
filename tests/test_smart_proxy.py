@@ -1,20 +1,44 @@
 # -*- coding: utf-8 -*-
 import asyncio
+import json
+import os
+import shutil
+import tempfile
+import time
 import unittest
 import configparser
 import threading
+from pathlib import Path
 from unittest.mock import MagicMock, patch, AsyncMock
 
 from src.core.proxy_manager import ProxyManager, FAILED_STATUS_CODES
 from src.database.db import DatabaseManager
 
 
-class TestProxyManager(unittest.TestCase):
+def write_config_file(directory: str, config_dict: dict, name: str = "config.ini") -> str:
+    """
+    Write a config dict to a real .ini file and return its path.
+
+    Tests must load config through the real configparser path. Patching
+    ConfigParser.read is not equivalent: read()'s return value is never used by
+    configparser, so the patch leaves manager.config empty and every setting
+    silently falls back to its hardcoded default - which means the config values
+    under test are never actually exercised.
+    """
+    config = configparser.ConfigParser()
+    config.read_dict(config_dict)
+    path = os.path.join(directory, name)
+    with open(path, "w", encoding="utf-8") as f:
+        config.write(f)
+    return path
+
+
+class ProxyManagerTestBase(unittest.TestCase):
+    """Shared fixture: a ProxyManager built from a real ini file, mocked DB."""
 
     def setUp(self):
         """Set up a mock environment for each test."""
-        self.mock_config = configparser.ConfigParser()
-        self.mock_config.read_dict(
+        self.config_dict = (
             {
                 "database": {
                     "host": "localhost",
@@ -63,19 +87,39 @@ class TestProxyManager(unittest.TestCase):
             }
         )
 
-        patcher_config = patch(
-            "configparser.ConfigParser.read", return_value=self.mock_config
-        )
-        self.addCleanup(patcher_config.stop)
-        patcher_config.start()
+        self.tmp_dir = tempfile.mkdtemp(prefix="smartproxy-test-")
+        self.addCleanup(shutil.rmtree, self.tmp_dir, True)
+        self.config_path = write_config_file(self.tmp_dir, self.config_dict)
 
         # PATCH THE IMPORT IN PROXY_MANAGER, NOT THE DEFINITION
         patcher_db = patch("src.core.proxy_manager.DatabaseManager", spec=DatabaseManager)
         self.addCleanup(patcher_db.stop)
         self.MockDatabaseManager = patcher_db.start()
 
-        self.manager = ProxyManager("dummy_path.ini")
+        self.manager = ProxyManager(self.config_path)
         self.mock_db_instance = self.MockDatabaseManager.return_value
+
+    def make_manager(self, overrides: dict, name: str = "override.ini") -> ProxyManager:
+        """Build a second manager from a real ini file with merged overrides."""
+        merged = {
+            section: dict(options) for section, options in self.config_dict.items()
+        }
+        for section, options in overrides.items():
+            merged.setdefault(section, {}).update(options)
+        path = write_config_file(self.tmp_dir, merged, name=name)
+        return ProxyManager(path)
+
+    def make_stat(self, results, **extra):
+        """Build a stat whose sliding window holds `results` of (success, latency_ms)."""
+        stat = self.manager._get_new_proxy_stat()
+        now = time.time()
+        for index, (is_success, latency_ms) in enumerate(results):
+            stat["recent_results"].append([now - index, is_success, latency_ms])
+        stat.update(extra)
+        return stat
+
+
+class TestProxyManager(ProxyManagerTestBase):
 
     # ========== Config Loading Tests ==========
 
@@ -584,6 +628,789 @@ class TestProxyManager(unittest.TestCase):
 
         score = self.manager._calculate_elo_score(stat)
         self.assertEqual(score, 50.0)
+
+
+class TestIssue13PoolQuality(ProxyManagerTestBase):
+    """
+    Regression tests for issue #13: defects that made pool output quality
+    degrade monotonically with uptime. One test (at least) per finding.
+    """
+
+    # ---------- Finding 1: dead proxies kept being handed out ----------
+
+    def test_sync_excludes_dead_proxies_from_tiers(self):
+        """Only proxies the DB reports as alive may enter the usable tiers."""
+        dead = "http://dead:80"
+        alive = "http://alive:80"
+        self.manager.source_stats["source1"] = {
+            # The dead proxy outscores the live one, so score ordering alone
+            # would place it first.
+            dead: self.manager._get_new_proxy_stat() | {"score": 88.0},
+            alive: self.manager._get_new_proxy_stat() | {"score": 51.0},
+        }
+        self.mock_db_instance.get_active_proxies.return_value = {alive}
+
+        self.manager._sync_and_select_top_proxies()
+
+        tiers = self.manager.available_proxies["source1"]
+        self.assertNotIn(dead, tiers["top_tier"])
+        self.assertNotIn(dead, tiers["bottom_tier"])
+        self.assertIn(alive, tiers["top_tier"])
+
+    def test_sync_keeps_dead_proxy_history_in_stats(self):
+        """A dead proxy loses its pool slot but keeps its score history."""
+        dead = "http://dead:80"
+        self.manager.source_stats["source1"] = {
+            dead: self.manager._get_new_proxy_stat() | {
+                "score": 88.0,
+                "success_count": 40,
+                "last_feedback_ts": time.time(),
+            }
+        }
+        self.mock_db_instance.get_active_proxies.return_value = set()
+
+        self.manager._sync_and_select_top_proxies()
+
+        self.assertIn(dead, self.manager.source_stats["source1"])
+        self.assertEqual(
+            self.manager.source_stats["source1"][dead]["success_count"], 40
+        )
+
+    def test_get_proxy_never_returns_a_dead_proxy_after_sync(self):
+        """End-to-end: 20 get_proxy calls after a sync never hit a dead proxy."""
+        dead = "http://dead:80"
+        alive = "http://alive:80"
+        self.manager.source_stats["source1"] = {
+            dead: self.manager._get_new_proxy_stat() | {"score": 99.0},
+            alive: self.manager._get_new_proxy_stat() | {"score": 50.0},
+        }
+        self.mock_db_instance.get_active_proxies.return_value = {alive}
+        self.manager._sync_and_select_top_proxies()
+
+        handed_out = {self.manager.get_proxy("source1") for _ in range(20)}
+
+        self.assertNotIn(dead, handed_out)
+        self.assertEqual(handed_out, {alive})
+
+    # ---------- Finding 2: one observation swung the score too far ----------
+
+    def test_single_success_scores_between_baseline_and_veteran(self):
+        """
+        One success must stay optimistic (> the 50 baseline) but must not
+        outrank a proxy with a full window of successes.
+        """
+        rookie = self.manager._calculate_elo_score(self.make_stat([(True, 200)]))
+        veteran = self.manager._calculate_elo_score(
+            self.make_stat([(True, 200)] * 48 + [(False, None)] * 2)
+        )
+        untried = self.manager._calculate_elo_score(
+            self.manager._get_new_proxy_stat()
+        )
+
+        self.assertEqual(untried, 50.0)
+        self.assertGreater(rookie, 50.0)
+        self.assertLess(rookie, veteran)
+        # Exploration budget, not a coronation: issue #13 pins 1 success to 50-75.
+        self.assertLessEqual(rookie, 75.0)
+        self.assertGreaterEqual(veteran, 90.0)
+
+    def test_single_success_without_latency_still_beats_baseline(self):
+        """The optimistic bonus must not depend on a latency being reported."""
+        score = self.manager._calculate_elo_score(self.make_stat([(True, None)]))
+
+        self.assertGreater(score, 50.0)
+        self.assertLessEqual(score, 75.0)
+
+    def test_single_failure_is_not_permanent_exile(self):
+        """One failure lands well above 0, leaving a recovery path."""
+        score = self.manager._calculate_elo_score(self.make_stat([(False, None)]))
+
+        self.assertGreater(score, 20.0)
+        self.assertLess(score, 50.0)
+
+    # ---------- Finding 5: an all-failure window got a neutral latency score ----------
+
+    def test_all_failures_get_no_neutral_latency_credit(self):
+        """A window with results but zero successes scores near zero."""
+        score = self.manager._calculate_elo_score(
+            self.make_stat([(False, None)] * 50)
+        )
+
+        self.assertLessEqual(score, 5.0)
+
+    def test_untried_proxy_keeps_the_neutral_baseline(self):
+        """The neutral score belongs to proxies with no data, not broken ones."""
+        self.assertEqual(
+            self.manager._calculate_elo_score(self.manager._get_new_proxy_stat()),
+            50.0,
+        )
+
+    # ---------- Finding 4: latency masked a low success rate ----------
+
+    def test_low_success_rate_cannot_hide_behind_low_latency(self):
+        """A fast but unreliable proxy must rank below an untried one."""
+        score = self.manager._calculate_elo_score(
+            self.make_stat([(True, 200)] * 17 + [(False, None)] * 33)
+        )
+
+        self.assertLess(score, 50.0)
+
+    def test_latency_score_is_scaled_by_success_rate(self):
+        """Same latency, different reliability: the reliable one scores higher."""
+        reliable = self.manager._calculate_elo_score(
+            self.make_stat([(True, 200)] * 45 + [(False, None)] * 5)
+        )
+        flaky = self.manager._calculate_elo_score(
+            self.make_stat([(True, 200)] * 20 + [(False, None)] * 30)
+        )
+
+        self.assertGreater(reliable - flaky, 30.0)
+
+    # ---------- Finding 3: time decay never applied to idle proxies ----------
+
+    def test_sync_rescores_idle_proxies_so_decay_applies(self):
+        """
+        A proxy whose only results are stale must have its frozen score
+        recomputed by the sync, not carried forever.
+        """
+        proxy_url = "http://idle:80"
+        stale_ts = time.time() - (10 * 24 * 3600)
+        stat = self.manager._get_new_proxy_stat()
+        stat["recent_results"] = [[stale_ts, True, 200] for _ in range(50)]
+        stat["last_feedback_ts"] = stale_ts
+        stat["score"] = 100.0  # frozen from when the results were fresh
+        self.manager.source_stats["source1"] = {proxy_url: stat}
+        self.mock_db_instance.get_active_proxies.return_value = {proxy_url}
+
+        score_before = self.manager.source_stats["source1"][proxy_url]["score"]
+        self.manager._sync_and_select_top_proxies()
+        score_after = self.manager.source_stats["source1"][proxy_url]["score"]
+
+        self.assertEqual(score_before, 100.0)
+        self.assertNotEqual(score_after, score_before)
+        self.assertEqual(score_after, 50.0)
+
+    def test_sync_rescore_can_be_disabled_by_config(self):
+        """rescore_on_sync_enabled is a real config switch, not a hardcode."""
+        manager = self.make_manager(
+            {"source_pool": {"rescore_on_sync_enabled": "false"}},
+            name="no_rescore.ini",
+        )
+        proxy_url = "http://idle:80"
+        stale_ts = time.time() - (10 * 24 * 3600)
+        stat = manager._get_new_proxy_stat()
+        stat["recent_results"] = [[stale_ts, True, 200] for _ in range(50)]
+        stat["last_feedback_ts"] = stale_ts
+        stat["score"] = 100.0
+        manager.source_stats["source1"] = {proxy_url: stat}
+        manager.db.get_active_proxies.return_value = {proxy_url}
+
+        manager._sync_and_select_top_proxies()
+
+        self.assertFalse(manager.rescore_on_sync_enabled)
+        self.assertEqual(manager.source_stats["source1"][proxy_url]["score"], 100.0)
+
+    # ---------- Finding 8: one dirty row rolled back the whole insert ----------
+
+    def test_parser_rejects_malformed_proxy_lines(self):
+        """Values that violate the DB column constraints are dropped, not stored."""
+        cases = {
+            # (line, default_protocol): expected
+            ("1.2.3.4:99999999999", "http"): None,       # port > PG INT / 65535
+            ("averylongprotocolname://5.6.7.8:80", None): None,  # > VARCHAR(10)
+            ("socks5://user:pass@9.9.9.9:1080", None): None,     # credentials in ip
+            ("1.2.3.4:0", "http"): None,                 # port below range
+            ("1.2.3.4:-1", "http"): None,
+            ("1.2.3.4:notaport", "http"): None,
+            ("1.2.3.4", "http"): None,                   # no port at all
+            ("1.2.3.4:8080", None): None,                # no protocol available
+            ("http://1.2.3.4:8080", None): ("http", "1.2.3.4", 8080),
+            ("1.2.3.4:8080", "http"): ("http", "1.2.3.4", 8080),
+            ("SOCKS5://1.2.3.4:1080", None): ("socks5", "1.2.3.4", 1080),
+            ("1.2.3.4:65535", "http"): ("http", "1.2.3.4", 65535),
+        }
+        for (line, default_protocol), expected in cases.items():
+            with self.subTest(line=line):
+                self.assertEqual(
+                    self.manager._parse_proxy_line(line, default_protocol), expected
+                )
+
+    def test_fetch_keeps_valid_lines_and_drops_dirty_ones(self):
+        """The three reproduced dirty rows are dropped; the clean row survives."""
+        payload = "\n".join(
+            [
+                "1.2.3.4:99999999999",
+                "averylongprotocolname://5.6.7.8:80",
+                "socks5://user:pass@9.9.9.9:1080",
+                "7.7.7.7:8080",
+            ]
+        )
+        job = {
+            "name": "proxy_source_dirty",
+            "url": "http://example.invalid/list.txt",
+            "default_protocol": "http",
+            "interval_minutes": 10,
+            "last_run": 0,
+        }
+
+        with patch.object(self.manager, "_fetch_source_text", return_value=payload):
+            parsed = self.manager._fetch_and_parse_source(job)
+
+        self.assertEqual(parsed, [("http", "7.7.7.7", 8080)])
+
+    def test_long_ip_is_rejected(self):
+        """The ip column is VARCHAR(45); anything longer would abort the batch."""
+        long_host = "a" * 46
+        self.assertIsNone(
+            self.manager._parse_proxy_line(f"{long_host}:8080", "http")
+        )
+
+    # ---------- Finding 9: empty batch skipped the pool refresh ----------
+
+    def test_empty_validation_batch_still_refreshes_pool(self):
+        """No proxies to validate is not a reason to keep serving a stale pool."""
+        self.mock_db_instance.get_new_proxies_to_validate.return_value = []
+        self.mock_db_instance.get_active_proxies_to_revalidate.return_value = []
+        self.mock_db_instance.get_eligible_failed_proxies.return_value = []
+        self.mock_db_instance.get_active_proxies.return_value = set()
+
+        self.manager._run_validation_cycle()
+
+        self.mock_db_instance.update_validation_counters.assert_not_called()
+        self.assertEqual(self.mock_db_instance.get_active_proxies.call_count, 1)
+
+    # ---------- Finding 14: new proxies starved the re-validation queue ----------
+
+    def test_validation_budget_is_split_between_new_and_revalidation(self):
+        """Each population gets its own share of validation_batch_limit."""
+        self.manager.validation_batch_limit = 100
+        self.manager.validation_new_proxy_ratio = 0.5
+        self.mock_db_instance.get_new_proxies_to_validate.return_value = []
+        self.mock_db_instance.get_active_proxies_to_revalidate.return_value = []
+
+        self.manager._collect_validation_batch()
+
+        self.assertEqual(
+            self.mock_db_instance.get_new_proxies_to_validate.call_args.kwargs["limit"],
+            50,
+        )
+        self.assertEqual(
+            self.mock_db_instance.get_active_proxies_to_revalidate.call_args.kwargs[
+                "limit"
+            ],
+            50,
+        )
+
+    def test_unused_new_proxy_budget_is_donated_to_revalidation(self):
+        """An empty new-proxy queue must not shrink the cycle."""
+        self.manager.validation_batch_limit = 100
+        self.manager.validation_new_proxy_ratio = 0.5
+        self.mock_db_instance.get_new_proxies_to_validate.return_value = []
+        self.mock_db_instance.get_active_proxies_to_revalidate.side_effect = [
+            [{"id": i, "protocol": "http", "ip": "1.1.1.1", "port": 80} for i in range(50)],
+            [
+                {"id": i, "protocol": "http", "ip": "1.1.1.1", "port": 80}
+                for i in range(100)
+            ],
+        ]
+
+        batch = self.manager._collect_validation_batch()
+
+        self.assertEqual(len(batch), 100)
+        self.assertEqual(
+            self.mock_db_instance.get_active_proxies_to_revalidate.call_args.kwargs[
+                "limit"
+            ],
+            100,
+        )
+
+    def test_supplement_query_excludes_already_selected_ids(self):
+        """
+        Deduplicating in Python after the SQL LIMIT wastes budget; the excluded
+        ids are pushed into the query instead.
+        """
+        self.mock_db_instance.get_new_proxies_to_validate.return_value = [
+            {"id": 7, "protocol": "http", "ip": "1.1.1.1", "port": 80}
+        ]
+        self.mock_db_instance.get_active_proxies_to_revalidate.return_value = []
+        self.mock_db_instance.get_eligible_failed_proxies.return_value = []
+
+        async def mock_validate_batch(proxies):
+            return [], [p["id"] for p in proxies]
+
+        with patch.object(
+            self.manager, "_validate_proxies_batch_async", side_effect=mock_validate_batch
+        ):
+            self.manager._run_validation_cycle()
+
+        self.assertEqual(
+            self.mock_db_instance.get_eligible_failed_proxies.call_args.kwargs[
+                "exclude_ids"
+            ],
+            [7],
+        )
+
+    # ---------- Finding 12: pool truncation laundered bad reputations ----------
+
+    def test_stats_truncation_keeps_proxies_that_carry_a_record(self):
+        """
+        Evicting by score drops a proxy with a failure history, which then
+        re-enters at score=50 / failure_count=0 on the next sync. Evict the
+        never-used entries instead.
+        """
+        self.manager.max_pool_size = 2
+        self.manager.stats_pool_max_multiplier = 1  # cap the stats pool at 2
+        punished = "http://punished:80"
+        stats_pool = {
+            punished: self.manager._get_new_proxy_stat()
+            | {
+                "score": 20.0,
+                "failure_count": 30,
+                "last_feedback_ts": time.time(),
+            },
+            "http://never_used_a:80": self.manager._get_new_proxy_stat(),
+            "http://never_used_b:80": self.manager._get_new_proxy_stat(),
+        }
+
+        retained = self.manager._truncate_stats_pool("source1", stats_pool)
+
+        self.assertEqual(len(retained), 2)
+        self.assertIn(punished, retained)
+        self.assertEqual(retained[punished]["failure_count"], 30)
+        self.assertEqual(retained[punished]["score"], 20.0)
+
+    def test_truncated_bad_proxy_does_not_come_back_whitewashed(self):
+        """After a full sync the punished proxy still carries its history."""
+        self.manager.max_pool_size = 2
+        self.manager.stats_pool_max_multiplier = 1
+        self.manager.rescore_on_sync_enabled = False
+        punished = "http://punished:80"
+        self.manager.source_stats["source1"] = {
+            punished: self.manager._get_new_proxy_stat()
+            | {"score": 20.0, "failure_count": 30, "last_feedback_ts": time.time()},
+            "http://never_used_a:80": self.manager._get_new_proxy_stat(),
+            "http://never_used_b:80": self.manager._get_new_proxy_stat(),
+        }
+        self.mock_db_instance.get_active_proxies.return_value = {punished}
+
+        self.manager._sync_and_select_top_proxies()
+
+        stat = self.manager.source_stats["source1"][punished]
+        self.assertEqual(stat["score"], 20.0)
+        self.assertEqual(stat["failure_count"], 30)
+
+    # ---------- Finding 12 (batch 2): exploration quota for untried proxies ----------
+
+    def test_exploration_can_hand_out_a_proxy_outside_the_top_pool(self):
+        """An untried but live proxy must be reachable even when not in a tier."""
+        self.manager.exploration_ratio = 1.0
+        untried = "http://untried:80"
+        incumbent = "http://incumbent:80"
+        self.manager.active_proxies = {untried, incumbent}
+        self.manager.source_stats["source1"] = {
+            incumbent: self.manager._get_new_proxy_stat()
+            | {"recent_results": [[time.time(), True, 100]]},
+            untried: self.manager._get_new_proxy_stat(),
+        }
+        self.manager.available_proxies["source1"] = {
+            "top_tier": [incumbent],
+            "bottom_tier": [],
+        }
+
+        self.assertEqual(self.manager.get_proxy("source1"), untried)
+
+    def test_exploration_is_disabled_when_ratio_is_zero(self):
+        """exploration_ratio = 0 restores the pure top-pool behaviour."""
+        manager = self.make_manager(
+            {"source_pool": {"exploration_ratio": "0"}}, name="no_explore.ini"
+        )
+        untried = "http://untried:80"
+        incumbent = "http://incumbent:80"
+        manager.active_proxies = {untried, incumbent}
+        manager.source_stats["source1"] = {untried: manager._get_new_proxy_stat()}
+        manager.available_proxies["source1"] = {
+            "top_tier": [incumbent],
+            "bottom_tier": [],
+        }
+
+        self.assertEqual(manager.exploration_ratio, 0.0)
+        self.assertEqual(
+            {manager.get_proxy("source1") for _ in range(20)}, {incumbent}
+        )
+
+    def test_exploration_never_returns_a_dead_proxy(self):
+        """The exploration pool is gated on active_proxies too."""
+        self.manager.exploration_ratio = 1.0
+        dead_untried = "http://dead-untried:80"
+        incumbent = "http://incumbent:80"
+        self.manager.active_proxies = {incumbent}
+        self.manager.source_stats["source1"] = {
+            dead_untried: self.manager._get_new_proxy_stat()
+        }
+        self.manager.available_proxies["source1"] = {
+            "top_tier": [incumbent],
+            "bottom_tier": [],
+        }
+
+        self.assertEqual(self.manager.get_proxy("source1"), incumbent)
+
+    # ---------- Finding 6: backup path drifted / restore failed silently ----------
+
+    def test_relative_backup_path_resolves_from_project_root(self):
+        """A relative stats_backup_path must not depend on the process CWD."""
+        manager = self.make_manager(
+            {
+                "backup": {
+                    "stats_backup_enabled": "false",
+                    "stats_backup_path": "./.local/data/proxy_stats_backup.json",
+                }
+            },
+            name="relpath.ini",
+        )
+        project_root = Path(__file__).resolve().parents[1]
+
+        self.assertTrue(manager.stats_backup_path.is_absolute())
+        self.assertEqual(
+            manager.stats_backup_path,
+            (project_root / ".local" / "data" / "proxy_stats_backup.json").resolve(),
+        )
+
+    def test_absolute_backup_path_is_left_alone(self):
+        absolute = os.path.join(self.tmp_dir, "backup.json")
+        manager = self.make_manager(
+            {"backup": {"stats_backup_enabled": "false", "stats_backup_path": absolute}},
+            name="abspath.ini",
+        )
+
+        self.assertEqual(manager.stats_backup_path, Path(absolute).resolve())
+
+    def test_missing_backup_file_is_reported_as_a_warning(self):
+        """Losing every score on restart must not be an INFO-level event."""
+        self.manager.stats_backup_path = Path(self.tmp_dir) / "missing.json"
+
+        with patch("src.core.proxy_manager.logger.warning") as warn:
+            result = self.manager.restore_stats()
+
+        self.assertEqual(result["status"], "skipped")
+        self.assertTrue(warn.called)
+        self.assertIn("missing.json", str(warn.call_args))
+
+    # ---------- Batch 1 item 4: atomic backup write ----------
+
+    def test_backup_is_written_atomically(self):
+        """A failure mid-dump must leave the previous backup intact."""
+        backup_path = Path(self.tmp_dir) / "stats.json"
+        backup_path.write_text('{"previous": true}', encoding="utf-8")
+        self.manager.stats_backup_path = backup_path
+        self.manager.source_stats["source1"] = {
+            "http://1.1.1.1:80": self.manager._get_new_proxy_stat()
+        }
+
+        with patch(
+            "src.core.proxy_manager.json.dump", side_effect=OSError("disk full")
+        ):
+            result = self.manager.backup_stats()
+
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(json.loads(backup_path.read_text(encoding="utf-8")), {"previous": True})
+        # No temp files left behind.
+        self.assertEqual(
+            [n for n in os.listdir(self.tmp_dir) if n.endswith(".tmp")], []
+        )
+
+    def test_backup_then_restore_round_trips(self):
+        backup_path = Path(self.tmp_dir) / "stats.json"
+        self.manager.stats_backup_path = backup_path
+        self.manager.source_stats["source1"] = {
+            "http://1.1.1.1:80": self.manager._get_new_proxy_stat() | {"score": 77.0}
+        }
+
+        self.assertEqual(self.manager.backup_stats()["status"], "success")
+        self.manager.source_stats["source1"] = {}
+        self.assertEqual(self.manager.restore_stats()["status"], "success")
+
+        self.assertEqual(
+            self.manager.source_stats["source1"]["http://1.1.1.1:80"]["score"], 77.0
+        )
+
+    # ---------- Finding 11: reload_sources only reloaded sources ----------
+
+    def test_reload_sources_reloads_the_whole_config(self):
+        """Editing any tunable and calling /reload-sources must take effect."""
+        self.assertEqual(self.manager.max_pool_size, 100)
+        self.assertEqual(self.manager.selection_strategy, "uniform")
+
+        updated = {
+            section: dict(options) for section, options in self.config_dict.items()
+        }
+        updated["source_pool"]["max_pool_size"] = "321"
+        updated["source_pool"]["selection_strategy"] = "weighted"
+        updated["validator"]["validation_workers"] = "42"
+        config = configparser.ConfigParser()
+        config.read_dict(updated)
+        with open(self.config_path, "w", encoding="utf-8") as f:
+            config.write(f)
+
+        result = self.manager.reload_sources()
+
+        self.assertEqual(self.manager.max_pool_size, 321)
+        self.assertEqual(self.manager.selection_strategy, "weighted")
+        self.assertEqual(self.manager.validation_workers, 42)
+        self.assertIn("restart_required_for", result)
+
+    def test_reload_sources_still_reports_source_changes(self):
+        updated = {
+            section: dict(options) for section, options in self.config_dict.items()
+        }
+        updated["sources"]["predefined_sources"] = "source1,source3"
+        config = configparser.ConfigParser()
+        config.read_dict(updated)
+        with open(self.config_path, "w", encoding="utf-8") as f:
+            config.write(f)
+
+        result = self.manager.reload_sources()
+
+        self.assertEqual(result["added_predefined_sources"], ["source3"])
+        self.assertEqual(result["removed_predefined_sources"], ["source2"])
+
+    # ---------- Finding 18: silent config drift ----------
+
+    def test_config_drift_reports_missing_keys(self):
+        example_path = Path(self.tmp_dir) / "example.ini"
+        # softmax_temperature is deliberately absent from the test fixture ini,
+        # so it is exactly the kind of key that silently falls back to a default.
+        example_path.write_text(
+            "[source_pool]\nmax_pool_size = 200\nsoftmax_temperature = 20.0\n"
+            "[brand_new]\nkey = value\n",
+            encoding="utf-8",
+        )
+
+        drift = self.manager.check_config_drift(example_path)
+
+        self.assertIn("[source_pool] softmax_temperature", drift["missing"])
+        self.assertIn("[brand_new] (entire section)", drift["missing"])
+        self.assertNotIn("[source_pool] max_pool_size", drift["missing"])
+
+    def test_config_drift_reports_deprecated_keys(self):
+        example_path = Path(self.tmp_dir) / "example.ini"
+        example_path.write_text("[source_pool]\nmax_pool_size = 200\n", encoding="utf-8")
+        self.manager.config.set("source_pool", "failure_penalties", "1")
+
+        drift = self.manager.check_config_drift(example_path)
+
+        self.assertIn("[source_pool] failure_penalties", drift["unknown"])
+
+    def test_config_drift_ignores_proxy_source_sections(self):
+        """Proxy sources are per-deployment and must never be flagged."""
+        example_path = Path(self.tmp_dir) / "example.ini"
+        example_path.write_text(
+            "[proxy_source_zzz]\nurl = http://example.invalid\n", encoding="utf-8"
+        )
+
+        drift = self.manager.check_config_drift(example_path)
+
+        self.assertEqual(drift["missing"], [])
+        self.assertEqual(drift["unknown"], [])
+
+    def test_shipped_example_config_covers_every_configurable_key(self):
+        """
+        Guard against the reverse drift: a new tunable added in code but never
+        documented in config.example.ini.
+        """
+        from src.core.proxy_manager import CONFIG_EXAMPLE_PATH
+
+        example = configparser.ConfigParser()
+        example.read(CONFIG_EXAMPLE_PATH, encoding="utf-8")
+        for section, option in [
+            ("source_pool", "exploration_ratio"),
+            ("source_pool", "elo_prior_successes"),
+            ("source_pool", "elo_prior_failures"),
+            ("source_pool", "rescore_on_sync_enabled"),
+            ("validator", "validation_new_proxy_ratio"),
+        ]:
+            with self.subTest(option=option):
+                self.assertTrue(
+                    example.has_option(section, option),
+                    f"[{section}] {option} is missing from config.example.ini",
+                )
+
+    # ---------- Test baseline: config really is read from the file ----------
+
+    def test_manager_loads_values_from_the_real_config_file(self):
+        """
+        The old fixture patched ConfigParser.read, so manager.config was empty
+        and every assertion below would have seen a fallback default instead.
+        """
+        self.assertTrue(self.manager.config.has_section("source_pool"))
+        self.assertEqual(self.manager.max_pool_size, 100)          # default is 500
+        self.assertEqual(self.manager.stats_pool_max_multiplier, 10)  # default is 20
+        self.assertEqual(self.manager.validation_workers, 10)      # default is 100
+        self.assertEqual(self.manager.top_tier_size, 50)           # default is 100
+        self.assertEqual(
+            self.manager.validation_target, "http://mocktarget.com"
+        )  # default is httpbin
+
+
+class TestSourcesEndpointCaching(unittest.TestCase):
+    """Finding 10: /api/sources ran a SELECT DISTINCT on every request."""
+
+    def setUp(self):
+        from src.api.server import create_app
+
+        self.mock_proxy_manager = MagicMock(spec=ProxyManager)
+        self.mock_proxy_manager.allowed_ips = []
+        self.mock_proxy_manager.trust_proxy_headers = False
+        self.mock_proxy_manager.trusted_proxy_ips = []
+        self.mock_proxy_manager.lock = threading.RLock()
+        self.mock_proxy_manager.dashboard_sources = {"default", "insolvencydirect"}
+        self.mock_proxy_manager.db = MagicMock(spec=DatabaseManager)
+        self.client = create_app(self.mock_proxy_manager).test_client()
+
+    def test_repeated_requests_do_not_hit_the_database(self):
+        for _ in range(3):
+            response = self.client.get(
+                "/api/sources", environ_overrides={"REMOTE_ADDR": "127.0.0.1"}
+            )
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(
+                response.get_json(), ["default", "insolvencydirect"]
+            )
+
+        self.assertLessEqual(
+            self.mock_proxy_manager.db.get_distinct_sources.call_count, 1
+        )
+        self.mock_proxy_manager._update_dashboard_sources.assert_not_called()
+
+
+class TestValidationQueueSQL(unittest.TestCase):
+    """
+    Finding 7 and finding 14, verified at the SQL-text level.
+
+    There is no local PostgreSQL instance, so these assert the statement text
+    and the bound parameters only - not the execution plan or index usage.
+    """
+
+    def setUp(self):
+        with patch("src.database.db.psycopg2.pool.ThreadedConnectionPool"):
+            config = configparser.ConfigParser()
+            config.read_dict(
+                {
+                    "database": {
+                        "host": "localhost",
+                        "port": "5432",
+                        "dbname": "test",
+                        "user": "user",
+                        "password": "password",
+                    }
+                }
+            )
+            self.db = DatabaseManager(config)
+
+    def _capture(self, call):
+        with patch.object(self.db, "_execute", return_value=[]) as execute:
+            call()
+        return execute.call_args
+
+    def test_eligible_failed_proxies_orders_oldest_first(self):
+        """
+        DESC re-tested the proxies that had just failed; NULLS FIRST pulled in
+        never-validated rows that the main query already owns.
+        """
+        args = self._capture(
+            lambda: self.db.get_eligible_failed_proxies(
+                window_minutes=30, max_attempts=5, limit=10
+            )
+        )
+        query = " ".join(args[0][0].split())
+
+        self.assertIn("ORDER BY last_validated_at ASC, created_at ASC", query)
+        self.assertNotIn("DESC", query)
+        self.assertNotIn("NULLS FIRST", query)
+        self.assertIn("AND last_validated_at IS NOT NULL", query)
+
+    def test_eligible_failed_proxies_passes_exclude_ids(self):
+        args = self._capture(
+            lambda: self.db.get_eligible_failed_proxies(
+                window_minutes=30, max_attempts=5, limit=10, exclude_ids=[1, 2]
+            )
+        )
+
+        self.assertEqual(args[0][1]["exclude_ids"], [1, 2])
+        self.assertIn("exclude_ids", " ".join(args[0][0].split()))
+
+    def test_new_and_revalidation_queries_are_disjoint(self):
+        new_query = " ".join(
+            self._capture(lambda: self.db.get_new_proxies_to_validate(limit=10))[0][
+                0
+            ].split()
+        )
+        reval_query = " ".join(
+            self._capture(
+                lambda: self.db.get_active_proxies_to_revalidate(
+                    interval_minutes=30, limit=10
+                )
+            )[0][0].split()
+        )
+
+        self.assertIn("WHERE last_validated_at IS NULL", new_query)
+        self.assertIn("ORDER BY created_at ASC, id ASC", new_query)
+        self.assertIn("last_validated_at IS NOT NULL", reval_query)
+        self.assertIn("is_active = true", reval_query)
+        self.assertIn("ORDER BY last_validated_at ASC, id ASC", reval_query)
+
+    def test_queue_queries_short_circuit_on_empty_budget(self):
+        with patch.object(self.db, "_execute") as execute:
+            self.assertEqual(self.db.get_new_proxies_to_validate(limit=0), [])
+            self.assertEqual(
+                self.db.get_active_proxies_to_revalidate(interval_minutes=30, limit=0),
+                [],
+            )
+            self.assertEqual(
+                self.db.get_eligible_failed_proxies(
+                    window_minutes=30, max_attempts=5, limit=0
+                ),
+                [],
+            )
+        execute.assert_not_called()
+
+    def test_combined_queue_query_has_deterministic_ordering(self):
+        args = self._capture(
+            lambda: self.db.get_proxies_to_validate(interval_minutes=30, limit=10)
+        )
+        query = " ".join(args[0][0].split())
+
+        self.assertIn("ORDER BY last_validated_at ASC NULLS FIRST, id ASC", query)
+
+    def test_insert_proxies_uses_a_large_page_size(self):
+        """Finding: execute_values defaults to page_size=100."""
+        conn = MagicMock()
+        self.db.pool = MagicMock()
+        self.db.pool.getconn.return_value = conn
+
+        with patch("src.database.db.psycopg2.extras.execute_values") as execute_values:
+            self.db.insert_proxies([("http", "1.1.1.1", 80)])
+
+        self.assertEqual(execute_values.call_args.kwargs["page_size"], 1000)
+
+    def test_insert_proxies_does_not_log_rowcount(self):
+        """
+        psycopg2 documents that after execute_values, cursor.rowcount "will not
+        contain a total result" - the old log line reported the last page only.
+        """
+        conn = MagicMock()
+        cursor = conn.cursor.return_value.__enter__.return_value
+        cursor.rowcount = 1  # would be the misleading number
+        self.db.pool = MagicMock()
+        self.db.pool.getconn.return_value = conn
+
+        with patch("src.database.db.psycopg2.extras.execute_values"), patch(
+            "src.database.db.logger.info"
+        ) as info:
+            self.db.insert_proxies([("http", "1.1.1.1", 80)] * 5)
+
+        logged = " ".join(str(call) for call in info.call_args_list)
+        self.assertIn("5", logged)
+        self.assertNotIn("1/", logged)
 
 
 class TestDatabaseManager(unittest.TestCase):
