@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import math
 import os
 import sys
 import argparse
@@ -218,15 +219,35 @@ smartproxy_is_validating {1 if proxy_manager.is_validating else 0}
         logger.debug(
             f"Handled feedback: {source} - {status_code} - {proxy_url} - {resp_time}"
         )
-        if not all([source, proxy_url]) or not isinstance(status_code, int):
+
+        # Validate strictly at the boundary. Anything that reaches
+        # process_feedback is written into the persistent scoring state and is
+        # later fed to _calculate_elo_score for the whole pool, so a single
+        # wrong-typed value would poison the stat and crash every later sync.
+        # bool is a subclass of int, so `type(...) is int` is deliberate.
+        if not isinstance(source, str) or not source.strip():
+            return jsonify({"error": "'source' must be a non-empty string."}), 400
+        if not isinstance(proxy_url, str) or not proxy_url.strip():
+            return jsonify({"error": "'proxy' must be a non-empty string."}), 400
+        if type(status_code) is not int:
             return (
                 jsonify(
                     {
-                        "error": "Invalid feedback data. 'source', 'proxy', and 'status_code' (int) are required."
+                        "error": "Invalid feedback data. 'source', 'proxy', and 'status' (int) are required."
                     }
                 ),
                 400,
             )
+        if resp_time is not None:
+            if type(resp_time) not in (int, float) or not math.isfinite(resp_time) or resp_time < 0:
+                return (
+                    jsonify(
+                        {"error": "'response_time_ms' must be a finite, non-negative number."}
+                    ),
+                    400,
+                )
+        if failure_kind is not None and not isinstance(failure_kind, str):
+            return jsonify({"error": "'failure_kind' must be a string."}), 400
         if not proxy_manager.is_valid_feedback_status(status_code):
             return (
                 jsonify(

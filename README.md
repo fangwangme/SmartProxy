@@ -7,7 +7,7 @@ SmartProxy is a sophisticated proxy management system designed to provide reliab
 * **Automated Proxy Fetching**: Gathers proxies from multiple user-defined sources.  
 * **Intelligent Validation & Scoring**: Validation is a liveness gate (`is_active`); ranking is owned entirely by client feedback, which drives a 0-100 ELO-style score over a sliding window.  
 * **Feedback-Driven Adaptation**: Success and failure both move the score, with small samples shrunk toward the neutral baseline so a single observation cannot crown or exile a proxy.  
-* **Dynamic Configuration Reloading**: A hot-reload endpoint (/reload-sources) re-reads the whole config file - sources, fetcher jobs, and every tunable - without restarting the service.  
+* **Dynamic Configuration Reloading**: A hot-reload endpoint (/reload-sources) re-reads the whole config file - sources, fetcher jobs, and every tunable - authoritatively and transactionally, without restarting the service.  
 * **Sustainable Validation Logic**: Employs a time-window-based attempt limit for re-validating failed proxies. This prevents proxy burnout, reduces database load, and ensures long-term service stability.  
 * **Source-Specific Pools**: Maintains separate proxy pools for different sources/use cases.  
 * **RESTful API**: Simple endpoints for fetching proxies and submitting feedback.  
@@ -207,7 +207,11 @@ Submits feedback on a proxy's performance. This is crucial for the scoring syste
 
 Triggers a hot-reload of config.ini. Every tunable is re-read - `[source_pool]`, `[validator]`, `[scheduler]`, `[backup]`, `[sources]` and the `[proxy_source_*]` sections - so you can add or remove proxy sources, update `predefined_sources`, and retune scoring or selection without restarting the service.
 
-Two settings are **not** reloadable, because they are consumed once at startup: the `[database]` connection pool and `[server] port`. Changing either requires a restart; the response lists them under `restart_required_for`.
+The reload is **authoritative**: the file is re-parsed into a fresh parser, so a key or a whole `[proxy_source_*]` section you delete from the file is genuinely dropped and reverts to its built-in default, rather than keeping its old in-memory value.
+
+It is also **transactional**: the new configuration is applied as a unit. If any value fails to parse, the service rolls back to the configuration it was running and returns an error, instead of being left on a mix of old and new settings.
+
+Three settings are **not** reloadable, because they are consumed once at startup: the `[database]` connection pool, `[server] port`, and `[logging]`. Changing any of them requires a restart; the response lists them under `restart_required_for`.
 
 ```bash
 curl -X POST -H "Content-Type: application/json" http://127.0.0.1:6942/reload-sources
@@ -225,7 +229,11 @@ curl -X POST -H "Content-Type: application/json" http://127.0.0.1:6942/reload-so
       "removed_fetcher_jobs": [],  
       "added_predefined_sources": ["new_pool"],  
       "removed_predefined_sources": [],  
-      "restart_required_for": ["[database] connection pool", "[server] port"]  
+      "restart_required_for": [  
+        "[database] connection pool",  
+        "[server] port",  
+        "[logging] log_dir / log_file_base_name"  
+      ]  
     }  
   }  
 ```

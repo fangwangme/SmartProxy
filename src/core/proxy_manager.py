@@ -2,6 +2,7 @@
 import os
 import configparser
 import copy
+import ipaddress
 import json
 import math
 import random
@@ -70,6 +71,11 @@ class ProxyManager:
         )  # MODIFIED: Structure for tiers
         self.premium_proxies: List[str] = []  # High-quality proxies for Playwright
         self.proxy_last_handed_out_ts: Dict[str, Dict[str, float]] = defaultdict(dict)
+
+        # Serialises the whole snapshot -> dump -> fsync -> replace sequence.
+        # self.lock only guards the snapshot, so two concurrent backups could
+        # interleave and let an older snapshot land last.
+        self.backup_lock = threading.Lock()
 
         self.feedback_buffer = defaultdict(
             lambda: defaultdict(lambda: defaultdict(int))
@@ -421,7 +427,11 @@ class ProxyManager:
 
     # Config that cannot be applied without a restart, because it is consumed
     # once at construction time.
-    RESTART_REQUIRED_CONFIG = ("[database] connection pool", "[server] port")
+    RESTART_REQUIRED_CONFIG = (
+        "[database] connection pool",
+        "[server] port",
+        "[logging] log_dir / log_file_base_name",
+    )
 
     def reload_sources(self) -> Dict:
         """
@@ -433,13 +443,40 @@ class ProxyManager:
         """
         logger.info("Attempting to reload configuration from config file...")
         with self.lock:
-            self.config.read(self.config_path, encoding="utf-8")
+            # A fresh parser, not self.config.read(): ConfigParser.read() MERGES
+            # into the existing object, so a key or a [proxy_source_*] section
+            # deleted from the file would keep its old in-memory value and the
+            # reload would silently not be authoritative.
+            new_config = configparser.ConfigParser()
+            if not new_config.read(self.config_path, encoding="utf-8"):
+                logger.error(
+                    "Config reload aborted: {} could not be read. Keeping the "
+                    "running configuration.",
+                    self.config_path,
+                )
+                raise RuntimeError(f"Config file not readable: {self.config_path}")
 
-            # Re-apply every tunable. _load_config() also refreshes
-            # predefined_sources/default_source; the diff below is computed
-            # against the snapshot taken before this call.
+            # Apply transactionally. _load_config() assigns ~40 attributes one
+            # by one, so an invalid value partway through would otherwise leave
+            # the service running on half-new, half-old settings.
+            old_config = self.config
+            attribute_snapshot = dict(self.__dict__)
             old_predefined_sources_before_reload = self.predefined_sources.copy()
-            self._load_config()
+
+            self.config = new_config
+            try:
+                self._load_config()
+            except Exception as e:
+                self.__dict__.update(attribute_snapshot)
+                self.config = old_config
+                self._load_config()
+                logger.error(
+                    "Config reload failed ({}); rolled back to the previous "
+                    "configuration.",
+                    e,
+                )
+                raise
+
             self.check_config_drift()
 
             old_job_names = {job["name"] for job in self.fetcher_jobs}
@@ -585,6 +622,18 @@ class ProxyManager:
         # Credentials are not supported; "user:pass@host" would otherwise be
         # stored verbatim as the IP.
         if not ip or "@" in ip or len(ip) > MAX_IP_LENGTH:
+            return None
+
+        # Must be a real IP literal. Length and "@" checks alone are not enough:
+        # a NUL or other control character passes them, and psycopg2 then raises
+        # on the whole execute_values batch, taking every valid row with it.
+        # The ip column is VARCHAR(45) - exactly max IPv6 length - so the schema
+        # already intends literals, not hostnames.
+        if ip.startswith("[") and ip.endswith("]"):
+            ip = ip[1:-1]
+        try:
+            ipaddress.ip_address(ip)
+        except ValueError:
             return None
 
         try:
@@ -1040,35 +1089,76 @@ class ProxyManager:
 
             self._sync_premium_proxies_locked()
 
+    @staticmethod
+    def _coerce_latency(value) -> Optional[int]:
+        """
+        Return value as a usable latency, or None.
+
+        Anything non-numeric that reaches recent_results poisons the stat
+        permanently: _calculate_elo_score runs over the whole pool on every
+        sync, so one bad entry would raise there and stop pool refreshes for
+        every source. The API validates its input, but restored backups and
+        legacy files are also untrusted, so the score path never assumes.
+        """
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        if not math.isfinite(value) or value < 0:
+            return None
+        return int(value)
+
+    @staticmethod
+    def _feedback_ts(stat: Dict) -> float:
+        ts = stat.get("last_feedback_ts")
+        return float(ts) if isinstance(ts, (int, float)) and not isinstance(ts, bool) else 0.0
+
     def _truncate_stats_pool(self, source: str, stats_pool: Dict[str, Dict]) -> Dict[str, Dict]:
         """
-        Cap the stats pool, evicting by staleness rather than by score.
+        Cap the stats pool, keeping live proxies first and evicting by staleness.
 
-        Evicting the lowest scores looks right but launders reputation: a proxy
-        with a long failure history is dropped, then re-enters on the next sync
-        as a pristine score=50 / failure_count=0 candidate and displaces peers
-        that still carry their record. Proxies with the oldest (or no) feedback
-        are the ones that can be dropped without losing information.
+        Two failure modes have to be avoided at once:
+
+        1. Evicting by score launders reputation - a proxy with a long failure
+           history is dropped, then re-enters on the next sync as a pristine
+           score=50 / failure_count=0 candidate and displaces peers that still
+           carry their record.
+        2. Evicting purely by staleness starves the pool of live proxies - a
+           freshly discovered active proxy has no last_feedback_ts at all, so it
+           ranks below every dead proxy that still carries an old timestamp. At
+           the cap that silently evicts the entire live pool and get_proxy()
+           starts returning None.
+
+        So: live proxies are retained ahead of dead ones, and only within a
+        group does staleness decide. When even the live set overflows the cap, a
+        slice proportional to exploration_ratio is reserved for unproven live
+        proxies so they cannot be crowded out by incumbents forever.
         """
         max_stats_size = self.max_pool_size * self.stats_pool_max_multiplier
         if len(stats_pool) <= max_stats_size:
             return stats_pool
 
-        def _retention_key(item: Tuple[str, Dict]) -> Tuple[float, float]:
-            stat = item[1]
-            last_feedback_ts = stat.get("last_feedback_ts")
-            if not isinstance(last_feedback_ts, (int, float)):
-                last_feedback_ts = 0.0
-            return (float(last_feedback_ts), float(stat.get("score", 0.0)))
+        live, dead = [], []
+        for item in stats_pool.items():
+            (live if item[0] in self.active_proxies else dead).append(item)
 
-        retained = sorted(stats_pool.items(), key=_retention_key, reverse=True)[
-            :max_stats_size
-        ]
+        by_staleness = lambda item: (self._feedback_ts(item[1]), float(item[1].get("score", 0.0)))
+
+        if len(live) <= max_stats_size:
+            retained = sorted(live, key=by_staleness, reverse=True)
+            remaining = max_stats_size - len(retained)
+            if remaining > 0:
+                retained += sorted(dead, key=by_staleness, reverse=True)[:remaining]
+        else:
+            proven = [i for i in live if self._feedback_ts(i[1]) > 0]
+            unproven = [i for i in live if self._feedback_ts(i[1]) == 0]
+            reserve = min(len(unproven), max(1, int(max_stats_size * self.exploration_ratio)))
+            retained = sorted(proven, key=by_staleness, reverse=True)[: max_stats_size - reserve]
+            retained += unproven[: max_stats_size - len(retained)]
+
         logger.info(
             f"Stats pool for source '{source}' exceeds limit "
-            f"({len(stats_pool)} > {max_stats_size}). "
-            f"Evicting {len(stats_pool) - max_stats_size} proxies with the "
-            f"oldest feedback."
+            f"({len(stats_pool)} > {max_stats_size}). Evicting "
+            f"{len(stats_pool) - len(retained)} proxies (dead first, then oldest "
+            f"feedback); {len(live)} live proxies in the pool."
         )
         return dict(retained)
 
@@ -1192,6 +1282,10 @@ class ProxyManager:
 
     def backup_stats(self) -> Dict:
         """Backup source_stats to a JSON file."""
+        with self.backup_lock:
+            return self._backup_stats_locked()
+
+    def _backup_stats_locked(self) -> Dict:
         with self.lock:
             # Deep copy: a shallow dict() still shares every stat dict and its
             # recent_results list with the live pool, which json.dump then walks
@@ -1337,15 +1431,21 @@ class ProxyManager:
             top_tier = proxy_pools.get("top_tier", [])
             bottom_tier = proxy_pools.get("bottom_tier", [])
             flat_pool = top_tier + bottom_tier
-            candidates = self._filter_cooldown_candidates(source, flat_pool)
-            if not candidates:
-                logger.warning(f"No available proxy for source '{source}' after cooldown filtering.")
-                return None
 
+            # Exploration first: it does its own cooldown filtering and draws
+            # from the whole stats pool, so it must not be gated on the ranked
+            # pool having a cooldown-free candidate. Checking `candidates` first
+            # made an entirely-cooled-down top pool return None even when an
+            # untried proxy was available.
             explored = self._maybe_select_exploration_candidate(source)
             if explored is not None:
                 self.proxy_last_handed_out_ts[source][explored] = time.time()
                 return explored
+
+            candidates = self._filter_cooldown_candidates(source, flat_pool)
+            if not candidates:
+                logger.warning(f"No available proxy for source '{source}' after cooldown filtering.")
+                return None
 
             if self.selection_strategy == "uniform":
                 selected = random.choice(candidates)
@@ -1393,7 +1493,17 @@ class ProxyManager:
         candidates = self._filter_cooldown_candidates(source, unproven)
         if not candidates:
             return None
-        return random.choice(candidates)
+
+        # "Unproven" means no feedback yet, which is not the same as never
+        # handed out: a proxy whose caller never reports back keeps qualifying
+        # and would absorb the entire exploration budget forever. Prefer
+        # genuinely untried proxies; once all have been tried at least once,
+        # rotate to whichever was explored longest ago.
+        handed_out = self.proxy_last_handed_out_ts.get(source, {})
+        never_tried = [url for url in candidates if url not in handed_out]
+        if never_tried:
+            return random.choice(never_tried)
+        return min(candidates, key=lambda url: handed_out.get(url, 0.0))
 
     def _filter_cooldown_candidates(self, source: str, proxy_urls: List[str]) -> List[str]:
         if self.proxy_cooldown_ms <= 0:
@@ -1700,9 +1810,12 @@ class ProxyManager:
         # 2. Latency component (0-30 points)
         # Lower latency = higher score
         latency_pairs = [
-            (r[2], w)
-            for r, w in zip(recent, weights)
-            if len(r) >= 3 and r[1] and r[2] is not None
+            (latency, w)
+            for latency, w in (
+                (self._coerce_latency(r[2]) if len(r) >= 3 and r[1] else None, w)
+                for r, w in zip(recent, weights)
+            )
+            if latency is not None
         ]
         if latency_pairs:
             weighted_latency_sum = sum(latency * weight for latency, weight in latency_pairs)
@@ -1830,21 +1943,23 @@ class ProxyManager:
             stat["consecutive_failures"] = 0
             
             # Update exponential moving average of latency for observability.
-            if response_time_ms is not None:
+            latency = self._coerce_latency(response_time_ms)
+            if latency is not None:
                 alpha = self.avg_latency_alpha
-                if stat["avg_latency_ms"] is None:
-                    stat["avg_latency_ms"] = response_time_ms
+                previous = self._coerce_latency(stat.get("avg_latency_ms"))
+                if previous is None:
+                    stat["avg_latency_ms"] = latency
                 else:
-                    stat["avg_latency_ms"] = (
-                        alpha * response_time_ms + 
-                        (1 - alpha) * stat["avg_latency_ms"]
-                    )
+                    stat["avg_latency_ms"] = alpha * latency + (1 - alpha) * previous
         else:
             stat["failure_count"] += 1
             stat["consecutive_failures"] += 1
         
         # Add to sliding window (keep last elo_max_window results)
-        stat["recent_results"].append([current_timestamp, is_success, response_time_ms])
+        latency_for_log = self._coerce_latency(response_time_ms)
+        stat["recent_results"].append(
+            [current_timestamp, is_success, self._coerce_latency(response_time_ms)]
+        )
         if len(stat["recent_results"]) > self.elo_max_window:
             stat["recent_results"] = stat["recent_results"][-self.elo_max_window:]
         stat["last_feedback_ts"] = current_timestamp
@@ -1853,7 +1968,7 @@ class ProxyManager:
         old_score = stat["score"]
         stat["score"] = self._calculate_elo_score(stat, source)
         
-        response_time_str = f"{response_time_ms:.0f}" if response_time_ms is not None else "N/A"
+        response_time_str = f"{latency_for_log:.0f}" if latency_for_log is not None else "N/A"
         logger.debug(
             f"ELO Score: {source:<15} | {proxy_url:<30} | "
             f"{'OK' if is_success else 'FAIL':<4} | {response_time_str:<6}ms | "

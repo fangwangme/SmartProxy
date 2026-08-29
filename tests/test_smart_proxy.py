@@ -1251,6 +1251,328 @@ class TestIssue13PoolQuality(ProxyManagerTestBase):
         )  # default is httpbin
 
 
+class TestReviewRegressions(ProxyManagerTestBase):
+    """
+    Regressions found reviewing the issue #13 fix itself. Several were
+    introduced by that fix; the rest it made reachable.
+    """
+
+    # --- Malformed feedback must not poison persistent scoring state ---
+
+    def test_non_numeric_latency_never_reaches_the_stat(self):
+        """
+        A string latency used to be stored verbatim in recent_results, and
+        _calculate_elo_score then raised on it. Because the pool is rescored on
+        every sync, that one stat stopped pool refreshes for every source.
+        """
+        url = "http://1.1.1.1:80"
+        self.manager.source_stats["source1"] = {url: self.manager._get_new_proxy_stat()}
+
+        self.manager.process_feedback("source1", url, 200, response_time_ms="fast")
+
+        stat = self.manager.source_stats["source1"][url]
+        self.assertIsNone(stat["avg_latency_ms"])
+        self.assertEqual(stat["recent_results"], [[stat["last_feedback_ts"], True, None]])
+        self.assertIsInstance(self.manager._calculate_elo_score(stat), float)
+
+    def test_poisoned_stat_from_a_backup_cannot_break_the_sync(self):
+        """Restored backups are untrusted; the score path must survive them."""
+        url = "http://1.1.1.1:80"
+        poisoned = self.manager._get_new_proxy_stat()
+        poisoned["recent_results"] = [
+            [time.time(), True, "fast"],
+            [time.time(), True, None],
+            [time.time(), True, float("inf")],
+            [time.time(), True, -5],
+            [time.time(), True, True],
+        ]
+        self.manager.source_stats["source1"] = {url: poisoned}
+        self.mock_db_instance.get_active_proxies.return_value = {url}
+
+        self.manager._sync_and_select_top_proxies()   # must not raise
+
+        self.assertIsInstance(
+            self.manager.source_stats["source1"][url]["score"], float
+        )
+
+    def test_feedback_endpoint_rejects_malformed_payloads(self):
+        from src.api.server import create_app
+
+        pm = MagicMock(spec=ProxyManager)
+        pm.allowed_ips = []
+        pm.trust_proxy_headers = False
+        pm.trusted_proxy_ips = []
+        pm.lock = threading.RLock()
+        pm.is_valid_feedback_status.return_value = True
+        client = create_app(pm).test_client()
+
+        bad_payloads = [
+            {"source": "s", "proxy": "p", "status": 200, "response_time_ms": "fast"},
+            {"source": "s", "proxy": "p", "status": 200, "response_time_ms": -1},
+            {"source": "s", "proxy": "p", "status": 200, "response_time_ms": float("nan")},
+            {"source": "s", "proxy": "p", "status": True},          # bool is not an int here
+            {"source": "", "proxy": "p", "status": 200},
+            {"source": 5, "proxy": "p", "status": 200},
+            {"source": "s", "proxy": None, "status": 200},
+            {"source": "s", "proxy": "p", "status": 200, "failure_kind": 7},
+        ]
+        for payload in bad_payloads:
+            with self.subTest(payload=payload):
+                r = client.post(
+                    "/feedback", json=payload,
+                    environ_overrides={"REMOTE_ADDR": "127.0.0.1"},
+                )
+                self.assertEqual(r.status_code, 400)
+        pm.process_feedback.assert_not_called()
+
+        r = client.post(
+            "/feedback",
+            json={"source": "s", "proxy": "p", "status": 200, "response_time_ms": 12.5},
+            environ_overrides={"REMOTE_ADDR": "127.0.0.1"},
+        )
+        self.assertEqual(r.status_code, 200)
+
+    # --- Parser must reject anything PostgreSQL would reject ---
+
+    def test_parser_rejects_nul_and_non_ip_hosts(self):
+        """
+        A NUL byte passes a length/'@' check but makes psycopg2 raise on the
+        whole execute_values batch, losing every valid row with it.
+        """
+        for line in [
+            "1.2.3.4\x00:80",
+            "1.2.3.4\x01:80",
+            "1.2.3.4 5:80",
+            "not_an_ip:80",
+            "256.1.1.1:80",
+            "1.2.3.4.5:80",
+            "::80",
+            "'; DROP TABLE proxies; --:80",
+        ]:
+            with self.subTest(line=line):
+                self.assertIsNone(self.manager._parse_proxy_line(line, "http"))
+
+    def test_parser_still_accepts_valid_ipv4_and_ipv6(self):
+        cases = {
+            ("1.2.3.4:8080", "http"): ("http", "1.2.3.4", 8080),
+            ("  1.2.3.4:8080  ".strip(), "http"): ("http", "1.2.3.4", 8080),
+            ("[2001:db8::1]:1080", "socks5"): ("socks5", "2001:db8::1", 1080),
+            ("http://[::1]:8080", None): ("http", "::1", 8080),
+        }
+        for (line, dp), expected in cases.items():
+            with self.subTest(line=line):
+                self.assertEqual(self.manager._parse_proxy_line(line, dp), expected)
+
+    def test_dirty_row_between_two_valid_rows_is_dropped(self):
+        payload = "\n".join(["1.1.1.1:80", "2.2.2.2\x00:80", "3.3.3.3:80"])
+        job = {"name": "j", "url": "u", "default_protocol": "http",
+               "interval_minutes": 10, "last_run": 0}
+
+        with patch.object(self.manager, "_fetch_source_text", return_value=payload):
+            parsed = self.manager._fetch_and_parse_source(job)
+
+        self.assertEqual(parsed, [("http", "1.1.1.1", 80), ("http", "3.3.3.3", 80)])
+
+    # --- Truncation must never trade a live proxy for a dead one ---
+
+    def test_truncation_never_evicts_live_in_favour_of_dead(self):
+        """
+        Staleness-only eviction ranks a freshly discovered live proxy (no
+        last_feedback_ts) below every dead proxy that still carries an old
+        timestamp - at the cap that empties the live pool entirely.
+        """
+        self.manager.max_pool_size = 2
+        self.manager.stats_pool_max_multiplier = 1
+        self.manager.rescore_on_sync_enabled = False
+        now = time.time()
+        newcomer = "http://new:80"
+        self.manager.source_stats["source1"] = {
+            "http://dead1:80": self.manager._get_new_proxy_stat() | {"last_feedback_ts": now},
+            "http://dead2:80": self.manager._get_new_proxy_stat() | {"last_feedback_ts": now},
+        }
+        self.mock_db_instance.get_active_proxies.return_value = {newcomer}
+
+        self.manager._sync_and_select_top_proxies()
+
+        self.assertIn(newcomer, self.manager.source_stats["source1"])
+        self.assertEqual(self.manager.available_proxies["source1"]["top_tier"], [newcomer])
+        self.assertEqual(self.manager.get_proxy("source1"), newcomer)
+
+    def test_truncation_still_keeps_punished_history_over_stale_dead(self):
+        """The original anti-laundering property must survive the live-first rule."""
+        self.manager.max_pool_size = 2
+        self.manager.stats_pool_max_multiplier = 1
+        now = time.time()
+        punished = "http://punished:80"
+        self.manager.active_proxies = {punished, "http://live2:80"}
+        pool = {
+            punished: self.manager._get_new_proxy_stat()
+            | {"score": 20.0, "failure_count": 30, "last_feedback_ts": now},
+            "http://live2:80": self.manager._get_new_proxy_stat(),
+            "http://deadold:80": self.manager._get_new_proxy_stat()
+            | {"last_feedback_ts": now - 99999},
+        }
+
+        retained = self.manager._truncate_stats_pool("source1", pool)
+
+        self.assertIn(punished, retained)
+        self.assertEqual(retained[punished]["failure_count"], 30)
+        self.assertNotIn("http://deadold:80", retained)
+
+    def test_truncation_reserves_slots_for_unproven_live_proxies(self):
+        """When live proxies alone overflow the cap, newcomers keep a share."""
+        self.manager.max_pool_size = 10
+        self.manager.stats_pool_max_multiplier = 1   # cap 10
+        self.manager.exploration_ratio = 0.2         # reserve 2
+        now = time.time()
+        proven = {f"http://p{i}:80": self.manager._get_new_proxy_stat()
+                  | {"last_feedback_ts": now - i} for i in range(15)}
+        unproven = {f"http://u{i}:80": self.manager._get_new_proxy_stat() for i in range(5)}
+        pool = {**proven, **unproven}
+        self.manager.active_proxies = set(pool)
+
+        retained = self.manager._truncate_stats_pool("source1", pool)
+
+        self.assertEqual(len(retained), 10)
+        self.assertEqual(sum(1 for u in retained if u.startswith("http://u")), 2)
+
+    # --- Exploration ---
+
+    def test_exploration_survives_a_fully_cooled_down_top_pool(self):
+        """
+        get_proxy checked the ranked candidates for emptiness before running
+        exploration, so an all-cooled-down top pool returned None even though
+        an untried proxy was available.
+        """
+        now = time.time()
+        incumbent, newcomer = "http://incumbent:80", "http://newcomer:80"
+        self.manager.proxy_cooldown_ms = 10000
+        self.manager.exploration_ratio = 1.0
+        self.manager.active_proxies = {incumbent, newcomer}
+        self.manager.source_stats["source1"] = {
+            incumbent: self.manager._get_new_proxy_stat() | {"recent_results": [[now, True, 100]]},
+            newcomer: self.manager._get_new_proxy_stat(),
+        }
+        self.manager.available_proxies["source1"] = {"top_tier": [incumbent], "bottom_tier": []}
+        self.manager.proxy_last_handed_out_ts["source1"][incumbent] = now
+
+        self.assertEqual(self.manager.get_proxy("source1"), newcomer)
+
+    def test_exploration_rotates_instead_of_repeating_one_proxy(self):
+        """
+        Eligibility is 'no feedback yet', which is not 'never handed out': a
+        caller that never reports back would otherwise let one proxy absorb the
+        whole exploration budget forever.
+        """
+        self.manager.exploration_ratio = 1.0
+        self.manager.proxy_cooldown_ms = 0
+        urls = [f"http://n{i}:80" for i in range(3)]
+        self.manager.active_proxies = set(urls)
+        self.manager.source_stats["source1"] = {
+            u: self.manager._get_new_proxy_stat() for u in urls
+        }
+        self.manager.available_proxies["source1"] = {"top_tier": [], "bottom_tier": []}
+
+        picks = [self.manager.get_proxy("source1") for _ in range(6)]
+
+        self.assertEqual(set(picks[:3]), set(urls))   # every untried one first
+        self.assertEqual(set(picks[3:]), set(urls))   # then rotate, not repeat
+
+    # --- Backup concurrency ---
+
+    def test_concurrent_backup_cannot_let_a_stale_snapshot_win(self):
+        backup_path = Path(self.tmp_dir) / "stats.json"
+        self.manager.stats_backup_path = backup_path
+        url = "http://a:80"
+        self.manager.source_stats["source1"] = {
+            url: self.manager._get_new_proxy_stat() | {"score": 1.0}
+        }
+        gate = threading.Event()
+        real_dump = json.dump
+
+        def slow_dump(obj, f, **kw):
+            if obj["source_stats"]["source1"][url]["score"] == 1.0:
+                gate.wait(5)
+            return real_dump(obj, f, **kw)
+
+        def old_writer():
+            with patch("src.core.proxy_manager.json.dump", side_effect=slow_dump):
+                self.manager.backup_stats()
+
+        t = threading.Thread(target=old_writer)
+        t.start()
+        time.sleep(0.2)
+        self.manager.source_stats["source1"][url]["score"] = 2.0
+        gate.set()
+        self.manager.backup_stats()
+        t.join()
+
+        written = json.loads(backup_path.read_text(encoding="utf-8"))
+        self.assertEqual(written["source_stats"]["source1"][url]["score"], 2.0)
+
+    # --- reload_sources must be authoritative and transactional ---
+
+    def test_reload_drops_keys_deleted_from_the_file(self):
+        """ConfigParser.read() merges, so a fresh parser is required."""
+        self.assertEqual(self.manager.max_pool_size, 100)
+        updated = {s: dict(o) for s, o in self.config_dict.items()}
+        del updated["source_pool"]["max_pool_size"]
+        config = configparser.ConfigParser()
+        config.read_dict(updated)
+        with open(self.config_path, "w", encoding="utf-8") as f:
+            config.write(f)
+
+        self.manager.reload_sources()
+
+        self.assertEqual(self.manager.max_pool_size, 500)   # the code fallback
+
+    def test_reload_drops_fetcher_jobs_deleted_from_the_file(self):
+        self.assertEqual([j["name"] for j in self.manager.fetcher_jobs], ["proxy_source_A"])
+        updated = {s: dict(o) for s, o in self.config_dict.items()}
+        del updated["proxy_source_A"]
+        config = configparser.ConfigParser()
+        config.read_dict(updated)
+        with open(self.config_path, "w", encoding="utf-8") as f:
+            config.write(f)
+
+        result = self.manager.reload_sources()
+
+        self.assertEqual(self.manager.fetcher_jobs, [])
+        self.assertEqual(result["removed_fetcher_jobs"], ["proxy_source_A"])
+
+    def test_reload_rolls_back_completely_on_an_invalid_value(self):
+        """A bad value halfway through must not leave half-new settings."""
+        before = (self.manager.max_pool_size, self.manager.top_tier_size)
+        updated = {s: dict(o) for s, o in self.config_dict.items()}
+        updated["source_pool"]["max_pool_size"] = "321"
+        updated["source_pool"]["top_tier_size"] = "not_a_number"
+        config = configparser.ConfigParser()
+        config.read_dict(updated)
+        with open(self.config_path, "w", encoding="utf-8") as f:
+            config.write(f)
+
+        with self.assertRaises(ValueError):
+            self.manager.reload_sources()
+
+        self.assertEqual((self.manager.max_pool_size, self.manager.top_tier_size), before)
+        self.assertEqual(self.manager.config.getint("source_pool", "max_pool_size"), 100)
+
+    def test_reload_aborts_when_the_file_is_unreadable(self):
+        before = self.manager.max_pool_size
+        os.remove(self.config_path)
+
+        with self.assertRaises(RuntimeError):
+            self.manager.reload_sources()
+
+        self.assertEqual(self.manager.max_pool_size, before)
+
+    def test_logging_is_declared_restart_required(self):
+        """Docs must not promise a reload that _load_config never performs."""
+        self.assertTrue(
+            any("logging" in entry for entry in self.manager.RESTART_REQUIRED_CONFIG)
+        )
+
+
 class TestSourcesEndpointCaching(unittest.TestCase):
     """Finding 10: /api/sources ran a SELECT DISTINCT on every request."""
 
