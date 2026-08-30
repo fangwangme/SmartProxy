@@ -1,3 +1,42 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+/*
+ * The Gruvbox `--gb-*` custom properties and `color-scheme` are emitted by the
+ * plugin in `tailwind.config.ts`, which reads `src/theme/gruvbox.ts`. Only
+ * behaviour that Tailwind utilities cannot express belongs here.
+ */
+@layer base {
+  html {
+    @apply bg-bg0;
+  }
+
+  body {
+    @apply bg-bg0 font-sans text-fg1 antialiased;
+  }
+
+  /* One real focus ring for every interactive element, mouse clicks excluded. */
+  :focus-visible {
+    @apply outline-none ring-2 ring-accent ring-offset-2 ring-offset-bg0;
+  }
+
+  /* Gruvbox dark is too low-contrast for the stock dark date-picker glyph. */
+  ::-webkit-calendar-picker-indicator {
+    @apply cursor-pointer opacity-60;
+  }
+
+  ::-webkit-calendar-picker-indicator:hover {
+    @apply opacity-100;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

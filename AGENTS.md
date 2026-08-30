@@ -57,9 +57,25 @@ never used by configparser, so the patch leaves `manager.config` empty and every
 setting silently falls back to its hardcoded default — the test then passes
 without ever exercising the configured value.
 
+## Workflow
+
+Development happens on feature branches, never directly on `main`. Every change
+that has shipped so far came in through a pull request.
+
+- Branch names follow `<category>/<issue-number>-<summary>`, e.g.
+  `fix/13-pool-quality-fixes`, `feat/15-dashboard-ui-overhaul`. Categories in
+  use: `feat`, `fix`, `perf`, `chore`, `docs`.
+- Work in a git worktree under `.worktrees/<branch-name>`, not by switching
+  branches in the main checkout. Each worktree needs its own `.venv`
+  (`uv sync --locked`) and its own `dashboard/node_modules` (`bun install`) —
+  see the Development Environment section above.
+- Open a pull request against `main` with `Closes #<issue>` in the body, and
+  record the verification you actually ran.
+- Merging, tagging, and releasing are manual gates. Do not merge your own PR,
+  create tags, or delete branches without being asked.
+
 ## Project Structure
 
-- Development is done directly on the `main` branch
 - Local state and build outputs live under `.local/`
 - Shared specs live under `docs/specs/`
 - Agent notes, plans, archives, and project status live under `.agents/` (local-only, git-ignored)

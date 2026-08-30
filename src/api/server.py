@@ -395,18 +395,23 @@ smartproxy_is_validating {1 if proxy_manager.is_validating else 0}
             if time_str in stats_map:
                 row = stats_map[time_str]
                 total = row["success"] + row["failure"]
-                success_rate = (row["success"] / total * 100) if total > 0 else 0
+                # No traffic in a slot means "unknown", not "0% success" — emit
+                # null so the dashboard breaks the line instead of drawing a dive
+                # to the floor for every slot after the current moment.
+                success_rate = (
+                    round(row["success"] / total * 100, 2) if total > 0 else None
+                )
                 results.append({
                     "time": time_str,
-                    "success_rate": round(success_rate, 2),
+                    "success_rate": success_rate,
                     "total_requests": total,
                     "success_count": row["success"],
                 })
             else:
-                # Fill missing data with 0
+                # Slot with no recorded traffic: counts are 0, rate is unknown.
                 results.append({
                     "time": time_str,
-                    "success_rate": 0,
+                    "success_rate": None,
                     "total_requests": 0,
                     "success_count": 0,
                 })
@@ -456,7 +461,11 @@ smartproxy_is_validating {1 if proxy_manager.is_validating else 0}
             timeseries_by_source.setdefault(source_name, {})[
                 interval_start.strftime("%H:%M")
             ] = {
-                "success_rate": round((success / total * 100) if total > 0 else 0, 2),
+                # See get_timeseries_stats_route: an empty slot has an unknown
+                # success rate, not a zero one.
+                "success_rate": (
+                    round(success / total * 100, 2) if total > 0 else None
+                ),
                 "total_requests": total,
                 "success_count": success,
             }
@@ -488,7 +497,7 @@ smartproxy_is_validating {1 if proxy_manager.is_validating else 0}
                             **source_points.get(
                                 time_key,
                                 {
-                                    "success_rate": 0,
+                                    "success_rate": None,
                                     "total_requests": 0,
                                     "success_count": 0,
                                 },
