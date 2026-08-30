@@ -122,7 +122,10 @@ by accident:
   asks "does this proxy have a result?" while the scorer asks "does it have a
   result that still counts?", a proxy is exiled by evidence the scorer has
   already discarded. `_unexpired_results()` is that single definition, and both
-  call it.
+  call it. Among eligible proxies, selection prefers one that has never been
+  handed out; after every candidate has been tried, it rotates to the one handed
+  out least recently so a client that omits feedback cannot monopolize the
+  exploration budget.
 
 Note the recovery curve has a discontinuity at that threshold (the result is
 dropped outright rather than fading out). Smoothing it would mean blending the

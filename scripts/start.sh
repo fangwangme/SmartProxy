@@ -51,7 +51,7 @@ start_server() {
         echo "=================================================="
         echo " ERROR: Project virtual environment not found!"
         echo " Expected interpreter at: $PYTHON"
-        echo " Create it with: uv sync"
+        echo " Create it with: uv sync --locked"
         echo " (without uv: python3.14 -m venv .venv && .venv/bin/pip install -r requirements.txt)"
         echo "=================================================="
         return 1

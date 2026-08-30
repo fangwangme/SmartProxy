@@ -11,7 +11,10 @@ from typing import Optional
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 from src.utils.logger import logger, setup_logging
-from src.core.proxy_manager import ProxyManager, MAX_LATENCY_MS
+from src.core.proxy_manager import (
+    DEFAULT_MAX_FEEDBACK_LATENCY_MS,
+    ProxyManager,
+)
 
 LOCALHOST_IPS = {"127.0.0.1", "::1"}
 INTERNAL_ONLY_ENDPOINTS = {"/health", "/metrics", "/reload-sources", "/backup-stats"}
@@ -243,13 +246,23 @@ smartproxy_is_validating {1 if proxy_manager.is_validating else 0}
         # what a latency is. It also keeps math.isfinite() off unbounded ints -
         # a body carrying 10**400 would otherwise raise OverflowError here and
         # turn a bad request into a 500.
-        if resp_time is not None and ProxyManager._coerce_latency(resp_time) is None:
+        max_latency_ms = getattr(
+            proxy_manager,
+            "max_feedback_latency_ms",
+            DEFAULT_MAX_FEEDBACK_LATENCY_MS,
+        )
+        if not isinstance(max_latency_ms, int) or isinstance(max_latency_ms, bool):
+            max_latency_ms = DEFAULT_MAX_FEEDBACK_LATENCY_MS
+        if (
+            resp_time is not None
+            and ProxyManager._coerce_latency(resp_time, max_latency_ms) is None
+        ):
             return (
                 jsonify(
                     {
                         "error": (
                             "'response_time_ms' must be a finite, non-negative "
-                            f"number of milliseconds no greater than {MAX_LATENCY_MS}."
+                            f"number of milliseconds no greater than {max_latency_ms}."
                         )
                     }
                 ),

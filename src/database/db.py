@@ -363,7 +363,9 @@ class DatabaseManager:
 
         return {"daily": daily_rows, "timeseries": timeseries_rows}
 
-    def get_distinct_sources(self) -> List[str]:
+    def get_distinct_sources(self) -> Optional[List[str]]:
         query = "SELECT DISTINCT source_name FROM source_stats_by_minute ORDER BY source_name;"
         rows = self._execute(query, fetch="all")
-        return [row["source_name"] for row in rows] if rows else []
+        if rows is None:
+            return None
+        return [row["source_name"] for row in rows]

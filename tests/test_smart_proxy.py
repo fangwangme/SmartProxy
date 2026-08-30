@@ -77,6 +77,7 @@ class ProxyManagerTestBase(unittest.TestCase):
                     "elo_time_decay_enabled": "true",
                     "elo_decay_half_life_hours": "24",
                     "elo_max_result_age_hours": "168",
+                    "max_feedback_latency_ms": "86400000",
                 },
                 "backup": {
                     "stats_backup_enabled": "false",
@@ -353,6 +354,26 @@ class TestProxyManager(ProxyManagerTestBase):
         self.manager._update_dashboard_sources()
 
         self.assertEqual(self.manager.dashboard_sources, {"default"})
+
+    def test_update_dashboard_sources_preserves_cache_on_query_failure(self):
+        self.manager.dashboard_sources = {"last-known-good"}
+        self.mock_db_instance.get_distinct_sources.return_value = None
+
+        with patch("src.core.proxy_manager.logger.warning") as warning:
+            refreshed = self.manager._update_dashboard_sources()
+
+        self.assertFalse(refreshed)
+        self.assertEqual(self.manager.dashboard_sources, {"last-known-good"})
+        warning.assert_called_once()
+
+    def test_update_dashboard_sources_clears_cache_after_successful_empty_query(self):
+        self.manager.dashboard_sources = {"last-known-good"}
+        self.mock_db_instance.get_distinct_sources.return_value = []
+
+        refreshed = self.manager._update_dashboard_sources()
+
+        self.assertTrue(refreshed)
+        self.assertEqual(self.manager.dashboard_sources, set())
 
     # ========== Validation Cycle Tests ==========
     
@@ -1134,6 +1155,70 @@ class TestIssue13PoolQuality(ProxyManagerTestBase):
             self.manager.source_stats["source1"]["http://1.1.1.1:80"]["score"], 77.0
         )
 
+    def test_restore_sanitizes_oversized_timestamps_before_sync(self):
+        backup_path = Path(self.tmp_dir) / "stats.json"
+        valid_timestamp = time.time() - 10
+        poisoned = self.manager._get_new_proxy_stat()
+        poisoned["recent_results"] = [
+            [10 ** 400, True, 200],
+            [valid_timestamp, True, 250],
+        ]
+        poisoned["last_feedback_ts"] = 10 ** 400
+        backup_path.write_text(
+            json.dumps(
+                {
+                    "timestamp": "2026-08-30T00:00:00",
+                    "source_stats": {
+                        "source1": {"http://poisoned:80": poisoned}
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.manager.stats_backup_path = backup_path
+
+        result = self.manager.restore_stats()
+
+        self.assertEqual(result["status"], "success")
+        restored = self.manager.source_stats["source1"]["http://poisoned:80"]
+        self.assertEqual(restored["recent_results"], [[valid_timestamp, True, 250]])
+        self.assertEqual(restored["last_feedback_ts"], valid_timestamp)
+
+        self.manager.active_proxies = {"http://poisoned:80"}
+        self.mock_db_instance.get_active_proxies.return_value = {
+            "http://poisoned:80"
+        }
+        self.manager._sync_and_select_top_proxies()  # must not raise
+
+    def test_structurally_invalid_restore_is_transactional(self):
+        backup_path = Path(self.tmp_dir) / "stats.json"
+        existing = {
+            "source1": {
+                "http://existing:80": self.manager._get_new_proxy_stat()
+            }
+        }
+        self.manager.source_stats = copy.deepcopy(existing)
+        backup_path.write_text(
+            json.dumps(
+                {
+                    "timestamp": "2026-08-30T00:00:00",
+                    "source_stats": {
+                        "source1": {
+                            "http://valid:80": self.manager._get_new_proxy_stat()
+                        },
+                        "source2": [],
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.manager.stats_backup_path = backup_path
+
+        result = self.manager.restore_stats()
+
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(self.manager.source_stats, existing)
+
     # ---------- Finding 11: reload_sources only reloaded sources ----------
 
     def test_reload_sources_reloads_the_whole_config(self):
@@ -1227,6 +1312,7 @@ class TestIssue13PoolQuality(ProxyManagerTestBase):
             ("source_pool", "elo_prior_successes"),
             ("source_pool", "elo_prior_failures"),
             ("source_pool", "rescore_on_sync_enabled"),
+            ("source_pool", "max_feedback_latency_ms"),
             ("validator", "validation_new_proxy_ratio"),
         ]:
             with self.subTest(option=option):
@@ -1814,9 +1900,38 @@ class TestStatsQueryIndexability(unittest.TestCase):
             with self.subTest(line=line):
                 self.assertNotIn("DATE(", line.upper())
 
+    def test_existing_databases_have_a_non_destructive_index_migration(self):
+        migration = (
+            Path(__file__).resolve().parents[1]
+            / "config"
+            / "migrations"
+            / "20260830_add_source_stats_source_minute_index.sql"
+        ).read_text(encoding="utf-8")
+        normalized = " ".join(migration.split()).upper()
+
+        self.assertIn("CREATE INDEX CONCURRENTLY IF NOT EXISTS", normalized)
+        self.assertIn("(SOURCE_NAME, MINUTE)", normalized)
+        self.assertNotIn("DROP TABLE", normalized)
+
 
 class TestDatabaseManager(unittest.TestCase):
     """Test DatabaseManager methods with mocked psycopg2."""
+
+    def _make_database_manager(self):
+        config = configparser.ConfigParser()
+        config.read_dict(
+            {
+                "database": {
+                    "host": "localhost",
+                    "port": "5432",
+                    "dbname": "test",
+                    "user": "user",
+                    "password": "password",
+                    "max_connections": "50",
+                }
+            }
+        )
+        return DatabaseManager(config)
 
     @patch("src.database.db.psycopg2.pool.ThreadedConnectionPool")
     def test_database_manager_uses_threaded_pool(self, mock_pool_class):
@@ -1838,6 +1953,15 @@ class TestDatabaseManager(unittest.TestCase):
         mock_pool_class.assert_called_once()
         call_kwargs = mock_pool_class.call_args
         self.assertEqual(call_kwargs[1]["maxconn"], 50)
+
+    @patch("src.database.db.psycopg2.pool.ThreadedConnectionPool")
+    def test_distinct_sources_distinguishes_failure_from_empty_result(self, _mock_pool):
+        db = self._make_database_manager()
+
+        with patch.object(db, "_execute", return_value=None):
+            self.assertIsNone(db.get_distinct_sources())
+        with patch.object(db, "_execute", return_value=[]):
+            self.assertEqual(db.get_distinct_sources(), [])
 
 
 class TestSecondReviewRegressions(ProxyManagerTestBase):
@@ -1996,22 +2120,66 @@ class TestSecondReviewRegressions(ProxyManagerTestBase):
                 url = f"{protocol}://{ip}:{port}"
                 self.assertEqual(urlsplit(url).port, port)
 
-    def test_ipv6_never_exceeds_the_ip_column_width(self):
+    def test_ipv6_forms_are_canonicalized_to_one_database_key(self):
+        compact = self.manager._parse_proxy_line("[2001:db8::1]:8080", "http")
+        expanded = self.manager._parse_proxy_line(
+            "[2001:0db8:0:0:0:0:0:1]:8080", "http"
+        )
+
+        self.assertIsNotNone(compact)
+        self.assertEqual(expanded, compact)
+        self.assertEqual(compact, ("http", "[2001:db8::1]", 8080))
+
+    def test_max_width_ipv6_is_canonicalized_and_retained(self):
         from src.core.proxy_manager import MAX_IP_LENGTH
 
         widest = "[ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255]:80"
         parsed = self.manager._parse_proxy_line(widest, "http")
-        if parsed is not None:
-            self.assertLessEqual(len(parsed[1]), MAX_IP_LENGTH)
+
+        self.assertIsNotNone(parsed)
+        self.assertEqual(
+            parsed,
+            ("http", "[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]", 80),
+        )
+        self.assertLessEqual(len(parsed[1]), MAX_IP_LENGTH)
 
     # --- Finding 5: an out-of-range latency must not reach a float op ---
 
     def test_oversized_integer_latency_is_rejected_not_raised(self):
-        from src.core.proxy_manager import MAX_LATENCY_MS
+        from src.core.proxy_manager import DEFAULT_MAX_FEEDBACK_LATENCY_MS
 
-        for value in (10 ** 400, MAX_LATENCY_MS + 1, float("inf"), float("nan"), -1):
+        for value in (
+            10 ** 400,
+            DEFAULT_MAX_FEEDBACK_LATENCY_MS + 1,
+            float("inf"),
+            float("nan"),
+            -1,
+        ):
             with self.subTest(value=repr(value)[:20]):
                 self.assertIsNone(self.manager._coerce_latency(value))
+
+    def test_latency_boundary_is_loaded_from_config(self):
+        manager = self.make_manager(
+            {"source_pool": {"max_feedback_latency_ms": "1000"}},
+            name="latency-boundary.ini",
+        )
+
+        self.assertEqual(manager.max_feedback_latency_ms, 1000)
+        self.assertEqual(
+            manager._coerce_latency(1000, manager.max_feedback_latency_ms), 1000
+        )
+        self.assertIsNone(
+            manager._coerce_latency(1001, manager.max_feedback_latency_ms)
+        )
+
+        proxy_url = "http://bounded:80"
+        manager.source_stats["source1"][proxy_url] = manager._get_new_proxy_stat()
+        manager.process_feedback(
+            "source1", proxy_url, 200, response_time_ms=1001
+        )
+        self.assertIsNone(
+            manager.source_stats["source1"][proxy_url]["recent_results"][-1][2]
+        )
 
     def test_backup_with_an_oversized_latency_does_not_block_sync(self):
         stat = self.manager._get_new_proxy_stat()
@@ -2073,11 +2241,25 @@ class TestFeedbackLatencyBoundary(unittest.TestCase):
         )
 
     def test_oversized_integer_latency_returns_400(self):
-        from src.core.proxy_manager import MAX_LATENCY_MS
+        from src.core.proxy_manager import DEFAULT_MAX_FEEDBACK_LATENCY_MS
 
-        for value in (10 ** 400, MAX_LATENCY_MS + 1, -1, "fast", True):
+        for value in (
+            10 ** 400,
+            DEFAULT_MAX_FEEDBACK_LATENCY_MS + 1,
+            -1,
+            "fast",
+            True,
+        ):
             with self.subTest(value=repr(value)[:20]):
                 self.assertEqual(self._post(value).status_code, 400)
+
+    def test_configured_latency_boundary_is_enforced_at_http_boundary(self):
+        self.mock_proxy_manager.max_feedback_latency_ms = 1000
+
+        response = self._post(1001)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("1000", response.get_json()["error"])
 
     def test_ordinary_latency_still_accepted(self):
         self.mock_proxy_manager.is_valid_feedback_status.return_value = True

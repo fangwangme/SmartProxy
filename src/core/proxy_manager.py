@@ -38,10 +38,9 @@ MAX_IP_LENGTH = 45  # Matches the proxies.ip VARCHAR(45) column.
 MIN_PORT = 1
 MAX_PORT = 65535
 # A latency is a request duration in milliseconds; anything past a day is not
-# one. The bound exists so the value can be range-checked with pure integer
-# comparisons before math.isfinite() or any arithmetic converts it to a float -
-# a JSON body may legally carry 10**400, and float(10**400) raises OverflowError.
-MAX_LATENCY_MS = 24 * 60 * 60 * 1000
+# one by default. Deployments may tune the boundary in [source_pool], while this
+# constant remains the backward-compatible fallback.
+DEFAULT_MAX_FEEDBACK_LATENCY_MS = 24 * 60 * 60 * 1000
 
 FAILED_STATUS_CODES = {
     0,
@@ -227,9 +226,9 @@ class ProxyManager:
         self.proxy_cooldown_ms = max(
             0, self.config.getint("source_pool", "proxy_cooldown_ms", fallback=0)
         )
-        # Share of get_proxy calls spent on proxies that have never been handed
-        # out, so newly discovered candidates can earn a ranking instead of
-        # being permanently stuck behind the incumbent top pool.
+        # Share of get_proxy calls spent on proxies without unexpired feedback.
+        # Never-handed candidates are preferred; once all have been tried, the
+        # least-recently explored candidate is rotated back in.
         self.exploration_ratio = min(
             1.0,
             max(
@@ -257,6 +256,14 @@ class ProxyManager:
         self.latency_zero_score_ms = max(
             self.latency_full_score_ms + 1,
             self.config.getint("source_pool", "latency_zero_score_ms", fallback=2000),
+        )
+        self.max_feedback_latency_ms = max(
+            1,
+            self.config.getint(
+                "source_pool",
+                "max_feedback_latency_ms",
+                fallback=DEFAULT_MAX_FEEDBACK_LATENCY_MS,
+            ),
         )
 
         # Fetcher configuration.
@@ -633,7 +640,7 @@ class ProxyManager:
 
         # Credentials are not supported; "user:pass@host" would otherwise be
         # stored verbatim as the IP.
-        if not ip or "@" in ip or len(ip) > MAX_IP_LENGTH:
+        if not ip or "@" in ip:
             return None
 
         # Must be a real IP literal. Length and "@" checks alone are not enough:
@@ -653,7 +660,8 @@ class ProxyManager:
         # "http://2001:db8::1:8080" has no parseable port - yarl rejects it, so
         # the proxy can be neither validated nor handed out. Normalising here,
         # at the only writer, keeps every one of those call sites correct.
-        ip = f"[{host}]" if parsed_ip.version == 6 else host
+        canonical_host = parsed_ip.compressed
+        ip = f"[{canonical_host}]" if parsed_ip.version == 6 else canonical_host
         if len(ip) > MAX_IP_LENGTH:
             return None
 
@@ -1111,9 +1119,11 @@ class ProxyManager:
             self._sync_premium_proxies_locked()
 
     @staticmethod
-    def _coerce_latency(value) -> Optional[int]:
+    def _coerce_latency(
+        value, max_latency_ms: int = DEFAULT_MAX_FEEDBACK_LATENCY_MS
+    ) -> Optional[int]:
         """
-        Return value as a usable latency, or None.
+        Return value as a usable latency under the supplied boundary, or None.
 
         Anything non-numeric that reaches recent_results poisons the stat
         permanently: _calculate_elo_score runs over the whole pool on every
@@ -1125,12 +1135,57 @@ class ProxyManager:
             return None
         # Integer comparisons first: they are exact for arbitrarily large ints,
         # whereas math.isfinite() would already have raised OverflowError.
-        if value < 0 or value > MAX_LATENCY_MS:
+        if value < 0 or value > max_latency_ms:
             return None
         # NaN escapes both comparisons above, so it still needs the finite check.
-        if not math.isfinite(value):
+        # A deployment can also configure an unusually large boundary; keep an
+        # arbitrary-size JSON integer from overflowing math.isfinite() then.
+        try:
+            is_finite = math.isfinite(value)
+        except OverflowError:
+            return None
+        if not is_finite:
             return None
         return int(value)
+
+    @staticmethod
+    def _coerce_timestamp(value, now_ts: Optional[float] = None) -> Optional[float]:
+        """Return a finite Unix timestamp, clamping future clock skew to now."""
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        try:
+            timestamp = float(value)
+        except (OverflowError, TypeError, ValueError):
+            return None
+        if not math.isfinite(timestamp) or timestamp < 0:
+            return None
+        if now_ts is not None:
+            timestamp = min(timestamp, now_ts)
+        return timestamp
+
+    def _normalize_recent_result(
+        self, result, now_ts: Optional[float] = None
+    ) -> Optional[List]:
+        """Normalize one untrusted feedback row from a persisted backup."""
+        if not isinstance(result, list) or len(result) < 3:
+            return None
+
+        timestamp = self._coerce_timestamp(result[0], now_ts)
+        if timestamp is None:
+            return None
+
+        success = result[1]
+        if type(success) is int and success in (0, 1):
+            success = bool(success)
+        if not isinstance(success, bool):
+            return None
+
+        latency = (
+            None
+            if result[2] is None
+            else self._coerce_latency(result[2], self.max_feedback_latency_ms)
+        )
+        return [timestamp, success, latency]
 
     def _unexpired_results(self, stat: Dict) -> List:
         """
@@ -1147,25 +1202,27 @@ class ProxyManager:
         _calculate_elo_score the difference between "never observed" (neutral
         50) and "observed, then aged out" (back to 50 by the recovery rule).
         """
-        recent = stat.get("recent_results", [])[-self.elo_scoring_window :]
-        if not self.elo_time_decay_enabled or not recent:
-            return recent
-
+        raw_results = stat.get("recent_results", [])
+        if not isinstance(raw_results, list):
+            return []
         now_ts = time.time()
         max_age_seconds = self.elo_max_result_age_hours * 3600
-        return [
-            r
-            for r in recent
-            if isinstance(r, list)
-            and len(r) >= 3
-            and isinstance(r[0], (int, float))
-            and now_ts - r[0] <= max_age_seconds
-        ]
+        recent = []
+        for raw_result in raw_results[-self.elo_scoring_window :]:
+            result = self._normalize_recent_result(raw_result, now_ts)
+            if result is None:
+                continue
+            if self.elo_time_decay_enabled and now_ts - result[0] > max_age_seconds:
+                continue
+            recent.append(result)
+        return recent
 
     @staticmethod
     def _feedback_ts(stat: Dict) -> float:
-        ts = stat.get("last_feedback_ts")
-        return float(ts) if isinstance(ts, (int, float)) and not isinstance(ts, bool) else 0.0
+        ts = ProxyManager._coerce_timestamp(
+            stat.get("last_feedback_ts"), now_ts=time.time()
+        )
+        return ts if ts is not None else 0.0
 
     def _truncate_stats_pool(self, source: str, stats_pool: Dict[str, Dict]) -> Dict[str, Dict]:
         """
@@ -1225,6 +1282,12 @@ class ProxyManager:
         # Use only unique sources from stats data (source_stats_by_minute).
         # This keeps dashboard source options aligned with real observable traffic.
         db_sources = self.db.get_distinct_sources()
+        if db_sources is None:
+            logger.warning(
+                "Dashboard source refresh failed; preserving the last-known-good cache."
+            )
+            return False
+
         with self.lock:
             fetcher_job_names = {job["name"] for job in self.fetcher_jobs}
 
@@ -1241,6 +1304,7 @@ class ProxyManager:
         logger.info(
             f"Dashboard sources updated: {len(self.dashboard_sources)} sources found."
         )
+        return True
 
     def _scheduler_loop(self):
         last_validation_run = 0
@@ -1400,65 +1464,109 @@ class ProxyManager:
 
     def restore_stats(self) -> Dict:
         """Restore source_stats from JSON file on startup."""
-        if not self.stats_backup_path.exists():
+        with self.lock:
+            backup_path = self.stats_backup_path
+            predefined_sources = set(self.predefined_sources)
+
+        if not backup_path.exists():
             # WARNING, not INFO: every restart that hits this path silently
             # discards the entire scoring history.
             logger.warning(
                 "No stats backup found at {} - starting with fresh scores. "
                 "All accumulated proxy scoring history is lost. Check "
                 "[backup] stats_backup_path if this is unexpected.",
-                self.stats_backup_path,
+                backup_path,
             )
             return {
                 "status": "skipped",
-                "message": f"No backup file found at {self.stats_backup_path}",
-                "path": str(self.stats_backup_path),
+                "message": f"No backup file found at {backup_path}",
+                "path": str(backup_path),
             }
 
         try:
             # Log file info before loading
-            file_size = self.stats_backup_path.stat().st_size
-            logger.info(f"Loading stats backup from: {self.stats_backup_path} (size: {file_size / 1024:.2f} KB)")
+            file_size = backup_path.stat().st_size
+            logger.info(
+                f"Loading stats backup from: {backup_path} "
+                f"(size: {file_size / 1024:.2f} KB)"
+            )
 
-            with open(self.stats_backup_path, "r", encoding="utf-8") as f:
+            with open(backup_path, "r", encoding="utf-8") as f:
                 snapshot = json.load(f)
+
+            if not isinstance(snapshot, dict):
+                raise ValueError("Backup root must be a JSON object")
+            source_stats = snapshot.get("source_stats", {})
+            if not isinstance(source_stats, dict):
+                raise ValueError("Backup source_stats must be a JSON object")
 
             # Log backup metadata
             backup_time = snapshot.get("timestamp", "unknown")
-            total_sources_in_file = len(snapshot.get("source_stats", {}))
-            logger.info(f"Backup file parsed successfully. Timestamp: {backup_time}, Sources in file: {total_sources_in_file}")
+            total_sources_in_file = len(source_stats)
+            logger.info(
+                "Backup file parsed successfully. Timestamp: {}, Sources in file: {}",
+                backup_time,
+                total_sources_in_file,
+            )
+
+            # Build and validate the complete replacement before taking the
+            # manager lock. If a later source is structurally invalid, no
+            # earlier source may have been partially installed.
+            restored_stats = {}
+            restored_sources = 0
+            restored_proxies = 0
+            skipped_sources = []
+            restore_summaries = []
+            for source, proxies in source_stats.items():
+                if source not in predefined_sources:
+                    skipped_sources.append(source)
+                    logger.debug(
+                        f"  [SKIPPED] Source '{source}': not in predefined_sources"
+                    )
+                    continue
+                if not isinstance(proxies, dict):
+                    raise ValueError(
+                        f"Backup source '{source}' must map proxy URLs to stats"
+                    )
+
+                migrated_proxies = {}
+                legacy_count = 0
+                for proxy_url, raw_stat in proxies.items():
+                    if not isinstance(raw_stat, dict):
+                        raise ValueError(
+                            f"Backup stat for '{source}'/'{proxy_url}' must be an object"
+                        )
+                    if "recent_results" not in raw_stat:
+                        legacy_count += 1
+                    migrated_proxies[proxy_url] = self._migrate_legacy_stat(
+                        copy.deepcopy(raw_stat)
+                    )
+
+                restored_stats[source] = migrated_proxies
+                restored_sources += 1
+                proxy_count = len(migrated_proxies)
+                restored_proxies += proxy_count
+                restore_summaries.append((source, proxy_count, legacy_count))
 
             with self.lock:
-                restored_sources = 0
-                restored_proxies = 0
-                skipped_sources = []
+                self.source_stats.update(restored_stats)
 
-                for source, proxies in snapshot.get("source_stats", {}).items():
-                    if source in self.predefined_sources:
-                        # Migrate legacy stats to new ELO format
-                        migrated_proxies = {}
-                        legacy_count = 0
-                        for proxy_url, stat in proxies.items():
-                            if "recent_results" not in stat:
-                                legacy_count += 1
-                            migrated_proxies[proxy_url] = self._migrate_legacy_stat(stat)
-                        
-                        self.source_stats[source] = migrated_proxies
-                        restored_sources += 1
-                        proxy_count = len(migrated_proxies)
-                        restored_proxies += proxy_count
-                        
-                        if legacy_count > 0:
-                            logger.info(f"  [RESTORED] Source '{source}': {proxy_count} proxies ({legacy_count} migrated to ELO format)")
-                        else:
-                            logger.info(f"  [RESTORED] Source '{source}': {proxy_count} proxies loaded")
-                    else:
-                        skipped_sources.append(source)
-                        logger.debug(f"  [SKIPPED] Source '{source}': not in predefined_sources")
+            for source, proxy_count, legacy_count in restore_summaries:
+                if legacy_count > 0:
+                    logger.info(
+                        f"  [RESTORED] Source '{source}': {proxy_count} proxies "
+                        f"({legacy_count} migrated to ELO format)"
+                    )
+                else:
+                    logger.info(
+                        f"  [RESTORED] Source '{source}': {proxy_count} proxies loaded"
+                    )
 
-                # Log skipped sources summary if any
-                if skipped_sources:
-                    logger.warning(f"Skipped {len(skipped_sources)} sources not in predefined_sources: {skipped_sources}")
+            if skipped_sources:
+                logger.warning(
+                    f"Skipped {len(skipped_sources)} sources not in "
+                    f"predefined_sources: {skipped_sources}"
+                )
 
             logger.info(
                 f"Stats restore completed: {restored_sources}/{total_sources_in_file} sources, "
@@ -1756,35 +1864,62 @@ class ProxyManager:
 
     def _migrate_legacy_stat(self, stat: Dict) -> Dict:
         """
-        Migrate legacy stat format to new ELO-based format.
-        Called when restoring stats from backup or encountering old format.
-        """
-        if "recent_results" not in stat:
-            # Legacy format detected, migrate
-            stat["recent_results"] = []
-            stat["avg_latency_ms"] = None
-            
-            # Estimate initial score from historical data
-            total = stat.get("success_count", 0) + stat.get("failure_count", 0)
-            if total > 0:
-                success_rate = stat.get("success_count", 0) / total
-                # Map success rate to 0-100 score
-                stat["score"] = min(100, max(0, success_rate * 100))
-            else:
-                stat["score"] = 50.0  # Neutral for no history
+        Migrate and normalize a stat before it enters the scoring path.
 
-        if "last_feedback_ts" not in stat:
-            recent_results = stat.get("recent_results", [])
-            valid_timestamps = [
-                r[0]
-                for r in recent_results
-                if isinstance(r, list) and len(r) >= 1 and isinstance(r[0], (int, float))
-            ]
-            stat["last_feedback_ts"] = max(valid_timestamps) if valid_timestamps else None
-        if "consecutive_failures" not in stat:
-            stat["consecutive_failures"] = 0
-        if "avg_latency_ms" not in stat:
-            stat["avg_latency_ms"] = None
+        Backups are untrusted persisted input. Keep historical counters where
+        possible, but replace malformed scalar values and discard malformed
+        result rows so one bad proxy cannot stop a full-pool sync.
+        """
+        if not isinstance(stat, dict):
+            raise ValueError("Proxy stat must be a mapping")
+
+        def nonnegative_int(value) -> int:
+            return value if type(value) is int and value >= 0 else 0
+
+        had_recent_results = "recent_results" in stat
+        success_count = nonnegative_int(stat.get("success_count", 0))
+        failure_count = nonnegative_int(stat.get("failure_count", 0))
+        stat["success_count"] = success_count
+        stat["failure_count"] = failure_count
+        stat["consecutive_failures"] = nonnegative_int(
+            stat.get("consecutive_failures", 0)
+        )
+
+        now_ts = time.time()
+        raw_results = stat.get("recent_results", [])
+        if not isinstance(raw_results, list):
+            raw_results = []
+        normalized_results = []
+        for raw_result in raw_results[-self.elo_max_window :]:
+            result = self._normalize_recent_result(raw_result, now_ts)
+            if result is not None:
+                normalized_results.append(result)
+        stat["recent_results"] = normalized_results
+
+        stat["avg_latency_ms"] = self._coerce_latency(
+            stat.get("avg_latency_ms"), self.max_feedback_latency_ms
+        )
+
+        last_feedback_ts = self._coerce_timestamp(
+            stat.get("last_feedback_ts"), now_ts
+        )
+        if last_feedback_ts is None and normalized_results:
+            last_feedback_ts = max(result[0] for result in normalized_results)
+        stat["last_feedback_ts"] = last_feedback_ts
+
+        if not had_recent_results:
+            total = success_count + failure_count
+            if total > 0:
+                stat["score"] = min(100.0, max(0.0, success_count / total * 100))
+            else:
+                stat["score"] = 50.0
+        else:
+            raw_score = stat.get("score")
+            try:
+                score = float(raw_score)
+            except (OverflowError, TypeError, ValueError):
+                score = 50.0
+            stat["score"] = min(100.0, max(0.0, score)) if math.isfinite(score) else 50.0
 
         return stat
 
@@ -1813,7 +1948,8 @@ class ProxyManager:
         window_size = self.elo_scoring_window
         now_ts = time.time()
 
-        raw_recent = stat.get("recent_results", [])[-window_size:]
+        raw_results = stat.get("recent_results", [])
+        raw_recent = raw_results[-window_size:] if isinstance(raw_results, list) else []
         recent = self._unexpired_results(stat)
 
         if not recent and raw_recent:
@@ -1836,8 +1972,10 @@ class ProxyManager:
                 historical_score = min(100, max(0, success_rate * 80 + 10))
 
                 if self.elo_time_decay_enabled:
-                    last_feedback_ts = stat.get("last_feedback_ts")
-                    if isinstance(last_feedback_ts, (int, float)):
+                    last_feedback_ts = self._coerce_timestamp(
+                        stat.get("last_feedback_ts"), now_ts
+                    )
+                    if last_feedback_ts is not None:
                         age_seconds = max(0.0, now_ts - last_feedback_ts)
                         half_life_seconds = self.elo_decay_half_life_hours * 3600
                         decay_factor = math.pow(0.5, age_seconds / half_life_seconds)
@@ -1882,7 +2020,12 @@ class ProxyManager:
         latency_pairs = [
             (latency, w)
             for latency, w in (
-                (self._coerce_latency(r[2]) if len(r) >= 3 and r[1] else None, w)
+                (
+                    self._coerce_latency(r[2], self.max_feedback_latency_ms)
+                    if len(r) >= 3 and r[1]
+                    else None,
+                    w,
+                )
                 for r, w in zip(recent, weights)
             )
             if latency is not None
@@ -2013,10 +2156,14 @@ class ProxyManager:
             stat["consecutive_failures"] = 0
             
             # Update exponential moving average of latency for observability.
-            latency = self._coerce_latency(response_time_ms)
+            latency = self._coerce_latency(
+                response_time_ms, self.max_feedback_latency_ms
+            )
             if latency is not None:
                 alpha = self.avg_latency_alpha
-                previous = self._coerce_latency(stat.get("avg_latency_ms"))
+                previous = self._coerce_latency(
+                    stat.get("avg_latency_ms"), self.max_feedback_latency_ms
+                )
                 if previous is None:
                     stat["avg_latency_ms"] = latency
                 else:
@@ -2026,9 +2173,17 @@ class ProxyManager:
             stat["consecutive_failures"] += 1
         
         # Add to sliding window (keep last elo_max_window results)
-        latency_for_log = self._coerce_latency(response_time_ms)
+        latency_for_log = self._coerce_latency(
+            response_time_ms, self.max_feedback_latency_ms
+        )
         stat["recent_results"].append(
-            [current_timestamp, is_success, self._coerce_latency(response_time_ms)]
+            [
+                current_timestamp,
+                is_success,
+                self._coerce_latency(
+                    response_time_ms, self.max_feedback_latency_ms
+                ),
+            ]
         )
         if len(stat["recent_results"]) > self.elo_max_window:
             stat["recent_results"] = stat["recent_results"][-self.elo_max_window:]

@@ -5,9 +5,9 @@ SmartProxy is a sophisticated proxy management system designed to provide reliab
 ## **Core Features**
 
 * **Automated Proxy Fetching**: Gathers proxies from multiple user-defined sources.  
-* **Intelligent Validation & Scoring**: Validation is a liveness gate (`is_active`); ranking is owned entirely by client feedback, which drives a 0-100 ELO-style score over a sliding window.  
-* **Feedback-Driven Adaptation**: Success and failure both move the score, with small samples shrunk toward the neutral baseline so a single observation cannot crown or exile a proxy.  
-* **Dynamic Configuration Reloading**: A hot-reload endpoint (/reload-sources) re-reads the whole config file - sources, fetcher jobs, and every tunable - authoritatively and transactionally, without restarting the service.  
+* **Intelligent Validation & Scoring**: Validation is a liveness gate (`is_active`); ranking is owned entirely by client feedback, which drives a 0-100 ELO-style score over a sliding window.
+* **Feedback-Driven Adaptation**: Success and failure both move the score, with small samples shrunk toward the neutral baseline so a single observation cannot crown or exile a proxy.
+* **Dynamic Configuration Reloading**: A hot-reload endpoint (/reload-sources) re-reads the whole config file - sources, fetcher jobs, and every tunable - authoritatively and transactionally, without restarting the service.
 * **Sustainable Validation Logic**: Employs a time-window-based attempt limit for re-validating failed proxies. This prevents proxy burnout, reduces database load, and ensures long-term service stability.  
 * **Source-Specific Pools**: Maintains separate proxy pools for different sources/use cases.  
 * **RESTful API**: Simple endpoints for fetching proxies and submitting feedback.  
@@ -23,7 +23,7 @@ SmartProxy is a sophisticated proxy management system designed to provide reliab
    * **Consistency (0-10)** - a bonus for a stable success rate across the last 10 results.
 
    Results are weighted by age (`elo_decay_half_life_hours`) and dropped entirely past `elo_max_result_age_hours`. Scores are recomputed for the whole pool on every sync (`rescore_on_sync_enabled`), not only when feedback arrives - otherwise idle proxies freeze at their last score, time decay never fires, and a proxy knocked down by one failure can never earn its way back. Consecutive failures are kept only as diagnostic data; candidates are not hard-deleted by a failure threshold.
-4. **Select**: When a client requests a proxy for a specific source via /get-proxy, the system serves only proxies that passed the most recent validation, filters them by the optional per-proxy cooldown, and selects from the current top pool using the configured strategy (`uniform`, `tiered`, `weighted`, or `softmax`). A configurable share of requests (`exploration_ratio`) instead goes to a proxy that has never been handed out, so newly discovered candidates can earn a ranking rather than being stuck behind the incumbent pool forever.
+4. **Select**: When a client requests a proxy for a specific source via /get-proxy, the system serves only proxies that passed the most recent validation, filters them by the optional per-proxy cooldown, and selects from the current top pool using the configured strategy (`uniform`, `tiered`, `weighted`, or `softmax`). A configurable share of requests (`exploration_ratio`) instead goes to a proxy without unexpired feedback. Never-handed proxies are preferred; once every candidate has been tried, exploration rotates to the least-recently-handed-out candidate.
 5. **Adapt**: Through continuous validation and feedback, low-quality proxies are phased out, and high-performing ones are prioritized, ensuring the overall quality of the pool constantly improves.
 
 ## **Project Structure**
@@ -45,7 +45,7 @@ SmartProxy is a sophisticated proxy management system designed to provide reliab
 1.  **Create the environment and install dependencies**:
 
     ```bash
-    uv sync
+    uv sync --locked
     ```
 
     This reads `pyproject.toml` and `uv.lock` and builds `.venv` on the
@@ -59,9 +59,9 @@ SmartProxy is a sophisticated proxy management system designed to provide reliab
     .venv/bin/pip install -r requirements.txt
     ```
 
-    `requirements.txt` is generated from the lockfile (`uv export --no-hashes
-    --no-emit-project -o requirements.txt`) and exists only for that fallback —
-    declare dependencies in `pyproject.toml`, not there.
+    `requirements.txt` is generated from the lockfile (`uv export --frozen
+    --no-hashes --no-emit-project -o requirements.txt`) and exists only for
+    that fallback — declare dependencies in `pyproject.toml`, not there.
 
 2.  **Run commands through the venv**:
 
@@ -75,9 +75,17 @@ SmartProxy is a sophisticated proxy management system designed to provide reliab
 3.  **Set up the database:**  
    * Ensure your PostgreSQL server is running.  
    * Create a database and a user.  
-   * Execute the `config/database_setup.sql` script to create the necessary tables and indexes.  
+   * **New database only:** execute `config/database_setup.sql`. It recreates
+     the tables and therefore must not be used as an upgrade script.
      ```bash
      psql -U your_user -d your_db -f config/database_setup.sql
+     ```
+   * **Existing database:** apply the non-destructive index migration. It uses
+     `CREATE INDEX CONCURRENTLY`, so run the file directly with `psql`, outside
+     any explicit transaction block.
+     ```bash
+     psql -U your_user -d your_db \
+       -f config/migrations/20260830_add_source_stats_source_minute_index.sql
      ```
 
 4.  **Configure the service:**  
@@ -86,7 +94,7 @@ SmartProxy is a sophisticated proxy management system designed to provide reliab
 
 5.  **Run Application**:
     ```bash
-    uv run run.py      # or: .venv/bin/python run.py
+    uv run --locked run.py      # or: .venv/bin/python run.py
     ```
     *Or use the management script below.*
 
@@ -161,7 +169,7 @@ The service is configured via the config.ini file.
   * validation\_success\_threshold: Number of targets a proxy must pass.  
   * validation\_workers: Number of concurrent threads for validation.  
   * validation\_batch\_limit: Maximum proxies pulled into one validation cycle.  
-  * validation\_new\_proxy\_ratio: Share of that budget reserved for never-validated proxies; the rest re-checks proxies that are currently alive. Unused budget is donated to the other side. Defaults to `0.5`.  
+  * validation\_new\_proxy\_ratio: Share of that budget reserved for never-validated proxies; the rest re-checks proxies that are currently alive. Unused budget is donated to the other side. Defaults to `0.5`.
   * validation\_supplement\_threshold: If the number of new/active proxies to test is below this, the queue will be supplemented with failed proxies.  
   * validation\_window\_minutes: The time window (in minutes) for the validation attempt limit.  
   * max\_validations\_per\_window: The maximum number of times a failed proxy will be re-tested within the time window.  
@@ -171,15 +179,15 @@ The service is configured via the config.ini file.
 * **\[sources\]**:  
   * predefined\_sources: A comma-separated list of logical names for your proxy pools (e.g., google\_search, web\_scraping).  
   * default\_source: The pool to use if a requested source doesn't exist.  
-* **\[source\_pool\]**: Parameters for the scoring and selection algorithm.  
-  * selection\_strategy: `uniform`, `tiered`, `weighted`, or `softmax`. Note that `uniform` draws every proxy in the pool with equal probability, so the score only decides pool membership and the ranking is otherwise discarded; `weighted` is recommended.  
-  * proxy\_cooldown\_ms: Minimum delay before the same proxy is handed out again for the same source.  
-  * exploration\_ratio: Share of requests spent on proxies that have never been handed out. Set to `0` to disable.  
-  * elo\_prior\_successes / elo\_prior\_failures: Beta prior that shrinks small samples toward the neutral score.  
-  * rescore\_on\_sync\_enabled: Recompute every score during pool sync so time decay applies to idle proxies.  
-  * ELO window/decay settings and latency scoring thresholds (`elo_max_window`, `elo_scoring_window`, `elo_decay_half_life_hours`, `elo_max_result_age_hours`, `latency_full_score_ms`, `latency_zero_score_ms`).  
-  * elo\_max\_result\_age\_hours: How long one bad result costs a proxy its traffic. Past this age the result stops counting entirely and the proxy returns to the neutral baseline, so this is the real knob for failure recovery. Defaults to 48.  
-  * max\_pool\_size x stats\_pool\_max\_multiplier: The cap on retained **dead** proxy history - not on total memory. Proxies that passed the latest validation are never evicted, because evicting one would reset its failure history to zero on the next sync, so the stats pool grows with the number of genuinely active proxies. If the live set alone reaches the cap, all dead history is dropped and a warning is logged.  
+* **\[source\_pool\]**: Parameters for the scoring and selection algorithm.
+  * selection\_strategy: `uniform`, `tiered`, `weighted`, or `softmax`. Note that `uniform` draws every proxy in the pool with equal probability, so the score only decides pool membership and the ranking is otherwise discarded; `weighted` is recommended.
+  * proxy\_cooldown\_ms: Minimum delay before the same proxy is handed out again for the same source.
+  * exploration\_ratio: Share of requests spent on proxies without unexpired feedback. Never-handed candidates are preferred; after all candidates have been tried, the least-recently-handed-out one is explored next. Set to `0` to disable.
+  * elo\_prior\_successes / elo\_prior\_failures: Beta prior that shrinks small samples toward the neutral score.
+  * rescore\_on\_sync\_enabled: Recompute every score during pool sync so time decay applies to idle proxies.
+  * ELO window/decay settings and latency thresholds (`elo_max_window`, `elo_scoring_window`, `elo_decay_half_life_hours`, `elo_max_result_age_hours`, `latency_full_score_ms`, `latency_zero_score_ms`, `max_feedback_latency_ms`).
+  * elo\_max\_result\_age\_hours: How long one bad result costs a proxy its traffic. Past this age the result stops counting entirely and the proxy returns to the neutral baseline, so this is the real knob for failure recovery. Defaults to 48.
+  * max\_pool\_size x stats\_pool\_max\_multiplier: The cap on retained **dead** proxy history - not on total memory. Proxies that passed the latest validation are never evicted, because evicting one would reset its failure history to zero on the next sync, so the stats pool grows with the number of genuinely active proxies. If the live set alone reaches the cap, all dead history is dropped and a warning is logged.
 * **\[proxy\_source\_\*\]**: Define your proxy sources here. Each source should have its own section (e.g., \[proxy\_source\_freeproxies\]).  
   * url: The URL to fetch the proxy list from.  
   * update\_interval\_minutes: How often to fetch from this source.  
@@ -217,7 +225,7 @@ Submits feedback on a proxy's performance. This is crucial for the scoring syste
   * source (string, required): The source pool the proxy belongs to.  
   * proxy (string, required): The full proxy URL (e.g., http://1.2.3.4:8080).  
   * status (integer, required): 0 and 4 are legacy failures; 1/2/3 and HTTP 1xx-3xx are successes; HTTP 4xx-5xx are failures; other values are rejected.  
-  * response\_time\_ms (integer, optional): The response time in milliseconds for successful requests. Lower times result in a higher score bonus. Must be finite, non-negative, and no larger than one day in milliseconds (86400000); anything else is rejected with a 400.  
+  * response\_time\_ms (integer, optional): The response time in milliseconds for successful requests. Lower times result in a higher score bonus. Must be finite, non-negative, and no larger than `max_feedback_latency_ms` (defaults to one day, `86400000`); anything else is rejected with a 400.
   * failure\_kind (string, optional): One of `timeout`, `proxy_error`, `dead`, `blocked`, `slow`, or `content_error`. `dead` applies the failure to every source where that proxy is tracked; other kinds affect only the reported source.
 * **Success Response (200)**:  
 
@@ -250,12 +258,12 @@ curl -X POST -H "Content-Type: application/json" http://127.0.0.1:6942/reload-so
       "added_fetcher_jobs": ["proxy_source_new"],  
       "removed_fetcher_jobs": [],  
       "added_predefined_sources": ["new_pool"],  
-      "removed_predefined_sources": [],  
-      "restart_required_for": [  
-        "[database] connection pool",  
-        "[server] port",  
-        "[logging] log_dir / log_file_base_name"  
-      ]  
+      "removed_predefined_sources": [],
+      "restart_required_for": [
+        "[database] connection pool",
+        "[server] port",
+        "[logging] log_dir / log_file_base_name"
+      ]
     }  
   }  
 ```

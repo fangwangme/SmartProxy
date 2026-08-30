@@ -84,7 +84,7 @@ CREATE INDEX idx_source_stats_minute ON source_stats_by_minute (minute);
 -- script aborted there. A plain (source_name, minute) index is immutable and,
 -- combined with range predicates in db.py instead of DATE(minute) = ..., is
 -- what the daily/timeseries queries actually use.
-CREATE INDEX idx_source_stats_by_minute_source_date ON source_stats_by_minute (source_name, minute);
+CREATE INDEX idx_source_stats_by_minute_source_minute ON source_stats_by_minute (source_name, minute);
 
 COMMENT ON TABLE source_stats_by_minute IS 'Stores aggregated success/failure counts for each source per minute.';
 COMMENT ON COLUMN source_stats_by_minute.minute IS 'Timestamp truncated to the minute, e.g., 2025-08-02 16:30:00';

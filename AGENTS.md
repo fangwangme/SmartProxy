@@ -1,6 +1,6 @@
 ## Development Environment
 
-- Python: **3.14**, managed by **uv**. `uv sync` then run tools through `.venv/bin/...`
+- Python: **3.14**, managed by **uv**. `uv sync --locked` then run tools through `.venv/bin/...`
 - Node.js: `cd dashboard && bun install`
 
 ### Creating the Python `.venv`
@@ -11,13 +11,12 @@ main checkout's environment, and a venv copied or moved between paths breaks
 path). Create one in each checkout you work in:
 
 ```bash
-uv sync
+uv sync --locked
 ```
 
 That reads `pyproject.toml` + `uv.lock` and creates `.venv` on the interpreter
 pinned in `.python-version`, installing uv's own 3.14 build if the machine has
-none. `uv lock` is the only thing that may change the resolution; `uv sync`
-never does.
+none. `--locked` makes the command fail if `uv.lock` would need to change.
 
 **Without uv**, the pip path still works:
 
@@ -33,7 +32,7 @@ run:
 
 ```bash
 uv lock
-uv export --no-hashes --no-emit-project -o requirements.txt
+uv export --frozen --no-hashes --no-emit-project -o requirements.txt
 ```
 
 Run tools through `.venv/bin/...` (e.g. `.venv/bin/python -m pytest tests/ -q`)
