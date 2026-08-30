@@ -1,6 +1,6 @@
 # Changelog
 
-## 2026-08-30 — PR #14: Proxy pool quality fixes
+## 3.3.0 — 2026-08-30 — PR #14: Proxy pool quality fixes
 
 This change closes [Issue #13](https://github.com/fangwangme/SmartProxy/issues/13).
 

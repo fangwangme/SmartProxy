@@ -1,6 +1,6 @@
 [project]
 name = "smartproxy"
-version = "0.1.0"
+version = "3.3.0"
 description = "An intelligent, self-adapting proxy pool service"
 requires-python = ">=3.14"
 dependencies = [
