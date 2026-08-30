@@ -3,14 +3,32 @@
 
 <head>
   <meta charset="UTF-8" />
-  <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Proxy Service Dashboard</title>
+  <script>
+    // Resolve the theme before first paint so the page never flashes the wrong
+    // background. Kept in sync with src/hooks/useTheme.ts.
+    (function () {
+      // System preference first, so a storage read that throws (private mode,
+      // blocked site data) cannot pin the page to dark against the system.
+      var theme = window.matchMedia('(prefers-color-scheme: dark)').matches
+        ? 'dark'
+        : 'light';
+      try {
+        var stored = localStorage.getItem('smartproxy-dashboard-theme');
+        if (stored === 'light' || stored === 'dark') theme = stored;
+      } catch (error) {
+        // Storage blocked: keep the system preference resolved above.
+      }
+      document.documentElement.dataset.theme = theme;
+    })();
+  </script>
 </head>
 
 <body>
   <div id="root"></div>
-  <script type="module" src="/src/main.jsx"></script>
+  <script type="module" src="/src/main.tsx"></script>
 </body>
 
 </html>
