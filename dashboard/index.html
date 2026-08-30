@@ -10,14 +10,16 @@
     // Resolve the theme before first paint so the page never flashes the wrong
     // background. Kept in sync with src/hooks/useTheme.ts.
     (function () {
-      var theme = 'dark';
+      // System preference first, so a storage read that throws (private mode,
+      // blocked site data) cannot pin the page to dark against the system.
+      var theme = window.matchMedia('(prefers-color-scheme: dark)').matches
+        ? 'dark'
+        : 'light';
       try {
         var stored = localStorage.getItem('smartproxy-dashboard-theme');
-        theme = stored === 'light' || stored === 'dark'
-          ? stored
-          : (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+        if (stored === 'light' || stored === 'dark') theme = stored;
       } catch (error) {
-        // Storage blocked: fall back to the dark default.
+        // Storage blocked: keep the system preference resolved above.
       }
       document.documentElement.dataset.theme = theme;
     })();

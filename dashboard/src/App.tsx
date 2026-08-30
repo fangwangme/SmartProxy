@@ -5,7 +5,11 @@ import Controls from './components/Controls'
 import ErrorBoundary from './components/ErrorBoundary'
 import Header from './components/Header'
 import StatsCards from './components/StatsCards'
-import { ALL_SOURCES_OPTION, useDashboardData } from './hooks/useDashboardData'
+import {
+  ALL_SOURCES_OPTION,
+  queryKeyOf,
+  useDashboardData,
+} from './hooks/useDashboardData'
 import { useTheme } from './hooks/useTheme'
 import type { Interval } from './types/api'
 import { todayLocal } from './utils/dateUtils'
@@ -16,9 +20,7 @@ const App = () => {
   const { preference, theme, setPreference } = useTheme()
   const {
     sources,
-    dailyStats,
-    chartRows,
-    chartSources,
+    snapshot,
     loading,
     isRefreshing,
     error,
@@ -36,6 +38,12 @@ const App = () => {
   const [isVisible, setIsVisible] = useState(
     () => document.visibilityState === 'visible',
   )
+
+  // Only ever render numbers that belong to the current selection. After a
+  // failed reload the previous snapshot is still in state, but its key no
+  // longer matches, so it cannot be shown under the new date or source.
+  const queryKey = queryKeyOf(selectedSource, selectedDate, interval)
+  const current = snapshot?.key === queryKey ? snapshot : null
 
   // Load the source list once; every later refresh runs off the single
   // scheduler below rather than a timer of its own.
@@ -55,8 +63,8 @@ const App = () => {
   }, [loadData, selectedSource, selectedDate, interval])
 
   useEffect(() => {
-    if (!loading && (dailyStats !== null || error !== null)) setHasLoaded(true)
-  }, [loading, dailyStats, error])
+    if (!loading && (current !== null || error !== null)) setHasLoaded(true)
+  }, [loading, current, error])
 
   // Latest-value ref so the scheduler and the visibility listener can refresh
   // without re-subscribing on every parameter change.
@@ -81,13 +89,34 @@ const App = () => {
     pollingEnabledRef.current = pollingEnabled
   }, [pollingEnabled])
 
+  /**
+   * One tick of the scheduler. Re-reads the wall clock first: a session left
+   * open across midnight must follow the new day, otherwise it would refresh
+   * yesterday once and then tear down its own timer when `isLatestDate` goes
+   * false — auto-refresh would stop for good.
+   */
+  const tickRef = useRef<() => void>(() => undefined)
+  useEffect(() => {
+    tickRef.current = () => {
+      const now = todayLocal()
+      if (now !== today) {
+        setToday(now)
+        if (selectedDate === today) {
+          // Sitting on "today" when it rolled over: move with it and let the
+          // parameter effect load the new day. Refreshing here would re-fetch
+          // the old date from a closure that is already stale.
+          setSelectedDate(now)
+          return
+        }
+      }
+      refreshRef.current(true)
+    }
+  })
+
   useEffect(() => {
     if (!shouldPoll) return
     const timer = window.setInterval(() => {
-      // Re-evaluate "today" so a session left open past midnight notices the
-      // rollover instead of silently polling yesterday forever.
-      setToday(todayLocal())
-      refreshRef.current(true)
+      tickRef.current()
     }, REFRESH_INTERVAL_MS)
     return () => {
       window.clearInterval(timer)
@@ -98,11 +127,9 @@ const App = () => {
     const onVisibilityChange = () => {
       const visible = document.visibilityState === 'visible'
       setIsVisible(visible)
-      if (visible) {
-        setToday(todayLocal())
-        // Catch up once on return; the scheduler resumes from here.
-        if (pollingEnabledRef.current) refreshRef.current(true)
-      }
+      // Catch up once on return, including across a midnight that passed while
+      // the tab was hidden.
+      if (visible && pollingEnabledRef.current) tickRef.current()
     }
     document.addEventListener('visibilitychange', onVisibilityChange)
     return () => {
@@ -165,17 +192,18 @@ const App = () => {
           )}
 
           <StatsCards
-            dailyStats={dailyStats}
+            dailyStats={current?.daily ?? null}
             loading={loading}
             scope={selectedSource}
           />
 
           <Charts
-            rows={chartRows}
-            chartSources={chartSources}
+            rows={current?.rows ?? []}
+            chartSources={current?.sources ?? []}
             theme={theme}
             loading={loading}
             hasLoaded={hasLoaded}
+            failed={current === null && error !== null}
           />
         </ErrorBoundary>
       </div>

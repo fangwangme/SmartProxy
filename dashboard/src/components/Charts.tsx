@@ -149,6 +149,8 @@ interface ChartsProps {
   theme: ResolvedTheme
   loading: boolean
   hasLoaded: boolean
+  /** The current selection has no data *because* its request failed. */
+  failed: boolean
 }
 
 const Charts = ({
@@ -157,6 +159,7 @@ const Charts = ({
   theme,
   loading,
   hasLoaded,
+  failed,
 }: ChartsProps) => {
   const palette = GRUVBOX[theme]
 
@@ -192,9 +195,11 @@ const Charts = ({
         ) : !hasData ? (
           <EmptyState
             message={
-              hasLoaded
-                ? 'No traffic recorded for this source on the selected date.'
-                : 'Loading statistics…'
+              failed
+                ? 'Could not load statistics for this selection. Fix the error above, then refresh.'
+                : hasLoaded
+                  ? 'No traffic recorded for this source on the selected date.'
+                  : 'Loading statistics…'
             }
           />
         ) : (

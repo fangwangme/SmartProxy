@@ -25,6 +25,30 @@ const EMPTY_DAILY: DailyStats = {
   success_rate: 0,
 }
 
+/**
+ * Identifies the query a set of numbers came from. Rendering compares this
+ * against the current selection, so a result can never be displayed under a
+ * date or source it does not belong to — including after a failed reload,
+ * where the previous result is still in state.
+ */
+export const queryKeyOf = (
+  source: string,
+  date: string,
+  interval: Interval,
+): string => `${source}|${date}|${String(interval)}`
+
+/**
+ * One complete, self-consistent set of dashboard numbers. Committed in a single
+ * `setState` only after every request behind it has succeeded, so the KPI row
+ * and the chart can never disagree about which day they are showing.
+ */
+export interface DashboardSnapshot {
+  key: string
+  daily: DailyStats
+  rows: ChartRow[]
+  sources: string[]
+}
+
 interface LoadOptions {
   /** Refresh in the background: keep the current chart, skip the skeleton. */
   silent?: boolean
@@ -88,9 +112,7 @@ const aggregateDaily = (sources: OverviewSource[]): DailyStats => {
  */
 export const useDashboardData = () => {
   const [sources, setSources] = useState<string[]>([ALL_SOURCES_OPTION])
-  const [dailyStats, setDailyStats] = useState<DailyStats | null>(null)
-  const [chartRows, setChartRows] = useState<ChartRow[]>([])
-  const [chartSources, setChartSources] = useState<string[]>([])
+  const [snapshot, setSnapshot] = useState<DashboardSnapshot | null>(null)
   const [loading, setLoading] = useState(false)
   const [isRefreshing, setIsRefreshing] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -150,45 +172,46 @@ export const useDashboardData = () => {
       setError(null)
 
       try {
+        let next: DashboardSnapshot
+        const key = queryKeyOf(source, date, interval)
+
         if (source === ALL_SOURCES_OPTION) {
           const overview = await fetchOverview(date, interval, controller.signal)
           if (!isCurrent()) return
 
           const fulfilled = overview.sources
-          if (fulfilled.length === 0) {
-            setDailyStats(EMPTY_DAILY)
-            setChartRows([])
-            setChartSources([])
-            return
-          }
-
           // Prefer sources that actually saw traffic; fall back to all of them
           // so an idle day still renders a legend instead of an empty chart.
           const active = fulfilled
             .filter((item) => item.daily.total_requests > 0)
             .map((item) => item.source)
 
-          setDailyStats(aggregateDaily(fulfilled))
-          setChartRows(mergedRows(fulfilled))
-          setChartSources(
-            active.length > 0 ? active : fulfilled.map((item) => item.source),
-          )
-          return
+          next = {
+            key,
+            daily: fulfilled.length > 0 ? aggregateDaily(fulfilled) : EMPTY_DAILY,
+            rows: mergedRows(fulfilled),
+            sources:
+              active.length > 0 ? active : fulfilled.map((item) => item.source),
+          }
+        } else {
+          // Both together: committing the daily total before the timeseries
+          // arrives would leave the KPI row and the chart on different days if
+          // the second request failed.
+          const [daily, points] = await Promise.all([
+            fetchDailyStats(source, date, controller.signal),
+            fetchTimeseries(source, date, interval, controller.signal),
+          ])
+          if (!isCurrent()) return
+
+          next = {
+            key,
+            daily,
+            rows: singleSourceRows(source, points),
+            sources: [source],
+          }
         }
 
-        const daily = await fetchDailyStats(source, date, controller.signal)
-        if (!isCurrent()) return
-        setDailyStats(daily)
-
-        const points = await fetchTimeseries(
-          source,
-          date,
-          interval,
-          controller.signal,
-        )
-        if (!isCurrent()) return
-        setChartRows(singleSourceRows(source, points))
-        setChartSources([source])
+        setSnapshot(next)
       } catch (caught) {
         if (isAbortError(caught)) return
         console.error(caught)
@@ -214,9 +237,7 @@ export const useDashboardData = () => {
 
   return {
     sources,
-    dailyStats,
-    chartRows,
-    chartSources,
+    snapshot,
     loading,
     isRefreshing,
     error,

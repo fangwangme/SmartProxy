@@ -1,4 +1,5 @@
 import type { ThemePreference } from '../hooks/useTheme'
+import { handleRadioGroupKeys } from '../utils/radioGroupKeys'
 import { MonitorIcon, MoonIcon, SunIcon } from './icons'
 
 interface ThemeToggleProps {
@@ -20,6 +21,7 @@ const ThemeToggle = ({ preference, onChange }: ThemeToggleProps) => (
   <div
     role="radiogroup"
     aria-label="Colour theme"
+    onKeyDown={handleRadioGroupKeys}
     className="flex items-center gap-0.5 rounded-md border border-bg3 bg-bg1 p-0.5"
   >
     {OPTIONS.map(({ value, label, Icon }) => {
@@ -30,6 +32,7 @@ const ThemeToggle = ({ preference, onChange }: ThemeToggleProps) => (
           type="button"
           role="radio"
           aria-checked={selected}
+          tabIndex={selected ? 0 : -1}
           aria-label={label}
           title={label}
           onClick={() => {

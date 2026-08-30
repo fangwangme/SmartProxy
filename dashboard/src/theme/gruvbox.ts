@@ -92,8 +92,13 @@ export type TokenName = keyof Palette
 export const TOKEN_NAMES = Object.keys(GRUVBOX.dark) as TokenName[]
 
 /**
- * Chart series hues, ordered so that neighbouring series stay distinguishable.
- * Bright variants resolve in dark mode, faded ones in light mode.
+ * Chart series base hues, ordered so that neighbouring series stay
+ * distinguishable. Bright variants resolve in dark mode, faded ones in light.
+ *
+ * Gruvbox only defines seven, but issue #15's motivating case is ten sources,
+ * and in the combined chart a source owns a whole hue (solid = success rate,
+ * dashed = volume). Repeating a hue would make two sources indistinguishable,
+ * so indices past the seventh get derived variants instead — see `seriesColor`.
  */
 const SERIES_HUES = [
   'orange',
@@ -105,7 +110,47 @@ const SERIES_HUES = [
   'red',
 ] as const satisfies readonly TokenName[]
 
+const clampChannel = (value: number): number =>
+  Math.max(0, Math.min(255, Math.round(value)))
+
+const parseHex = (hex: string): [number, number, number] => {
+  const value = Number.parseInt(hex.slice(1), 16)
+  return [(value >> 16) & 0xff, (value >> 8) & 0xff, value & 0xff]
+}
+
+const toHex = (channels: readonly number[]): string =>
+  `#${channels.map((c) => clampChannel(c).toString(16).padStart(2, '0')).join('')}`
+
+/** Linear blend of two hex colours; `ratio` is how far to move toward `target`. */
+const mix = (hex: string, target: string, ratio: number): string => {
+  const from = parseHex(hex)
+  const to = parseHex(target)
+  return toHex(from.map((channel, index) => {
+    const other = to[index] ?? channel
+    return channel + (other - channel) * ratio
+  }))
+}
+
+/**
+ * Tiers applied to the base hues, in order. Each is a blend target read from
+ * the active palette plus a ratio, so both directions stay theme-aware:
+ * `fg0` is cream in dark mode and near-black in light mode, so tier 1 lightens
+ * on a dark ground and deepens on a light one — contrast improves either way.
+ */
+const SERIES_TIERS: { toward: TokenName; ratio: number }[] = [
+  { toward: 'fg0', ratio: 0 },
+  { toward: 'fg0', ratio: 0.45 },
+  { toward: 'bg0', ratio: 0.34 },
+]
+
+/** Distinct colours available before any repeat: 7 hues x 3 tiers. */
+export const SERIES_COLOR_COUNT = SERIES_HUES.length * SERIES_TIERS.length
+
 export const seriesColor = (palette: Palette, index: number): string => {
-  const hue = SERIES_HUES[index % SERIES_HUES.length]
-  return hue === undefined ? palette.gray : palette[hue]
+  const safeIndex = Math.max(0, index) % SERIES_COLOR_COUNT
+  const hue = SERIES_HUES[safeIndex % SERIES_HUES.length]
+  const tier = SERIES_TIERS[Math.floor(safeIndex / SERIES_HUES.length)]
+  if (hue === undefined || tier === undefined) return palette.gray
+  const base = palette[hue]
+  return tier.ratio === 0 ? base : mix(base, palette[tier.toward], tier.ratio)
 }

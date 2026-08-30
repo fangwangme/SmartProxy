@@ -2,6 +2,7 @@ import { useCallback, useEffect } from 'react'
 
 import { INTERVALS, type Interval } from '../types/api'
 import { shiftLocalDate } from '../utils/dateUtils'
+import { handleRadioGroupKeys } from '../utils/radioGroupKeys'
 import { ChevronLeftIcon, ChevronRightIcon, RefreshIcon } from './icons'
 
 interface ControlsProps {
@@ -56,21 +57,15 @@ const Controls = ({
     [selectedDate, today, onDateChange],
   )
 
-  // Left/right arrows step the day, unless the user is typing in a field.
+  // Left/right arrows step the day, but only while nothing is focused. Any
+  // focused control owns its own arrow keys — the radiogroups below use them
+  // to move between members, and stealing them here both broke that and
+  // changed the date behind the user's back.
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      const target = event.target
-      if (target instanceof HTMLElement) {
-        const tag = target.tagName.toLowerCase()
-        if (
-          tag === 'input' ||
-          tag === 'select' ||
-          tag === 'textarea' ||
-          target.isContentEditable
-        ) {
-          return
-        }
-      }
+      if (event.defaultPrevented) return
+      const active = document.activeElement
+      if (active !== null && active !== document.body) return
 
       if (event.key === 'ArrowLeft') stepDate(-1)
       else if (event.key === 'ArrowRight') stepDate(1)
@@ -147,6 +142,7 @@ const Controls = ({
         <div
           role="radiogroup"
           aria-label="Aggregation interval"
+          onKeyDown={handleRadioGroupKeys}
           className={`${GROUP} ${FIELD} divide-x divide-bg3`}
         >
           {INTERVALS.map((value) => {
@@ -157,6 +153,7 @@ const Controls = ({
                 type="button"
                 role="radio"
                 aria-checked={selected}
+                tabIndex={selected ? 0 : -1}
                 onClick={() => {
                   onIntervalChange(value)
                 }}
