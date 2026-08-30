@@ -11,7 +11,10 @@ from typing import Optional
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 from src.utils.logger import logger, setup_logging
-from src.core.proxy_manager import ProxyManager
+from src.core.proxy_manager import (
+    DEFAULT_MAX_FEEDBACK_LATENCY_MS,
+    ProxyManager,
+)
 
 LOCALHOST_IPS = {"127.0.0.1", "::1"}
 INTERNAL_ONLY_ENDPOINTS = {"/health", "/metrics", "/reload-sources", "/backup-stats"}
@@ -218,15 +221,55 @@ smartproxy_is_validating {1 if proxy_manager.is_validating else 0}
         logger.debug(
             f"Handled feedback: {source} - {status_code} - {proxy_url} - {resp_time}"
         )
-        if not all([source, proxy_url]) or not isinstance(status_code, int):
+
+        # Validate strictly at the boundary. Anything that reaches
+        # process_feedback is written into the persistent scoring state and is
+        # later fed to _calculate_elo_score for the whole pool, so a single
+        # wrong-typed value would poison the stat and crash every later sync.
+        # bool is a subclass of int, so `type(...) is int` is deliberate.
+        if not isinstance(source, str) or not source.strip():
+            return jsonify({"error": "'source' must be a non-empty string."}), 400
+        if not isinstance(proxy_url, str) or not proxy_url.strip():
+            return jsonify({"error": "'proxy' must be a non-empty string."}), 400
+        if type(status_code) is not int:
             return (
                 jsonify(
                     {
-                        "error": "Invalid feedback data. 'source', 'proxy', and 'status_code' (int) are required."
+                        "error": "Invalid feedback data. 'source', 'proxy', and 'status' (int) are required."
                     }
                 ),
                 400,
             )
+        # One normalizer for both entry points. The API and restore_stats() feed
+        # the same recent_results window, so a value the API waves through is a
+        # value that will be replayed out of a backup later; they must agree on
+        # what a latency is. It also keeps math.isfinite() off unbounded ints -
+        # a body carrying 10**400 would otherwise raise OverflowError here and
+        # turn a bad request into a 500.
+        max_latency_ms = getattr(
+            proxy_manager,
+            "max_feedback_latency_ms",
+            DEFAULT_MAX_FEEDBACK_LATENCY_MS,
+        )
+        if not isinstance(max_latency_ms, int) or isinstance(max_latency_ms, bool):
+            max_latency_ms = DEFAULT_MAX_FEEDBACK_LATENCY_MS
+        if (
+            resp_time is not None
+            and ProxyManager._coerce_latency(resp_time, max_latency_ms) is None
+        ):
+            return (
+                jsonify(
+                    {
+                        "error": (
+                            "'response_time_ms' must be a finite, non-negative "
+                            f"number of milliseconds no greater than {max_latency_ms}."
+                        )
+                    }
+                ),
+                400,
+            )
+        if failure_kind is not None and not isinstance(failure_kind, str):
+            return jsonify({"error": "'failure_kind' must be a string."}), 400
         if not proxy_manager.is_valid_feedback_status(status_code):
             return (
                 jsonify(
@@ -282,9 +325,12 @@ smartproxy_is_validating {1 if proxy_manager.is_validating else 0}
 
     @app.route("/api/sources", methods=["GET"])
     def get_sources():
-        # Keep source list fresh for dashboard clients instead of waiting for scheduler refresh.
-        proxy_manager._update_dashboard_sources()
-        return jsonify(sorted(list(proxy_manager.dashboard_sources)))
+        # Read the cache the scheduler maintains (source_refresh_interval_seconds,
+        # and once at startup). Refreshing here ran a SELECT DISTINCT on every
+        # dashboard poll for a list that changes on the order of hours.
+        with proxy_manager.lock:
+            sources = sorted(proxy_manager.dashboard_sources)
+        return jsonify(sources)
 
     @app.route("/api/stats/daily", methods=["GET"])
     def get_daily_stats_route():
