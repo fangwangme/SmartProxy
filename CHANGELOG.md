@@ -42,7 +42,12 @@ This change closes [Issue #15](https://github.com/fangwangme/SmartProxy/issues/1
   committed together, so the KPI row and the chart cannot disagree about which
   day they show.
 - Arrow keys step the date only when no control is focused. The interval and
-  theme selectors implement standard radio-group keyboard behaviour.
+  theme selectors implement standard radio-group keyboard behaviour, and the
+  date field shows a focus ring again.
+- A date typed past today is clamped to today, so the "next day" control and
+  the auto-refresh state cannot disagree with what is displayed.
+- Dismissing the error banner no longer makes the chart claim the day had no
+  traffic when the request in fact failed.
 - Compact KPI row, responsive toolbar, skeleton loading states, focus-visible
   styling, and a recoverable error boundary. Vite template leftovers were
   removed and `dashboard/README.md` was rewritten.

@@ -116,28 +116,42 @@ export const useDashboardData = () => {
   const [loading, setLoading] = useState(false)
   const [isRefreshing, setIsRefreshing] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  /**
+   * The query whose load failed, if any. Tracked separately from `error`
+   * because the error banner is dismissible: clearing the banner must not make
+   * the chart claim the day had no traffic when it was never fetched.
+   */
+  const [failedKey, setFailedKey] = useState<string | null>(null)
 
   const requestIdRef = useRef(0)
   const activeControllerRef = useRef<AbortController | null>(null)
+  const sourcesControllerRef = useRef<AbortController | null>(null)
 
   // Never leave a request running after the dashboard unmounts.
   useEffect(
     () => () => {
       activeControllerRef.current?.abort()
       activeControllerRef.current = null
+      sourcesControllerRef.current?.abort()
+      sourcesControllerRef.current = null
     },
     [],
   )
 
   const loadSources = useCallback(async (options: LoadOptions = {}) => {
+    sourcesControllerRef.current?.abort()
+    const controller = new AbortController()
+    sourcesControllerRef.current = controller
+
     try {
-      const data = await fetchSources()
+      const data = await fetchSources(controller.signal)
       const normalized = [
         ...new Set(data.filter((item) => item && item !== ALL_SOURCES_OPTION)),
       ]
       const next = [ALL_SOURCES_OPTION, ...normalized]
       setSources((previous) => (sameArray(previous, next) ? previous : next))
     } catch (caught) {
+      if (isAbortError(caught)) return
       console.error(caught)
       if (!options.silent) {
         setError(
@@ -212,6 +226,7 @@ export const useDashboardData = () => {
         }
 
         setSnapshot(next)
+        setFailedKey((previous) => (previous === next.key ? null : previous))
       } catch (caught) {
         if (isAbortError(caught)) return
         console.error(caught)
@@ -219,6 +234,7 @@ export const useDashboardData = () => {
           setError(
             caught instanceof Error ? caught.message : 'Failed to load statistics.',
           )
+          setFailedKey(queryKeyOf(source, date, interval))
         }
       } finally {
         if (isCurrent()) {
@@ -238,6 +254,7 @@ export const useDashboardData = () => {
   return {
     sources,
     snapshot,
+    failedKey,
     loading,
     isRefreshing,
     error,

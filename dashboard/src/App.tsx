@@ -21,6 +21,7 @@ const App = () => {
   const {
     sources,
     snapshot,
+    failedKey,
     loading,
     isRefreshing,
     error,
@@ -76,7 +77,7 @@ const App = () => {
     }
   })
 
-  const isLatestDate = selectedDate === today
+  const isLatestDate = selectedDate >= today
   // Polling a past date re-fetches a day that can no longer change, and a
   // hidden tab does not need the traffic at all.
   const pollingEnabled = autoRefresh && isLatestDate
@@ -90,14 +91,16 @@ const App = () => {
   }, [pollingEnabled])
 
   /**
-   * One tick of the scheduler. Re-reads the wall clock first: a session left
-   * open across midnight must follow the new day, otherwise it would refresh
-   * yesterday once and then tear down its own timer when `isLatestDate` goes
-   * false — auto-refresh would stop for good.
+   * One refresh, from the scheduler, the visibility listener, or the manual
+   * button. Re-reads the wall clock first: a session left open across midnight
+   * must follow the new day, otherwise it would refresh yesterday once and then
+   * tear down its own timer when `isLatestDate` goes false — auto-refresh would
+   * stop for good. Manual refresh goes through here too, so clicking the button
+   * just after midnight cannot strand the view on yesterday.
    */
-  const tickRef = useRef<() => void>(() => undefined)
+  const tickRef = useRef<(silent: boolean) => void>(() => undefined)
   useEffect(() => {
-    tickRef.current = () => {
+    tickRef.current = (silent: boolean) => {
       const now = todayLocal()
       if (now !== today) {
         setToday(now)
@@ -109,14 +112,14 @@ const App = () => {
           return
         }
       }
-      refreshRef.current(true)
+      refreshRef.current(silent)
     }
   })
 
   useEffect(() => {
     if (!shouldPoll) return
     const timer = window.setInterval(() => {
-      tickRef.current()
+      tickRef.current(true)
     }, REFRESH_INTERVAL_MS)
     return () => {
       window.clearInterval(timer)
@@ -129,7 +132,7 @@ const App = () => {
       setIsVisible(visible)
       // Catch up once on return, including across a midnight that passed while
       // the tab was hidden.
-      if (visible && pollingEnabledRef.current) tickRef.current()
+      if (visible && pollingEnabledRef.current) tickRef.current(true)
     }
     document.addEventListener('visibilitychange', onVisibilityChange)
     return () => {
@@ -138,8 +141,7 @@ const App = () => {
   }, [])
 
   const handleRefresh = useCallback(() => {
-    setToday(todayLocal())
-    refreshRef.current(false)
+    tickRef.current(false)
   }, [])
 
   return (
@@ -203,7 +205,7 @@ const App = () => {
             theme={theme}
             loading={loading}
             hasLoaded={hasLoaded}
-            failed={current === null && error !== null}
+            failed={current === null && failedKey === queryKey}
           />
         </ErrorBoundary>
       </div>

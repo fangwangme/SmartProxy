@@ -45,7 +45,7 @@ const Controls = ({
   loading,
   isRefreshing,
 }: ControlsProps) => {
-  const isLatestDate = selectedDate === today
+  const isLatestDate = selectedDate >= today
 
   const stepDate = useCallback(
     (offsetDays: number) => {
@@ -119,9 +119,13 @@ const Controls = ({
             value={selectedDate}
             max={today}
             onChange={(event) => {
-              if (event.target.value) onDateChange(event.target.value)
+              // `max` marks a future date invalid but does not block typing it.
+              const value = event.target.value
+              if (value) onDateChange(value > today ? today : value)
             }}
-            className="w-[8.5rem] border-0 bg-transparent px-2 text-center text-sm text-fg1 focus:ring-0"
+            // The group clips overflow, so the shared ring's offset would be
+            // cut off — draw it inset instead of suppressing it.
+            className="w-[8.5rem] border-0 bg-transparent px-2 text-center text-sm text-fg1 focus-visible:ring-inset focus-visible:ring-offset-0"
           />
           <button
             type="button"

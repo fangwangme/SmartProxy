@@ -18,9 +18,12 @@ const getJson = async <T>(
 
   const response = await fetch(url, { signal })
   if (!response.ok) {
-    throw new Error(
-      `${path} failed: ${String(response.status)} ${response.statusText}`,
-    )
+    // HTTP/2 and HTTP/3 dropped the status reason phrase, so `statusText` is
+    // routinely empty — joining unconditionally would leave a trailing space.
+    const status = [String(response.status), response.statusText]
+      .filter(Boolean)
+      .join(' ')
+    throw new Error(`${path} failed: ${status}`)
   }
   return (await response.json()) as T
 }
