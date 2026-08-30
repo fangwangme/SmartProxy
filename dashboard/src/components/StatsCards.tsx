@@ -57,7 +57,6 @@ const StatsCards = ({ dailyStats, loading, scope }: StatsCardsProps) => {
   }
 
   const hasTraffic = dailyStats.total_requests > 0
-  const failed = dailyStats.total_requests - dailyStats.total_success
 
   return (
     <dl className={shell}>
@@ -66,7 +65,10 @@ const StatsCards = ({ dailyStats, loading, scope }: StatsCardsProps) => {
         label="Requests (day)"
         value={dailyStats.total_requests.toLocaleString()}
       />
-      <Kpi label="Failed (day)" value={failed.toLocaleString()} />
+      <Kpi
+        label="Success (day)"
+        value={dailyStats.total_success.toLocaleString()}
+      />
       <Kpi
         label="Success rate (day)"
         value={hasTraffic ? `${String(dailyStats.success_rate)}%` : '—'}
