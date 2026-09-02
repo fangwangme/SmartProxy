@@ -1,5 +1,16 @@
 # Changelog
 
+## 3.3.3 — 2026-09-02 — PR #20: Dashboard interval K-line alignment, Today quick jump, and time window selection
+
+This change closes [Issue #19](https://github.com/fangwangme/SmartProxy/issues/19).
+
+### Dashboard & API
+
+- **Aggregation intervals alignment**: Updated API and frontend to standard K-line intervals `[1, 2, 5, 15, 60]` minutes (`src/api/server.py`, `dashboard/src/types/api.ts`).
+- **"Today" quick-jump action**: Added a "Today" button next to Date picker in `Controls.tsx`. Clicking jumps to `today` and resumes auto-refresh; disabled when already on today.
+- **Time window selection**: Added `1h`, `2h`, `5h`, `24h` window selector in `Controls.tsx`, filtering visible timeseries rows in `App.tsx` when viewing today.
+- **Adaptive X-axis ticks**: Dynamically computes tick marks in `Charts.tsx` based on the visible duration and interval (e.g., 10–15m for 1h, 15–30m for 2h, 30–60m for 5h, 2h for 24h).
+
 ## 3.3.2 — 2026-09-02 — PR #18: Restore proxy supply and recalibrate scoring
 
 This change closes [Issue #17](https://github.com/fangwangme/SmartProxy/issues/17).
