@@ -1877,8 +1877,8 @@ class TestStatsQueryIndexability(unittest.TestCase):
     def test_no_stats_query_filters_on_a_function_call(self):
         calls = [
             lambda: self.db.get_daily_stats("s", "2026-08-29"),
-            lambda: self.db.get_timeseries_stats("s", "2026-08-29", 10),
-            lambda: self.db.get_overview_stats("2026-08-29", 10),
+            lambda: self.db.get_timeseries_stats("s", "2026-08-29", 15),
+            lambda: self.db.get_overview_stats("2026-08-29", 15),
         ]
         for call in calls:
             with self.subTest(call=call):

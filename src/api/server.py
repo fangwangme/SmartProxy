@@ -358,13 +358,13 @@ smartproxy_is_validating {1 if proxy_manager.is_validating else 0}
     def get_timeseries_stats_route():
         source = request.args.get("source")
         date_str = request.args.get("date")
-        interval = request.args.get("interval", "10", type=int)
+        interval = request.args.get("interval", "5", type=int)
         if not all([source, date_str]):
             return (
                 jsonify({"error": "'source' and 'date' query parameters are required."}),
                 400,
             )
-        valid_intervals = [2, 5, 10, 30, 60]
+        valid_intervals = [1, 2, 5, 15, 60]
         if interval not in valid_intervals:
             return jsonify({"error": f"'interval' must be one of {valid_intervals}."}), 400
         
@@ -423,11 +423,11 @@ smartproxy_is_validating {1 if proxy_manager.is_validating else 0}
     @app.route("/api/stats/overview", methods=["GET"])
     def get_stats_overview_route():
         date_str = request.args.get("date")
-        interval = request.args.get("interval", "10", type=int)
+        interval = request.args.get("interval", "5", type=int)
         if not date_str:
             return jsonify({"error": "'date' query parameter is required."}), 400
 
-        valid_intervals = [2, 5, 10, 30, 60]
+        valid_intervals = [1, 2, 5, 15, 60]
         if interval not in valid_intervals:
             return jsonify({"error": f"'interval' must be one of {valid_intervals}."}), 400
 

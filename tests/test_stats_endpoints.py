@@ -188,5 +188,76 @@ class TestOverviewNullSemantics(StatsEndpointsTestCase):
         self.assertEqual(points["03:00"]["total_requests"], 4)
 
 
+class TestIntervalValidation(StatsEndpointsTestCase):
+    def test_valid_intervals_for_timeseries(self):
+        expected_slot_counts = {
+            1: 1440,
+            2: 720,
+            5: 288,
+            15: 96,
+            60: 24,
+        }
+        for interval, count in expected_slot_counts.items():
+            with self.subTest(interval=interval):
+                self.mock_proxy_manager.db.get_timeseries_stats.return_value = []
+                response = self.client.get(
+                    f"/api/stats/timeseries?source=alpha&date={DATE}&interval={interval}",
+                    environ_overrides=LOCAL,
+                )
+                self.assertEqual(response.status_code, 200)
+                data = response.get_json()
+                self.assertEqual(len(data), count)
+
+    def test_valid_intervals_for_overview(self):
+        expected_slot_counts = {
+            1: 1440,
+            2: 720,
+            5: 288,
+            15: 96,
+            60: 24,
+        }
+        for interval, count in expected_slot_counts.items():
+            with self.subTest(interval=interval):
+                self.mock_proxy_manager.db.get_overview_stats.return_value = {
+                    "daily": [],
+                    "timeseries": [],
+                }
+                response = self.client.get(
+                    f"/api/stats/overview?date={DATE}&interval={interval}",
+                    environ_overrides=LOCAL,
+                )
+                self.assertEqual(response.status_code, 200)
+                payload = response.get_json()["sources"]
+                self.assertEqual(len(payload[0]["timeseries"]), count)
+
+    def test_invalid_intervals_timeseries(self):
+        invalid_intervals = [0, -1, 10, 30, 45, 120]
+        for interval in invalid_intervals:
+            with self.subTest(interval=interval):
+                response = self.client.get(
+                    f"/api/stats/timeseries?source=alpha&date={DATE}&interval={interval}",
+                    environ_overrides=LOCAL,
+                )
+                self.assertEqual(response.status_code, 400)
+                self.assertIn(
+                    "'interval' must be one of [1, 2, 5, 15, 60].",
+                    response.get_json()["error"],
+                )
+
+    def test_invalid_intervals_overview(self):
+        invalid_intervals = [0, -1, 10, 30, 45, 120]
+        for interval in invalid_intervals:
+            with self.subTest(interval=interval):
+                response = self.client.get(
+                    f"/api/stats/overview?date={DATE}&interval={interval}",
+                    environ_overrides=LOCAL,
+                )
+                self.assertEqual(response.status_code, 400)
+                self.assertIn(
+                    "'interval' must be one of [1, 2, 5, 15, 60].",
+                    response.get_json()["error"],
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,11 @@
 import { useCallback, useEffect } from 'react'
 
-import { INTERVALS, type Interval } from '../types/api'
+import {
+  INTERVALS,
+  TIME_WINDOWS,
+  type Interval,
+  type TimeWindow,
+} from '../types/api'
 import { shiftLocalDate } from '../utils/dateUtils'
 import { handleRadioGroupKeys } from '../utils/radioGroupKeys'
 import { ChevronLeftIcon, ChevronRightIcon, RefreshIcon } from './icons'
@@ -13,6 +18,8 @@ interface ControlsProps {
   onDateChange: (date: string) => void
   /** Today in local time, re-evaluated by the scheduler so it survives midnight. */
   today: string
+  timeWindow: TimeWindow
+  onTimeWindowChange: (window: TimeWindow) => void
   interval: Interval
   onIntervalChange: (interval: Interval) => void
   autoRefresh: boolean
@@ -37,6 +44,8 @@ const Controls = ({
   selectedDate,
   onDateChange,
   today,
+  timeWindow,
+  onTimeWindowChange,
   interval,
   onIntervalChange,
   autoRefresh,
@@ -138,6 +147,51 @@ const Controls = ({
           >
             <ChevronRightIcon />
           </button>
+          <button
+            type="button"
+            onClick={() => {
+              onDateChange(today)
+            }}
+            disabled={isLatestDate}
+            className={`${SEGMENT} px-2.5 text-xs font-medium`}
+            aria-label="Jump to today"
+          >
+            Today
+          </button>
+        </div>
+      </div>
+
+      <div>
+        <span className={LABEL}>Window</span>
+        <div
+          role="radiogroup"
+          aria-label="Time window"
+          onKeyDown={handleRadioGroupKeys}
+          className={`${GROUP} ${FIELD} divide-x divide-bg3`}
+        >
+          {TIME_WINDOWS.map((value) => {
+            const selected = timeWindow === value
+            return (
+              <button
+                key={value}
+                type="button"
+                role="radio"
+                aria-checked={selected}
+                tabIndex={selected ? 0 : -1}
+                disabled={!isLatestDate}
+                onClick={() => {
+                  onTimeWindowChange(value)
+                }}
+                className={`${SEGMENT} min-w-[2.5rem] tabular-nums ${
+                  selected
+                    ? 'bg-accent/15 font-medium text-accent hover:bg-accent/15 hover:text-accent'
+                    : ''
+                }`}
+              >
+                {value}
+              </button>
+            )
+          })}
         </div>
       </div>
 

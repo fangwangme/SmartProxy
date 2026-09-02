@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import Charts from './components/Charts'
 import Controls from './components/Controls'
@@ -11,7 +11,7 @@ import {
   useDashboardData,
 } from './hooks/useDashboardData'
 import { useTheme } from './hooks/useTheme'
-import type { Interval } from './types/api'
+import type { Interval, TimeWindow } from './types/api'
 import { todayLocal } from './utils/dateUtils'
 
 const REFRESH_INTERVAL_MS = 30_000
@@ -33,6 +33,7 @@ const App = () => {
   const [today, setToday] = useState(todayLocal)
   const [selectedSource, setSelectedSource] = useState(ALL_SOURCES_OPTION)
   const [selectedDate, setSelectedDate] = useState(today)
+  const [timeWindow, setTimeWindow] = useState<TimeWindow>('24h')
   const [interval, setInterval] = useState<Interval>(5)
   const [autoRefresh, setAutoRefresh] = useState(true)
   const [hasLoaded, setHasLoaded] = useState(false)
@@ -144,6 +145,32 @@ const App = () => {
     tickRef.current(false)
   }, [])
 
+  const visibleRows = useMemo(() => {
+    const allRows = current?.rows ?? []
+    if (allRows.length === 0 || timeWindow === '24h' || selectedDate !== today) {
+      return allRows
+    }
+
+    const windowMinutes =
+      timeWindow === '1h'
+        ? 60
+        : timeWindow === '2h'
+          ? 120
+          : timeWindow === '5h'
+            ? 300
+            : 1440
+
+    const now = new Date()
+    const currentMinutes = now.getHours() * 60 + now.getMinutes()
+    const startMinutes = Math.max(0, currentMinutes - windowMinutes)
+
+    return allRows.filter((row) => {
+      const [h, m] = row.time.split(':').map(Number)
+      const rowMinutes = (h ?? 0) * 60 + (m ?? 0)
+      return rowMinutes >= startMinutes && rowMinutes <= currentMinutes
+    })
+  }, [current?.rows, timeWindow, selectedDate, today])
+
   return (
     <div className="min-h-screen bg-bg0 px-4 py-5 font-sans text-fg1 sm:px-6 lg:px-8">
       <div className="mx-auto max-w-7xl">
@@ -177,6 +204,8 @@ const App = () => {
             selectedDate={selectedDate}
             onDateChange={setSelectedDate}
             today={today}
+            timeWindow={timeWindow}
+            onTimeWindowChange={setTimeWindow}
             interval={interval}
             onIntervalChange={setInterval}
             autoRefresh={autoRefresh}
@@ -200,7 +229,7 @@ const App = () => {
           />
 
           <Charts
-            rows={current?.rows ?? []}
+            rows={visibleRows}
             chartSources={current?.sources ?? []}
             theme={theme}
             loading={loading}
