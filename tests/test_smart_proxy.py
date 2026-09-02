@@ -2283,23 +2283,16 @@ class TestIssue17FetcherSupply(ProxyManagerTestBase):
     failure rate into a near-total outage.
     """
 
-    def _curl_result(self, stdout, returncode=0, stderr=""):
+    def _curl_result(self, stdout, returncode=0, stderr="", http_status=200):
         return subprocess.CompletedProcess(
-            args=["curl"], returncode=returncode, stdout=stdout, stderr=stderr
+            args=["curl"],
+            returncode=returncode,
+            stdout=f"{stdout}\n{http_status:03d}",
+            stderr=stderr,
         )
 
-    def test_curl_is_the_default_transport(self):
-        """A config that says nothing about use_curl must still use curl."""
-        merged = {
-            section: dict(options) for section, options in self.config_dict.items()
-        }
-        merged.pop("fetcher", None)
-        manager = ProxyManager(write_config_file(self.tmp_dir, merged, "nofetcher.ini"))
-
-        self.assertTrue(manager.fetcher_use_curl)
-
     def test_fetch_source_text_uses_curl_and_parses_the_output(self):
-        manager = self.make_manager({"fetcher": {"use_curl": "true"}}, "curl.ini")
+        manager = self.make_manager({}, "curl.ini")
         body = "1.2.3.4:8080\nsocks5://5.6.7.8:1080\nnot-a-proxy\n"
 
         with patch(
@@ -2321,6 +2314,7 @@ class TestIssue17FetcherSupply(ProxyManagerTestBase):
         # Retry is the point: a single reset connection must not cost the whole
         # fetch cycle.
         self.assertIn("--retry", command)
+        self.assertIn("--write-out", command)
         self.assertEqual(
             command[command.index("--retry") + 1], str(manager.fetch_curl_retries)
         )
@@ -2337,7 +2331,6 @@ class TestIssue17FetcherSupply(ProxyManagerTestBase):
         manager = self.make_manager(
             {
                 "fetcher": {
-                    "use_curl": "true",
                     "total_timeout_s": "60",
                     "curl_retries": "2",
                     "curl_retry_delay_s": "1",
@@ -2354,62 +2347,12 @@ class TestIssue17FetcherSupply(ProxyManagerTestBase):
 
         self.assertGreaterEqual(mock_run.call_args.kwargs["timeout"], 3 * 60)
 
-    def test_aiohttp_failure_falls_back_to_curl(self):
-        """
-        The transports cover each other, so a change in how the host routes
-        traffic does not stop supply until somebody edits the config.
-        """
-        manager = self.make_manager({"fetcher": {"use_curl": "false"}}, "fallback.ini")
-
-        with patch.object(
-            manager,
-            "_fetch_source_text_aiohttp",
-            side_effect=FetchError("Connection reset by peer", transient=True),
-        ), patch(
-            "src.core.proxy_manager.subprocess.run",
-            return_value=self._curl_result("9.9.9.9:3128\n"),
-        ) as mock_run:
-            text = manager._fetch_source_text("http://source-a.com/list.txt")
-
-        self.assertEqual(text, "9.9.9.9:3128\n")
-        self.assertEqual(mock_run.call_args.args[0][0], "curl")
-
-    def test_curl_failure_falls_back_to_aiohttp(self):
-        manager = self.make_manager({"fetcher": {"use_curl": "true"}}, "fallback2.ini")
-
-        with patch(
-            "src.core.proxy_manager.subprocess.run",
-            return_value=self._curl_result("", returncode=7, stderr="conn refused"),
-        ), patch.object(
-            manager, "_fetch_source_text_aiohttp", return_value="9.9.9.9:3128\n"
-        ) as mock_aiohttp:
-            text = manager._fetch_source_text("http://source-a.com/list.txt")
-
-        self.assertEqual(text, "9.9.9.9:3128\n")
-        mock_aiohttp.assert_called_once()
-
-    def test_fallback_can_be_disabled(self):
-        manager = self.make_manager(
-            {"fetcher": {"use_curl": "true", "fallback_enabled": "false"}},
-            "nofallback.ini",
-        )
-
-        with patch(
-            "src.core.proxy_manager.subprocess.run",
-            return_value=self._curl_result("", returncode=7, stderr="conn refused"),
-        ), patch.object(manager, "_fetch_source_text_aiohttp") as mock_aiohttp:
-            with self.assertRaises(FetchError):
-                manager._fetch_source_text("http://source-a.com/list.txt")
-
-        mock_aiohttp.assert_not_called()
-
     def test_curl_exit_codes_are_classified(self):
-        manager = self.make_manager({"fetcher": {"use_curl": "true"}}, "classify.ini")
+        manager = self.make_manager({}, "classify.ini")
         cases = {
             56: True,   # recv failure - the reset that started this issue
             7: True,    # failed to connect
             28: True,   # operation timed out
-            22: False,  # -f and the server said 4xx/5xx
             3: False,   # malformed URL
         }
         for returncode, expected_transient in cases.items():
@@ -2420,6 +2363,27 @@ class TestIssue17FetcherSupply(ProxyManagerTestBase):
                 ):
                     with self.assertRaises(FetchError) as ctx:
                         manager._fetch_source_text_curl("http://source-a.com")
+                self.assertEqual(ctx.exception.transient, expected_transient)
+
+    def test_curl_http_statuses_are_classified_from_the_real_status_code(self):
+        manager = self.make_manager({}, "http.ini")
+        cases = {
+            404: False,
+            429: True,
+            500: True,
+            503: True,
+        }
+        for http_status, expected_transient in cases.items():
+            with self.subTest(http_status=http_status):
+                with patch(
+                    "src.core.proxy_manager.subprocess.run",
+                    return_value=self._curl_result(
+                        "", returncode=22, http_status=http_status
+                    ),
+                ):
+                    with self.assertRaises(FetchError) as ctx:
+                        manager._fetch_source_text_curl("http://source-a.com")
+                self.assertIn(str(http_status), str(ctx.exception))
                 self.assertEqual(ctx.exception.transient, expected_transient)
 
     def test_transient_backoff_never_exceeds_the_transient_cap(self):
@@ -2687,6 +2651,38 @@ class TestIssue17ReputationPersistence(ProxyManagerTestBase):
         # The queue is drained, so an idle service does not rewrite the same
         # rows every flush interval.
         self.assertEqual(self.manager.pending_feedback_persist, set())
+
+    def test_overlapping_flushes_cannot_overwrite_newer_totals_with_older_ones(self):
+        proxy = "http://1.2.3.4:8080"
+        self.manager.source_stats["source1"][proxy] = self.manager._get_new_proxy_stat()
+        self.manager.process_feedback("source1", proxy, 500)
+
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        stored_failure_counts = []
+
+        def persist(rows):
+            failure_count = rows[0][4]
+            if not stored_failure_counts:
+                first_entered.set()
+                self.assertTrue(release_first.wait(2))
+            stored_failure_counts.append(failure_count)
+
+        self.mock_db_instance.upsert_proxy_feedback_history.side_effect = persist
+        first = threading.Thread(target=self.manager._persist_feedback_history)
+        first.start()
+        self.assertTrue(first_entered.wait(2))
+
+        self.manager.process_feedback("source1", proxy, 500)
+        second = threading.Thread(target=self.manager._persist_feedback_history)
+        second.start()
+        release_first.set()
+        first.join(2)
+        second.join(2)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(stored_failure_counts, [1, 2])
 
     def test_ipv6_proxy_urls_round_trip_through_the_write_back_key(self):
         proxy = "http://[2001:db8::1]:8080"

@@ -18,7 +18,7 @@ SmartProxy is a sophisticated proxy management system designed to provide reliab
 1. **Fetch**: The service periodically fetches proxy lists from various sources defined in config.ini.  
 2. **Validate**: A validation cycle runs regularly. It prioritizes new and previously successful proxies. To avoid overwhelming unreliable proxies, it supplements the validation queue with failed proxies that have not been tested more than a configured number of times within a specific time window (e.g., 5 times in 30 minutes).  
 3. **Score**: Proxies are managed in memory for each source, with an ELO-inspired 0-100 score built from three additive components over a sliding window of recent results:
-   * **Success rate (0-60)** - the weighted success rate, shrunk toward 0.5 by a Beta prior (`elo_prior_successes` / `elo_prior_failures`). This is what keeps one lucky success from outranking a proven proxy: with the defaults, 1 success scores about 59 and 48-of-50 successes about 90, while an untried proxy sits at the neutral 50.
+   * **Success rate (0-60)** - the weighted success rate, shrunk toward 0.5 by a Beta prior (`elo_prior_successes` / `elo_prior_failures`). This is what keeps one lucky success from outranking a proven proxy: with the defaults and successes at 15000ms, 1 success scores about 52 and 48-of-50 successes about 79, while an untried proxy sits at the live measured pool's median score (falling back to 50 when nothing is measured).
    * **Latency (0-30)** - a linear ramp between `latency_full_score_ms` and `latency_zero_score_ms`, then **multiplied by the smoothed success rate**. Latency is only ever measured on successful requests, so on its own it says nothing about how often a proxy fails; scaling it means a fast-but-unreliable proxy cannot hold a pool slot. A window with results but zero successes scores 0 here, not a neutral value.
    * **Consistency (0-10)** - a bonus for a stable success rate across the last 10 results.
 
@@ -181,9 +181,8 @@ The service is configured via the config.ini file.
   * validation\_window\_minutes: The time window (in minutes) for the validation attempt limit.  
   * max\_validations\_per\_window: The maximum number of times a failed proxy will be re-tested within the time window.  
 * **\[fetcher\]**:
-  * use\_curl: Which transport downloads proxy lists. Defaults to `true`: a host can route shell and Python traffic differently, and the `curl` subprocess keeps working when Python's own egress is blocked. The validator is unaffected — it dials proxy IPs through aiohttp and is not switchable.
-  * fallback\_enabled: When the preferred transport fails, try the other one before failing the job. Defaults to `true`, so a change in how the host routes traffic does not silently stop proxy supply until someone edits the config.
-  * curl\_retries / curl\_retry\_delay\_s: `--retry` arguments for the curl transport. The subprocess timeout is sized to cover every attempt, since `--max-time` bounds one attempt each.
+  * Proxy-list downloads always use curl; there is no transport switch or fallback. The validator is unaffected — it dials proxy IPs through aiohttp and inspects response headers.
+  * curl\_retries / curl\_retry\_delay\_s: `--retry` arguments for curl. The subprocess timeout is sized to cover every attempt, since `--max-time` bounds one attempt each.
   * backoff\_base\_s / backoff\_max\_s / backoff\_transient\_max\_s: Backoff after a failed fetch doubles per consecutive failure from `backoff_base_s`, capped by what kind of failure it was. A reset connection or a timeout is transient and stops at `backoff_transient_max_s` (300s); an HTTP 404 or a malformed URL is the source itself saying no and waits `backoff_max_s` (1800s). Without the split, an intermittently reset connection compounds into a near-total supply outage — a 35% fetch failure rate put every source into a 16-32 minute backoff.
 * **\[scheduler\]**: Intervals for background tasks like fetching, validation, and flushing stats.  
 * **\[sources\]**:  

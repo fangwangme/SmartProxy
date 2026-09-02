@@ -108,6 +108,10 @@ class ProxyManager:
         # self.lock only guards the snapshot, so two concurrent backups could
         # interleave and let an older snapshot land last.
         self.backup_lock = threading.Lock()
+        # Periodic and shutdown flushes can overlap. Keep per-proxy absolute
+        # totals ordered so an older snapshot cannot land after a newer one and
+        # make durable reputation move backwards.
+        self.feedback_persist_lock = threading.Lock()
 
         self.feedback_buffer = defaultdict(
             lambda: defaultdict(lambda: defaultdict(int))
@@ -308,13 +312,10 @@ class ProxyManager:
         )
 
         # Fetcher configuration.
-        # curl is the default transport: a host may route shell and Python
-        # traffic differently, and the fetch targets are plain public URLs, so
-        # the subprocess path is the one that keeps working when Python's own
-        # egress is broken. Either transport can serve as the other's fallback.
-        self.fetcher_use_curl = self.config.getboolean(
-            "fetcher", "use_curl", fallback=True
-        )
+        # Proxy-list downloads always use curl. This host routes curl and Python
+        # traffic differently, and Python's direct egress to the source URLs is
+        # the path that failed. The validator remains aiohttp-based because it
+        # connects through the proxies and inspects response headers.
         self.fetch_connect_timeout_s = self.config.getint(
             "fetcher", "connect_timeout_s", fallback=30
         )
@@ -326,12 +327,6 @@ class ProxyManager:
         )
         self.fetch_curl_retry_delay_s = max(
             0, self.config.getint("fetcher", "curl_retry_delay_s", fallback=1)
-        )
-        # When the configured transport fails, try the other one before giving
-        # up. Without it a change in how the host routes traffic silently stops
-        # proxy supply until somebody edits the config.
-        self.fetch_fallback_enabled = self.config.getboolean(
-            "fetcher", "fallback_enabled", fallback=True
         )
         self.fetch_backoff_base_s = max(
             1, self.config.getint("fetcher", "backoff_base_s", fallback=30)
@@ -644,8 +639,7 @@ class ProxyManager:
     def _fetch_and_parse_source(self, job: Dict) -> List:
         """
         DEADLOCK FIX: This method now returns a list of proxies instead of writing to the DB.
-        The transport (curl or aiohttp, whichever the config prefers, with the
-        other as fallback) is chosen inside _fetch_source_text.
+        Proxy-list downloads always use curl via _fetch_source_text.
         """
         url = job["url"]
         logger.info(f"Fetching proxy source: {job['name']} from {url}")
@@ -782,59 +776,26 @@ class ProxyManager:
         return (protocol, ip, port)
 
     def _fetch_source_text(self, url: str) -> str:
-        """
-        Fetch one proxy list, with the two transports backing each other up.
-
-        curl and aiohttp are not interchangeable on every host: traffic can be
-        routed per process, so one of them may reach a public URL while the
-        other is reset. Whichever transport the config prefers is tried first
-        and the other one covers it, which keeps supply alive across a routing
-        change without a config edit. Both raise FetchError, so the backoff
-        above can tell a blip from a source that is genuinely gone.
-        """
-        if self.fetcher_use_curl:
-            primary, fallback = self._fetch_source_text_curl, self._fetch_source_text_aiohttp
-            primary_name, fallback_name = "curl", "aiohttp"
-        else:
-            primary, fallback = self._fetch_source_text_aiohttp, self._fetch_source_text_curl
-            primary_name, fallback_name = "aiohttp", "curl"
-
-        try:
-            return primary(url)
-        except FetchError as primary_error:
-            if not self.fetch_fallback_enabled:
-                raise
-            logger.warning(
-                "Fetch of {} via {} failed ({}); retrying via {}.",
-                url,
-                primary_name,
-                primary_error,
-                fallback_name,
-            )
-            try:
-                return fallback(url)
-            except FetchError as fallback_error:
-                # Transient if either path thinks so: one path may be reset
-                # while the other reports the same 404, and the cheaper wait is
-                # the safer default when the two disagree.
-                raise FetchError(
-                    f"{primary_name}: {primary_error}; "
-                    f"{fallback_name}: {fallback_error}",
-                    transient=primary_error.transient or fallback_error.transient,
-                ) from fallback_error
+        """Fetch one proxy list through curl."""
+        return self._fetch_source_text_curl(url)
 
     def _fetch_source_text_curl(self, url: str) -> str:
         command = [
             "curl",
-            "-s",
+            "-sS",
             "-f",
-            # Follow redirects, so this transport and aiohttp (which follows by
-            # default) resolve the same URL to the same body.
+            # Follow redirects because several public proxy-list URLs move to a
+            # canonical download endpoint.
             "-L",
             "--connect-timeout",
             str(self.fetch_connect_timeout_s),
             "--max-time",
             str(self.fetch_total_timeout_s),
+            # curl's exit code 22 collapses every HTTP 4xx/5xx response. Append
+            # the final response code so 404 can receive the persistent cap
+            # while 429/503 receive the transient cap.
+            "--write-out",
+            "\n%{http_code}",
         ]
         if self.fetch_curl_retries > 0:
             command += [
@@ -867,9 +828,22 @@ class ProxyManager:
                 f"curl timed out after {process_timeout}s", transient=True
             ) from e
         except FileNotFoundError as e:
-            # No curl binary on this host. Waiting will not install one, so this
-            # is persistent - the fallback transport is the way out, not a retry.
+            # No curl binary on this host. Waiting will not install it, so this
+            # is persistent and requires operator action.
             raise FetchError("curl executable not found", transient=False) from e
+
+        body, separator, status_text = result.stdout.rpartition("\n")
+        http_status = (
+            int(status_text)
+            if separator and len(status_text) == 3 and status_text.isdigit()
+            else None
+        )
+
+        if http_status is not None and http_status >= 400:
+            raise FetchError(
+                f"HTTP {http_status} from {url}",
+                transient=http_status in TRANSIENT_HTTP_STATUS_CODES,
+            )
 
         if result.returncode != 0:
             raise FetchError(
@@ -877,30 +851,9 @@ class ProxyManager:
                 f"{result.stderr.strip()}",
                 transient=result.returncode in TRANSIENT_CURL_EXIT_CODES,
             )
-        return result.stdout
-
-    def _fetch_source_text_aiohttp(self, url: str) -> str:
-        try:
-            return asyncio.run(self._fetch_source_text_async(url))
-        except aiohttp.ClientResponseError as e:
-            raise FetchError(
-                f"HTTP {e.status} from {url}",
-                transient=e.status in TRANSIENT_HTTP_STATUS_CODES,
-            ) from e
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
-            raise FetchError(
-                f"{type(e).__name__}: {e}", transient=True
-            ) from e
-
-    async def _fetch_source_text_async(self, url: str) -> str:
-        timeout = aiohttp.ClientTimeout(
-            total=self.fetch_total_timeout_s,
-            connect=self.fetch_connect_timeout_s,
-        )
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url) as response:
-                response.raise_for_status()
-                return await response.text()
+        if http_status is None:
+            raise FetchError("curl did not report an HTTP status", transient=True)
+        return body
 
     def _handle_fetch_results(self, futures: List):
         """
@@ -1397,6 +1350,11 @@ class ProxyManager:
         absolute, so the next feedback for that proxy re-queues it and carries
         the missed total along with it.
         """
+        with self.feedback_persist_lock:
+            self._persist_feedback_history_locked()
+
+    def _persist_feedback_history_locked(self):
+        """Persist one ordered snapshot; caller holds feedback_persist_lock."""
         with self.lock:
             pending = self.pending_feedback_persist
             self.pending_feedback_persist = set()
