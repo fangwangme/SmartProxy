@@ -13,8 +13,17 @@ import {
 import { useTheme } from './hooks/useTheme'
 import type { Interval, TimeWindow } from './types/api'
 import { todayLocal } from './utils/dateUtils'
+import { serverNowMinutes } from './utils/serverClock'
 
 const REFRESH_INTERVAL_MS = 30_000
+
+/** Exhaustive over `TimeWindow` so a new entry fails to compile until added. */
+const WINDOW_MINUTES: Record<TimeWindow, number> = {
+  '1h': 60,
+  '2h': 120,
+  '5h': 300,
+  '24h': 1440,
+}
 
 const App = () => {
   const { preference, theme, setPreference } = useTheme()
@@ -151,17 +160,13 @@ const App = () => {
       return allRows
     }
 
-    const windowMinutes =
-      timeWindow === '1h'
-        ? 60
-        : timeWindow === '2h'
-          ? 120
-          : timeWindow === '5h'
-            ? 300
-            : 1440
+    const windowMinutes = WINDOW_MINUTES[timeWindow]
 
-    const now = new Date()
-    const currentMinutes = now.getHours() * 60 + now.getMinutes()
+    // Row `time` values are server-local; filtering against the browser's
+    // clock would misalign the window whenever the two differ. `allRows` is
+    // non-empty here only after a response has arrived, which is what learns
+    // the server clock in the first place, so it is always known by now.
+    const currentMinutes = serverNowMinutes() ?? 0
     const startMinutes = Math.max(0, currentMinutes - windowMinutes)
 
     return allRows.filter((row) => {

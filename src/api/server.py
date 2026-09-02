@@ -42,7 +42,16 @@ def _get_client_ip(proxy_manager: ProxyManager) -> str:
 def create_app(proxy_manager: ProxyManager):
     app = Flask(__name__, static_folder=str(PROJECT_ROOT / ".local" / "dist"))
     CORS(app)
-    
+
+    @app.after_request
+    def add_server_time_header(response):
+        # Same local clock as the `time` field in timeseries/overview rows
+        # (see get_timeseries_stats_route), so the dashboard can filter
+        # "now"-relative windows against the server's clock instead of the
+        # viewer's.
+        response.headers["X-Server-Time"] = datetime.now().strftime("%H:%M")
+        return response
+
     @app.before_request
     def restrict_api_access():
         """

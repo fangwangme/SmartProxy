@@ -43,7 +43,7 @@ const computeTicks = (rows: ChartRow[]): string[] => {
     stepMinutes = rowInterval === 15 ? 15 : 10
   } else if (duration <= 150) {
     // ~2h window: tick every 15m or 30m
-    stepMinutes = rowInterval >= 30 ? 60 : (rowInterval === 15 ? 30 : 15)
+    stepMinutes = rowInterval >= 30 ? 30 : (rowInterval === 15 ? 30 : 15)
   } else if (duration <= 360) {
     // ~5h window: tick every 30m or 60m
     stepMinutes = rowInterval >= 60 ? 60 : 30

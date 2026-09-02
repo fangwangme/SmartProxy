@@ -4,6 +4,7 @@ import type {
   OverviewResponse,
   TimeseriesPoint,
 } from '../types/api'
+import { recordServerTime } from '../utils/serverClock'
 
 const API_BASE_URL = '/api'
 
@@ -17,6 +18,9 @@ const getJson = async <T>(
   const url = query ? `${API_BASE_URL}${path}?${query}` : `${API_BASE_URL}${path}`
 
   const response = await fetch(url, { signal })
+  // Same-origin, so custom response headers are always readable; use this to
+  // learn the server's clock (see utils/serverClock).
+  recordServerTime(response.headers.get('X-Server-Time'))
   if (!response.ok) {
     // HTTP/2 and HTTP/3 dropped the status reason phrase, so `statusText` is
     // routinely empty — joining unconditionally would leave a trailing space.
