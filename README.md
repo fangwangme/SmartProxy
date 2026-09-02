@@ -18,7 +18,7 @@ SmartProxy is a sophisticated proxy management system designed to provide reliab
 1. **Fetch**: The service periodically fetches proxy lists from various sources defined in config.ini.  
 2. **Validate**: A validation cycle runs regularly. It prioritizes new and previously successful proxies. To avoid overwhelming unreliable proxies, it supplements the validation queue with failed proxies that have not been tested more than a configured number of times within a specific time window (e.g., 5 times in 30 minutes).  
 3. **Score**: Proxies are managed in memory for each source, with an ELO-inspired 0-100 score built from three additive components over a sliding window of recent results:
-   * **Success rate (0-60)** - the weighted success rate, shrunk toward 0.5 by a Beta prior (`elo_prior_successes` / `elo_prior_failures`). This is what keeps one lucky success from outranking a proven proxy: with the defaults, 1 success scores about 59 and 48-of-50 successes about 90, while an untried proxy sits at the neutral 50.
+   * **Success rate (0-60)** - the weighted success rate, shrunk toward 0.5 by a Beta prior (`elo_prior_successes` / `elo_prior_failures`). This is what keeps one lucky success from outranking a proven proxy: with the defaults and successes at 15000ms, 1 success scores about 52 and 48-of-50 successes about 79, while an untried proxy sits at the live measured pool's median score (falling back to 50 when nothing is measured).
    * **Latency (0-30)** - a linear ramp between `latency_full_score_ms` and `latency_zero_score_ms`, then **multiplied by the smoothed success rate**. Latency is only ever measured on successful requests, so on its own it says nothing about how often a proxy fails; scaling it means a fast-but-unreliable proxy cannot hold a pool slot. A window with results but zero successes scores 0 here, not a neutral value.
    * **Consistency (0-10)** - a bonus for a stable success rate across the last 10 results.
 
@@ -80,13 +80,20 @@ SmartProxy is a sophisticated proxy management system designed to provide reliab
      ```bash
      psql -U your_user -d your_db -f config/database_setup.sql
      ```
-   * **Existing database:** apply the non-destructive index migration. It uses
-     `CREATE INDEX CONCURRENTLY`, so run the file directly with `psql`, outside
+   * **Existing database:** apply the non-destructive migrations in
+     `config/migrations/`, oldest first. The index one uses
+     `CREATE INDEX CONCURRENTLY`, so run the files directly with `psql`, outside
      any explicit transaction block.
      ```bash
      psql -U your_user -d your_db \
        -f config/migrations/20260830_add_source_stats_source_minute_index.sql
+     psql -U your_user -d your_db \
+       -f config/migrations/20260902_add_proxy_feedback_history.sql
      ```
+     The second one adds the durable feedback counters that keep a proxy's
+     record from being wiped when it is evicted from the in-memory stats pool
+     and later revalidates. Without it the service logs a failed query every
+     pool sync and falls back to seeding new stats at the untried baseline.
 
 4.  **Configure the service:**  
    * Rename or copy `config/config.example.ini` to `config/config.ini`.  
@@ -174,7 +181,9 @@ The service is configured via the config.ini file.
   * validation\_window\_minutes: The time window (in minutes) for the validation attempt limit.  
   * max\_validations\_per\_window: The maximum number of times a failed proxy will be re-tested within the time window.  
 * **\[fetcher\]**:
-  * use\_curl: Defaults to `false`. Enable only for local environments that intentionally route `curl` differently from Python.
+  * Proxy-list downloads always use curl; there is no transport switch or fallback. The validator is unaffected — it dials proxy IPs through aiohttp and inspects response headers.
+  * curl\_retries / curl\_retry\_delay\_s: `--retry` arguments for curl. The subprocess timeout is sized to cover every attempt, since `--max-time` bounds one attempt each.
+  * backoff\_base\_s / backoff\_max\_s / backoff\_transient\_max\_s: Backoff after a failed fetch doubles per consecutive failure from `backoff_base_s`, capped by what kind of failure it was. A reset connection or a timeout is transient and stops at `backoff_transient_max_s` (300s); an HTTP 404 or a malformed URL is the source itself saying no and waits `backoff_max_s` (1800s). Without the split, an intermittently reset connection compounds into a near-total supply outage — a 35% fetch failure rate put every source into a 16-32 minute backoff.
 * **\[scheduler\]**: Intervals for background tasks like fetching, validation, and flushing stats.  
 * **\[sources\]**:  
   * predefined\_sources: A comma-separated list of logical names for your proxy pools (e.g., google\_search, web\_scraping).  
@@ -184,9 +193,12 @@ The service is configured via the config.ini file.
   * proxy\_cooldown\_ms: Minimum delay before the same proxy is handed out again for the same source.
   * exploration\_ratio: Share of requests spent on proxies without unexpired feedback. Never-handed candidates are preferred; after all candidates have been tried, the least-recently-handed-out one is explored next. Set to `0` to disable.
   * elo\_prior\_successes / elo\_prior\_failures: Beta prior that shrinks small samples toward the neutral score.
+  * latency\_full\_score\_ms / latency\_zero\_score\_ms: The latency band the 30-point latency component is scaled over. These must bracket the latencies the proxies really have (free proxies here run 8-33s); set below the population, every proxy scores 0 and the component silently stops ranking anything. Re-check them if the proxy population changes.
   * rescore\_on\_sync\_enabled: Recompute every score during pool sync so time decay applies to idle proxies.
   * ELO window/decay settings and latency thresholds (`elo_max_window`, `elo_scoring_window`, `elo_decay_half_life_hours`, `elo_max_result_age_hours`, `latency_full_score_ms`, `latency_zero_score_ms`, `max_feedback_latency_ms`).
   * elo\_max\_result\_age\_hours: How long one bad result costs a proxy its traffic. Past this age the result stops counting entirely and the proxy returns to the neutral baseline, so this is the real knob for failure recovery. Defaults to 48.
+  * The untried baseline is **not** a constant: a proxy with no usable feedback scores the median score of the live proxies that do have some, recomputed each pool sync (falling back to 50.0 when nothing is measured yet). A fixed baseline inverts the whole ranking as soon as the population's real scores stop straddling it. See `docs/specs/proxy-quality-scoring.md` §2.
+  * Feedback counters are also persisted to `proxies.feedback_success_count` / `feedback_failure_count` / `feedback_last_ts`, so a proxy evicted from the stats pool and later revalidated comes back with its record instead of a clean sheet. Existing databases need `config/migrations/20260902_add_proxy_feedback_history.sql`.
   * max\_pool\_size x stats\_pool\_max\_multiplier: The cap on retained **dead** proxy history - not on total memory. Proxies that passed the latest validation are never evicted, because evicting one would reset its failure history to zero on the next sync, so the stats pool grows with the number of genuinely active proxies. If the live set alone reaches the cap, all dead history is dropped and a warning is logged.
 * **\[proxy\_source\_\*\]**: Define your proxy sources here. Each source should have its own section (e.g., \[proxy\_source\_freeproxies\]).  
   * url: The URL to fetch the proxy list from.  

@@ -48,20 +48,80 @@ dead proxies (a validation problem) or the ranking is wrong (a feedback
 problem). Fused, every incident becomes an argument about weights.
 
 **Corollary**: ranking defects must be fixed inside the feedback/exploration
-system. When thousands of proxies tie at the neutral 50.0 and the top pool ends
-up decided by dict insertion order, the fix is an explicit exploration budget
+system. When thousands of untried proxies tie at the baseline and the top pool
+ends up decided by dict insertion order, the fix is an explicit exploration budget
 (`exploration_ratio`), which buys real feedback for untried proxies — not a
 tiebreak on validation latency, which would smuggle the probe signal into the
 ranking through the back door.
 
 ---
 
-## 2. Scoring is optimistic, but one observation is not a coronation
+## 2. The untried baseline is the pool's median, not a constant
 
-A new proxy that succeeds a few times is *supposed* to score above the untried
+A proxy with no usable evidence scores the **median score of the live proxies
+that do have evidence**, recomputed once per pool sync. Every "nothing to score
+on" path returns it: never observed, observed then aged out, and historical
+counters with no usable timestamp. One baseline, one place to reason about it.
+
+### Why not a constant
+
+A fixed 50.0 is only meaningful while the pool's real scores straddle 50. They
+do not have to. When the population's honest success rate is low - and for free
+proxies it is - every score that reflects evidence sits below 50, and the
+ranking inverts wholesale: a proxy that has *never been measured* outranks every
+proxy that has, because 50 beats all of them. The pool then fills with proxies
+whose only qualification is that nothing is known about them, which is the
+opposite of what the score is for.
+
+This was observed, not hypothesised. The `insolvencydirect` pool reached a state
+where its 4000 stats entries topped out at 42.63, no proxy scored 50 or more,
+and all 100 top-tier slots were held by unmeasured proxies while 44 proxies with
+a proven record (>=20 observations, >=40% window success rate) sat outside the
+pool entirely. End-to-end success followed the ranking down from 48% to 11.6%.
+
+Pinning the baseline to the middle of the measured distribution makes "unknown"
+mean *mid-pack* whatever the absolute numbers are: half the proven proxies rank
+above an unknown one, half below, and the ordering survives any recalibration of
+the components.
+
+### Which proxies vote
+
+Only proxies that are **live** and **measured**.
+
+- Unmeasured ones are excluded because their score *is* the baseline. Including
+  them makes the median a fixed point of itself - when most of the pool is
+  unmeasured, "the median of everyone" is just whatever the baseline already
+  was, and any value is self-consistent.
+- Dead ones are excluded because they cannot be handed out, so they say nothing
+  about what a fresh candidate is competing against.
+
+This is why `_sync_and_select_top_proxies` rescores in two passes: measured
+proxies first (their scores do not depend on the baseline), then the baseline is
+read off them, then the unmeasured ones are scored against it.
+
+With nothing measured - an empty pool, a fresh restart, a source whose every
+live proxy is still untried - there is no distribution to take a median of, and
+the baseline falls back to the `DEFAULT_NEUTRAL_SCORE` constant of 50.0.
+
+### What this changes about §3 below
+
+The head start a lucky new proxy gets is now *relative*. A single success scores
+~52; whether that is above the baseline depends on the pool. In a pool whose
+median is 60, one success does not vault a proxy to the front - and it should
+not. The guarantee that untried proxies keep collecting evidence is
+`exploration_ratio`, exactly as §1's corollary says; it was never the starting
+score's job.
+
+---
+
+## 3. Scoring is optimistic, but one observation is not a coronation
+
+A new proxy that succeeds a few times is *supposed* to gain on the untried
 baseline. That head start is an **exploration budget**, not a bug: without it a
 newly discovered proxy has no way to accumulate the traffic it needs to prove
-itself, and the pool ossifies around whatever was in it at startup.
+itself, and the pool ossifies around whatever was in it at startup. Since §2 the
+head start is relative — it lifts a proxy through the measured distribution, not
+past a fixed number.
 
 What is a bug is the *magnitude*. Before this was constrained, the raw success
 ratio let one lucky observation reach a perfect 1.0, so a single success scored
@@ -77,26 +137,41 @@ The observed success rate is shrunk toward the 0.5 baseline by a Beta prior
 smoothed_rate = (successes_weight + a) / (total_weight + a + b)
 ```
 
-Calibration targets, at the defaults, with fresh results and 200ms latency:
+Calibration targets, at the defaults, with fresh results and successes at
+15000ms - the middle of the band these proxies actually run at:
 
 | Evidence | Score | Requirement |
 | --- | --- | --- |
-| no observations | 50.0 | the neutral baseline |
-| 1 success | ~59 | **above** the baseline, in the 50-75 band |
-| 48 of 50 successes | ~90 | **well above** any small sample |
+| no observations | the pool median | see §2 |
+| 1 success | ~52 | **above** a proxy with a failing record |
+| 48 of 50 successes | ~79 | **well above** any small sample |
 | 1 failure | ~29 | punished, but recoverable |
 | 50 of 50 failures | ~2 | effectively out |
-| 35% success rate | ~32 | **below** the untried baseline |
+| 35% success rate | ~29 | below a 50%-success proxy (~44) |
 
-The rule that ties these together: a small sample must land strictly between the
-untried baseline and a proven proxy. Never below (that removes the incentive to
-try anything new), never above (that hands the pool to noise).
+The rule that ties these together: a small sample must land strictly between a
+proven proxy and a proven-bad one. Never at the bottom (that removes the
+incentive to try anything new), never at the top (that hands the pool to noise).
+
+### The latency component has to be calibrated on the real population
+
+`latency_full_score_ms` / `latency_zero_score_ms` are not preferences, they are
+a statement about where this population's latencies fall. Anything at or past
+the zero point scores 0, so thresholds set below the population put *every*
+proxy at 0 and silently delete the whole 30-point component - the ranking then
+runs on success rate and consistency alone and nobody notices, because no error
+is raised and the scores still look like scores.
+
+The shipped 5000/30000 covers the observed free-proxy `avg_latency_ms` range of
+8-33 seconds. The 300/2000 they started at is a datacenter figure; against this
+population it scored a constant 0. **When the proxy population changes, re-check
+these two numbers against the real latency distribution.**
 
 ### Recovery from a single failure
 
 The mirror image of "one success must not crown" is "one failure must not
 exile". A single fresh failure scores ~29, climbs slowly as the result decays,
-and returns to the 50 baseline once the result passes
+and returns to the untried baseline once the result passes
 `elo_max_result_age_hours`.
 
 That threshold is therefore the real knob for how long one bad result costs a
@@ -115,8 +190,8 @@ by accident:
   and a single failure then decays asymptotically toward 50 without ever
   arriving — 40.3 at 49 hours with the shipped half-life. So the scorer
   distinguishes *never observed* (fall back to the counters; a stat restored
-  from an old backup has nothing else) from *observed, then aged out* (return
-  the 50 baseline outright).
+  from an old backup or from the proxies table has nothing else) from
+  *observed, then aged out* (return the baseline outright).
 - **Expiry and exploration eligibility use one definition.** The exploration
   budget is the only way back for a proxy scoring below the baseline, so if it
   asks "does this proxy have a result?" while the scorer asks "does it have a
@@ -134,18 +209,24 @@ proxy below the 90-point target above — i.e. it requires re-tuning the
 component weights, not just adding a blend. Deliberately not done.
 
 The measured curve for one failure at the shipped defaults: 29.0 fresh, 31.7 at
-24h, 33.2 at 47h, 50.0 from 48h on.
+24h, 33.2 at 47h, and the untried baseline from 48h on.
 
 ### What this forbids
 
 Making new proxies start low, or start at zero, or serve a probationary sentence
 before they can be selected. If one-hit wonders crowd the pool, raise the prior
 (`elo_prior_successes` / `elo_prior_failures`) so small samples shrink harder
-toward 0.5 — do not move the starting point.
+toward 0.5 — do not push the starting point down.
+
+The median baseline of §2 is not an exception to this. Mid-pack is not low: it
+is the definition of "we do not know yet", and it moves with the pool instead of
+having to be re-tuned every time the components are. What is forbidden is a
+starting point *below* the measured distribution, or one a proxy has to serve
+time to escape.
 
 ---
 
-## 3. Ranking staleness of one validation cycle is accepted
+## 4. Ranking staleness of one validation cycle is accepted
 
 Scores are recomputed for the whole pool during `_sync_and_select_top_proxies`,
 which runs once per validation cycle (`validation_interval_seconds`, 120s by
@@ -161,7 +242,7 @@ sync it runs inside, and one cycle of ranking lag is not worth avoiding it.
 
 ---
 
-## 4. Quality is expressed as score, never as a deletion rule
+## 5. Quality is expressed as score, never as a deletion rule
 
 There is no "N consecutive failures and it's gone" rule. `consecutive_failures`
 is a **diagnostic field only** and must not gate selection.
@@ -172,20 +253,37 @@ hard-deletion threshold would add a second, non-recoverable path with its own
 edge cases — and would interact badly with the decoupling in §1, because a
 transient run of client-side failures is not evidence that a proxy is dead.
 
-Reputation must also survive pool maintenance. **Eviction from the stats pool is
-reputation loss**, because the record does not survive it: `_sync_and_select_top_proxies`
-re-seeds any active proxy missing from the pool with `_get_new_proxy_stat()`, so
-an evicted-but-still-active proxy returns one cycle later as a pristine
-`score=50 / failure_count=0` candidate.
+Reputation must also survive pool maintenance. **Eviction from the stats pool
+used to be reputation loss**, because the record did not survive it:
+`_sync_and_select_top_proxies` re-seeds any active proxy missing from the pool
+with `_get_new_proxy_stat()`, so an evicted proxy returned one cycle later as a
+pristine `failure_count=0` candidate.
+
+Two things address that, and both are needed.
+
+**The counters are durable.** `proxies.feedback_success_count` /
+`feedback_failure_count` / `feedback_last_ts` hold a copy of the in-memory
+counters, written back for proxies whose feedback moved since the last flush.
+When the sync re-seeds a proxy it seeds those counters too, so the proxy comes
+back with the record it earned rather than a clean sheet, and time decay - not
+eviction - is what eventually forgives it. Absolute totals are written, not
+increments, so a write lost to a transient DB error is corrected by the next
+one instead of leaving the stored total permanently short.
+
+This is not a substitute for the eviction rule below. The stored record has no
+sliding window, so a restored proxy scores off the historical counters, which
+decay toward the baseline with age; a proxy evicted while still live would still
+lose its recent-window evidence. The durable counters close the *revival* path,
+which the cap alone could not.
 
 That makes the eviction *order* the wrong thing to tune. Any order that can
 evict a live proxy launders a bad record on a two-sync delay — which is the same
 defect as evicting by score outright, just slower to observe. So:
 
 **Live proxies do not participate in the cap.** It applies to dead history
-alone, oldest feedback first. Dead history is the part that is safe to drop: a
-dead proxy that comes back has to pass validation again anyway, and until it
-does it cannot be handed out.
+alone, oldest feedback first. Dead history is the safest part to drop: a dead
+proxy that comes back has to pass validation again anyway, until it does it
+cannot be handed out, and its counters survive in the proxies table.
 
 The consequence is that `max_pool_size × stats_pool_max_multiplier` bounds
 retained *dead* history, not total memory — the live half tracks however many
@@ -196,7 +294,7 @@ trading away reputation.
 
 ---
 
-## 5. New tunables go to config
+## 6. New tunables go to config
 
 Every threshold introduced here is a config key in `[source_pool]` or
 `[validator]` with a fallback default, and appears in `config/config.example.ini`.

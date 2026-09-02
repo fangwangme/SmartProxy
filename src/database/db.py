@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import sys
 import configparser
+from datetime import datetime, timezone
 import psycopg2
 import psycopg2.pool
 import psycopg2.extras
@@ -265,6 +266,100 @@ class DatabaseManager:
         if rows is None:
             return None
         return {f"{row['protocol']}://{row['ip']}:{row['port']}" for row in rows}
+
+    def get_active_feedback_history(self) -> Optional[Dict[str, Dict]]:
+        """
+        Persisted feedback counters for every live proxy that has any.
+
+        This is what makes eviction from the in-memory stats pool survivable.
+        The pool caps retained history, so a proxy that failed its way out and
+        later passes validation again is re-seeded from scratch; without a
+        durable record that re-seed hands it a clean sheet it never earned.
+
+        Returns None if the query failed, so the caller can tell "no history"
+        from "we do not know", and seed conservatively rather than wrongly.
+        """
+        query = """
+            SELECT protocol, ip, port,
+                   feedback_success_count,
+                   feedback_failure_count,
+                   EXTRACT(EPOCH FROM feedback_last_ts) AS feedback_last_ts
+            FROM proxies
+            WHERE is_active = true
+              AND (feedback_success_count > 0 OR feedback_failure_count > 0);
+        """
+        rows = self._execute(query, fetch="all")
+        if rows is None:
+            return None
+        history = {}
+        for row in rows:
+            url = f"{row['protocol']}://{row['ip']}:{row['port']}"
+            last_ts = row["feedback_last_ts"]
+            history[url] = {
+                "success_count": int(row["feedback_success_count"] or 0),
+                "failure_count": int(row["feedback_failure_count"] or 0),
+                "last_feedback_ts": float(last_ts) if last_ts is not None else None,
+            }
+        return history
+
+    def upsert_proxy_feedback_history(self, rows: List[Tuple]):
+        """
+        Write absolute feedback totals for a batch of proxies.
+
+        Absolute rather than incremental on purpose: the counters live in
+        memory and are written back periodically, so a write that is lost to a
+        transient DB error is corrected by the next one instead of leaving the
+        stored total permanently short.
+
+        Each row is (protocol, ip, port, success_count, failure_count,
+        last_feedback_ts) where the timestamp is Unix seconds or None.
+        """
+        if not rows:
+            return
+        query = """
+            UPDATE proxies SET
+                feedback_success_count = data.success_count,
+                feedback_failure_count = data.failure_count,
+                feedback_last_ts = data.last_ts
+            FROM (VALUES %s) AS data(protocol, ip, port, success_count, failure_count, last_ts)
+            WHERE proxies.protocol = data.protocol
+              AND proxies.ip = data.ip
+              AND proxies.port = data.port;
+        """
+        values = []
+        for protocol, ip, port, success_count, failure_count, last_ts in rows:
+            timestamp = (
+                datetime.fromtimestamp(last_ts, tz=timezone.utc)
+                if last_ts is not None
+                else None
+            )
+            values.append(
+                (protocol, ip, int(port), int(success_count), int(failure_count), timestamp)
+            )
+
+        conn = None
+        try:
+            conn = self.pool.getconn()
+            with conn.cursor() as cur:
+                psycopg2.extras.execute_values(
+                    cur,
+                    query,
+                    values,
+                    # Explicit casts: a VALUES list sends these as "unknown",
+                    # and PostgreSQL has no conversion from unknown to
+                    # timestamptz when it is only ever assigned, never compared.
+                    template="(%s::varchar, %s::varchar, %s::int, %s::int, %s::int, %s::timestamptz)",
+                    page_size=1000,
+                )
+                conn.commit()
+            logger.debug(f"Persisted feedback history for {len(values)} proxies.")
+        except psycopg2.Error as e:
+            logger.error(f"Failed to persist proxy feedback history: {e}")
+            if conn:
+                conn.rollback()
+        finally:
+            if conn:
+                self.pool.putconn(conn)
 
     def flush_feedback_stats(self, stats_buffer: List[Tuple]):
         if not stats_buffer:
