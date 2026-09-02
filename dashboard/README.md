@@ -34,7 +34,7 @@ the production server serving nothing.
 | `GET /api/stats/timeseries?source&date&interval` | `{ time, success_rate, total_requests, success_count }[]` |
 | `GET /api/stats/overview?date&interval` | `{ sources: { source, daily, timeseries }[] }` |
 
-`interval` is hard-validated server-side to `2 | 5 | 10 | 30 | 60`; the union
+`interval` is hard-validated server-side to `1 | 2 | 5 | 15 | 60`; the union
 type in `src/types/api.ts` mirrors that.
 
 **`success_rate` is `null` for a slot with no traffic.** The backend

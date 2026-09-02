@@ -12,11 +12,67 @@ import {
 import { GRUVBOX, seriesColor, type ResolvedTheme } from '../theme/gruvbox'
 import type { ChartRow } from '../types/api'
 
-/** 00:00, 02:00 … 22:00 — Recharts drops any that would collide. */
-const TICKS = Array.from(
-  { length: 12 },
-  (_, index) => `${String(index * 2).padStart(2, '0')}:00`,
-)
+/**
+ * Dynamically computes XAxis tick labels matching data points based on the
+ * visible time range.
+ */
+const computeTicks = (rows: ChartRow[]): string[] => {
+  if (rows.length === 0) return []
+  const firstTime = rows[0]?.time
+  const lastTime = rows[rows.length - 1]?.time
+  if (!firstTime || !lastTime) return []
+
+  const [h1, m1] = firstTime.split(':').map(Number)
+  const [h2, m2] = lastTime.split(':').map(Number)
+  const firstMin = (h1 ?? 0) * 60 + (m1 ?? 0)
+  const lastMin = (h2 ?? 0) * 60 + (m2 ?? 0)
+  const duration = lastMin - firstMin
+
+  let rowInterval = 60
+  if (rows.length > 1) {
+    const [hNext, mNext] = (rows[1]?.time ?? '').split(':').map(Number)
+    const nextMin = (hNext ?? 0) * 60 + (mNext ?? 0)
+    if (nextMin > firstMin) {
+      rowInterval = nextMin - firstMin
+    }
+  }
+
+  let stepMinutes: number
+  if (duration <= 75) {
+    // ~1h window: tick every 10m (or 15m if interval is 15m)
+    stepMinutes = rowInterval === 15 ? 15 : 10
+  } else if (duration <= 150) {
+    // ~2h window: tick every 15m or 30m
+    stepMinutes = rowInterval >= 30 ? 30 : (rowInterval === 15 ? 30 : 15)
+  } else if (duration <= 360) {
+    // ~5h window: tick every 30m or 60m
+    stepMinutes = rowInterval >= 60 ? 60 : 30
+  } else {
+    // Full day (24h): tick every 2h
+    stepMinutes = 120
+  }
+
+  const ticks: string[] = []
+  for (const row of rows) {
+    const [h, m] = row.time.split(':').map(Number)
+    const totalMin = (h ?? 0) * 60 + (m ?? 0)
+    if (totalMin % stepMinutes === 0) {
+      ticks.push(row.time)
+    }
+  }
+
+  // Fallback: if no rows fell on exact stepMinutes boundaries, take evenly spaced rows
+  if (ticks.length === 0) {
+    const count = Math.min(rows.length, 6)
+    const stride = Math.max(1, Math.floor(rows.length / count))
+    for (let i = 0; i < rows.length; i += stride) {
+      const t = rows[i]?.time
+      if (t) ticks.push(t)
+    }
+  }
+
+  return ticks
+}
 
 const VOLUME_DASH = '5 4'
 
@@ -171,6 +227,8 @@ const Charts = ({
     return map
   }, [chartSources, palette])
 
+  const ticks = useMemo(() => computeTicks(rows), [rows])
+
   const hasData = rows.length > 0 && chartSources.length > 0
 
   const axis = {
@@ -209,7 +267,7 @@ const Charts = ({
               margin={{ top: 4, right: 4, left: -8, bottom: 0 }}
             >
               <CartesianGrid strokeDasharray="3 3" stroke={palette.bg2} />
-              <XAxis dataKey="time" ticks={TICKS} {...axis} />
+              <XAxis dataKey="time" ticks={ticks} {...axis} />
               <YAxis
                 yAxisId="rate"
                 domain={[0, 100]}

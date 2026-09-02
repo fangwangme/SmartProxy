@@ -42,7 +42,16 @@ def _get_client_ip(proxy_manager: ProxyManager) -> str:
 def create_app(proxy_manager: ProxyManager):
     app = Flask(__name__, static_folder=str(PROJECT_ROOT / ".local" / "dist"))
     CORS(app)
-    
+
+    @app.after_request
+    def add_server_time_header(response):
+        # Same local clock as the `time` field in timeseries/overview rows
+        # (see get_timeseries_stats_route), so the dashboard can filter
+        # "now"-relative windows against the server's clock instead of the
+        # viewer's.
+        response.headers["X-Server-Time"] = datetime.now().strftime("%H:%M")
+        return response
+
     @app.before_request
     def restrict_api_access():
         """
@@ -358,13 +367,13 @@ smartproxy_is_validating {1 if proxy_manager.is_validating else 0}
     def get_timeseries_stats_route():
         source = request.args.get("source")
         date_str = request.args.get("date")
-        interval = request.args.get("interval", "10", type=int)
+        interval = request.args.get("interval", "5", type=int)
         if not all([source, date_str]):
             return (
                 jsonify({"error": "'source' and 'date' query parameters are required."}),
                 400,
             )
-        valid_intervals = [2, 5, 10, 30, 60]
+        valid_intervals = [1, 2, 5, 15, 60]
         if interval not in valid_intervals:
             return jsonify({"error": f"'interval' must be one of {valid_intervals}."}), 400
         
@@ -423,11 +432,11 @@ smartproxy_is_validating {1 if proxy_manager.is_validating else 0}
     @app.route("/api/stats/overview", methods=["GET"])
     def get_stats_overview_route():
         date_str = request.args.get("date")
-        interval = request.args.get("interval", "10", type=int)
+        interval = request.args.get("interval", "5", type=int)
         if not date_str:
             return jsonify({"error": "'date' query parameter is required."}), 400
 
-        valid_intervals = [2, 5, 10, 30, 60]
+        valid_intervals = [1, 2, 5, 15, 60]
         if interval not in valid_intervals:
             return jsonify({"error": f"'interval' must be one of {valid_intervals}."}), 400
 
