@@ -1,5 +1,65 @@
 # Changelog
 
+## 3.3.2 — 2026-09-02 — PR #18: Restore proxy supply and recalibrate scoring
+
+This change closes [Issue #17](https://github.com/fangwangme/SmartProxy/issues/17).
+
+### Fetcher and supply
+
+- Proxy list downloads now run via `curl` subprocess with `--retry`, `--retry-delay`, and `--retry-connrefused`.
+- HTTP status codes are extracted from curl via `--write-out "\n%{http_code}"` to classify failures:
+  - Transient failures (connection resets, timeouts, 429/500/502/503/504) back off up to `backoff_transient_max_s` (300s).
+  - Persistent failures (HTTP 404, invalid URL) back off up to `backoff_max_s` (1800s).
+- Calling `POST /reload-sources` or restarting the service immediately resets fetcher backoffs.
+
+### Scoring and calibration
+
+- Recalibrated latency score range (`latency_full_score_ms = 5000`, `latency_zero_score_ms = 30000`) to match real-world free proxy latencies (8–33s), restoring the 30-point latency discriminator.
+- Dynamic median baseline: unmeasured proxies score at the median score of currently measured live proxies rather than a fixed 50.0, resolving rank inversions.
+- Calibration reference table updated in code docstrings, `docs/specs/proxy-quality-scoring.md`, and `README.md`.
+
+### Reputation persistence
+
+- Added `feedback_success_count`, `feedback_failure_count`, and `feedback_last_ts` columns to the `proxies` table to persist historical performance across in-memory stats pool eviction.
+- Periodic and shutdown flushes are serialized via `feedback_persist_lock` to ensure write-back order consistency.
+- Re-seeded proxies recover their historical records and decay toward the baseline over time (`elo_decay_half_life_hours = 24`, `elo_max_result_age_hours = 48`).
+
+### Upgrade and Migration Guide
+
+Existing deployments upgrading to 3.4.0 should perform the following steps:
+
+1. **Database Migration**:
+   Apply the non-destructive migration script to add feedback history columns:
+   ```bash
+   psql -U your_user -d your_db -f config/migrations/20260902_add_proxy_feedback_history.sql
+   ```
+
+2. **Configuration Updates**:
+   Update `config/config.ini` to align with the new latency calibration thresholds:
+   ```ini
+   [source_pool]
+   latency_full_score_ms = 5000
+   latency_zero_score_ms = 30000
+   ```
+   Ensure the `[fetcher]` section contains the retry and backoff tunables if customized:
+   ```ini
+   [fetcher]
+   connect_timeout_s = 30
+   total_timeout_s = 60
+   curl_retries = 2
+   curl_retry_delay_s = 1
+   backoff_base_s = 30
+   backoff_max_s = 1800
+   backoff_transient_max_s = 300
+   ```
+
+3. **Service Restart / Reload**:
+   Restart the service or call `POST /reload-sources` to apply configuration and reset fetcher backoffs:
+   ```bash
+   curl -X POST http://127.0.0.1:8000/reload-sources
+   ```
+   Historical stats do not need to be cleared; in-memory scores will automatically rescore during the first pool sync.
+
 ## 3.3.1 — 2026-08-31 — PR #16: Dashboard rebuild and stats null semantics
 
 This change closes [Issue #15](https://github.com/fangwangme/SmartProxy/issues/15).

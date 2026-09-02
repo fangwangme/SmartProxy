@@ -437,7 +437,7 @@ wheels = [
 
 [[package]]
 name = "smartproxy"
-version = "3.3.1"
+version = "3.3.2"
 source = { virtual = "." }
 dependencies = [
     { name = "aiohttp" },

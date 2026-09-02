@@ -75,25 +75,11 @@ SmartProxy is a sophisticated proxy management system designed to provide reliab
 3.  **Set up the database:**  
    * Ensure your PostgreSQL server is running.  
    * Create a database and a user.  
-   * **New database only:** execute `config/database_setup.sql`. It recreates
-     the tables and therefore must not be used as an upgrade script.
+   * Initialize the database schema:
      ```bash
      psql -U your_user -d your_db -f config/database_setup.sql
      ```
-   * **Existing database:** apply the non-destructive migrations in
-     `config/migrations/`, oldest first. The index one uses
-     `CREATE INDEX CONCURRENTLY`, so run the files directly with `psql`, outside
-     any explicit transaction block.
-     ```bash
-     psql -U your_user -d your_db \
-       -f config/migrations/20260830_add_source_stats_source_minute_index.sql
-     psql -U your_user -d your_db \
-       -f config/migrations/20260902_add_proxy_feedback_history.sql
-     ```
-     The second one adds the durable feedback counters that keep a proxy's
-     record from being wiped when it is evicted from the in-memory stats pool
-     and later revalidates. Without it the service logs a failed query every
-     pool sync and falls back to seeding new stats at the untried baseline.
+   *(For upgrading an existing database, see the Migration Guide in `CHANGELOG.md`)*
 
 4.  **Configure the service:**  
    * Rename or copy `config/config.example.ini` to `config/config.ini`.  
@@ -198,7 +184,7 @@ The service is configured via the config.ini file.
   * ELO window/decay settings and latency thresholds (`elo_max_window`, `elo_scoring_window`, `elo_decay_half_life_hours`, `elo_max_result_age_hours`, `latency_full_score_ms`, `latency_zero_score_ms`, `max_feedback_latency_ms`).
   * elo\_max\_result\_age\_hours: How long one bad result costs a proxy its traffic. Past this age the result stops counting entirely and the proxy returns to the neutral baseline, so this is the real knob for failure recovery. Defaults to 48.
   * The untried baseline is **not** a constant: a proxy with no usable feedback scores the median score of the live proxies that do have some, recomputed each pool sync (falling back to 50.0 when nothing is measured yet). A fixed baseline inverts the whole ranking as soon as the population's real scores stop straddling it. See `docs/specs/proxy-quality-scoring.md` §2.
-  * Feedback counters are also persisted to `proxies.feedback_success_count` / `feedback_failure_count` / `feedback_last_ts`, so a proxy evicted from the stats pool and later revalidated comes back with its record instead of a clean sheet. Existing databases need `config/migrations/20260902_add_proxy_feedback_history.sql`.
+  * Feedback counters are also persisted to `proxies.feedback_success_count` / `feedback_failure_count` / `feedback_last_ts`, so a proxy evicted from the stats pool and later revalidated comes back with its record instead of a clean sheet.
   * max\_pool\_size x stats\_pool\_max\_multiplier: The cap on retained **dead** proxy history - not on total memory. Proxies that passed the latest validation are never evicted, because evicting one would reset its failure history to zero on the next sync, so the stats pool grows with the number of genuinely active proxies. If the live set alone reaches the cap, all dead history is dropped and a warning is logged.
 * **\[proxy\_source\_\*\]**: Define your proxy sources here. Each source should have its own section (e.g., \[proxy\_source\_freeproxies\]).  
   * url: The URL to fetch the proxy list from.  
