@@ -6,6 +6,7 @@ import ipaddress
 import json
 import math
 import random
+import statistics
 import tempfile
 import threading
 import time
@@ -42,6 +43,18 @@ MAX_PORT = 65535
 # constant remains the backward-compatible fallback.
 DEFAULT_MAX_FEEDBACK_LATENCY_MS = 24 * 60 * 60 * 1000
 
+# The untried baseline is dynamic (the median of the live, measured pool), so
+# this constant is only the fallback used before any pool has been scored -
+# at startup, during a restore, or for a source with no measured proxy yet.
+DEFAULT_NEUTRAL_SCORE = 50.0
+
+# curl exit codes that mean "the network path failed right now" rather than
+# "the server answered and said no". Only the latter earns the long backoff.
+TRANSIENT_CURL_EXIT_CODES = frozenset({5, 6, 7, 16, 18, 28, 35, 52, 55, 56, 92})
+
+# HTTP statuses that say "ask again later"; every other >=400 is persistent.
+TRANSIENT_HTTP_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
+
 FAILED_STATUS_CODES = {
     0,
     4,
@@ -55,6 +68,21 @@ VALID_FAILURE_KINDS = {
     "slow",
     "content_error",
 }
+
+class FetchError(RuntimeError):
+    """
+    A proxy-source fetch failure, tagged with how long it is worth waiting.
+
+    `transient` separates "the connection was reset" from "the server returned
+    404": the first is a blip that must not lock a source out for half an hour,
+    the second is a source that will keep saying no. _fetch_and_parse_source
+    picks the backoff cap from this flag.
+    """
+
+    def __init__(self, message: str, transient: bool = True):
+        super().__init__(message)
+        self.transient = transient
+
 
 class ProxyManager:
     """Manages the proxy lifecycle, state, and business logic."""
@@ -87,6 +115,15 @@ class ProxyManager:
 
         self.dashboard_sources: Set[str] = set()
         self.last_source_refresh_time = 0
+
+        # Per-source untried baseline: the median score of the live proxies
+        # that actually have evidence, recomputed each pool sync. Empty until
+        # the first sync, which is why every reader goes through
+        # _baseline_score() and its DEFAULT_NEUTRAL_SCORE fallback.
+        self.baseline_scores: Dict[str, float] = {}
+        # Proxy URLs whose feedback counters have moved since the last time
+        # they were written back to the proxies table.
+        self.pending_feedback_persist: Set[str] = set()
 
         self._load_config()
         self.check_config_drift()
@@ -250,12 +287,16 @@ class ProxyManager:
             1.0,
             max(0.01, self.config.getfloat("source_pool", "avg_latency_alpha", fallback=0.3)),
         )
+        # Calibrated for free proxies, whose observed avg_latency_ms sits in
+        # the 8-33 second range. The datacenter-grade 300/2000 these defaults
+        # started at put every real proxy past the zero point, so the latency
+        # component scored a constant 0 and stopped ranking anything.
         self.latency_full_score_ms = max(
-            1, self.config.getint("source_pool", "latency_full_score_ms", fallback=300)
+            1, self.config.getint("source_pool", "latency_full_score_ms", fallback=5000)
         )
         self.latency_zero_score_ms = max(
             self.latency_full_score_ms + 1,
-            self.config.getint("source_pool", "latency_zero_score_ms", fallback=2000),
+            self.config.getint("source_pool", "latency_zero_score_ms", fallback=30000),
         )
         self.max_feedback_latency_ms = max(
             1,
@@ -267,14 +308,47 @@ class ProxyManager:
         )
 
         # Fetcher configuration.
+        # curl is the default transport: a host may route shell and Python
+        # traffic differently, and the fetch targets are plain public URLs, so
+        # the subprocess path is the one that keeps working when Python's own
+        # egress is broken. Either transport can serve as the other's fallback.
         self.fetcher_use_curl = self.config.getboolean(
-            "fetcher", "use_curl", fallback=False
+            "fetcher", "use_curl", fallback=True
         )
         self.fetch_connect_timeout_s = self.config.getint(
             "fetcher", "connect_timeout_s", fallback=30
         )
         self.fetch_total_timeout_s = self.config.getint(
             "fetcher", "total_timeout_s", fallback=60
+        )
+        self.fetch_curl_retries = max(
+            0, self.config.getint("fetcher", "curl_retries", fallback=2)
+        )
+        self.fetch_curl_retry_delay_s = max(
+            0, self.config.getint("fetcher", "curl_retry_delay_s", fallback=1)
+        )
+        # When the configured transport fails, try the other one before giving
+        # up. Without it a change in how the host routes traffic silently stops
+        # proxy supply until somebody edits the config.
+        self.fetch_fallback_enabled = self.config.getboolean(
+            "fetcher", "fallback_enabled", fallback=True
+        )
+        self.fetch_backoff_base_s = max(
+            1, self.config.getint("fetcher", "backoff_base_s", fallback=30)
+        )
+        # Two caps, because the two failure classes deserve different patience.
+        self.fetch_backoff_max_s = max(
+            self.fetch_backoff_base_s,
+            self.config.getint("fetcher", "backoff_max_s", fallback=1800),
+        )
+        self.fetch_backoff_transient_max_s = max(
+            self.fetch_backoff_base_s,
+            min(
+                self.fetch_backoff_max_s,
+                self.config.getint(
+                    "fetcher", "backoff_transient_max_s", fallback=300
+                ),
+            ),
         )
 
         # Backup configuration
@@ -570,8 +644,8 @@ class ProxyManager:
     def _fetch_and_parse_source(self, job: Dict) -> List:
         """
         DEADLOCK FIX: This method now returns a list of proxies instead of writing to the DB.
-        Uses aiohttp by default; curl remains available for local environments that
-        route Python and shell traffic differently.
+        The transport (curl or aiohttp, whichever the config prefers, with the
+        other as fallback) is chosen inside _fetch_source_text.
         """
         url = job["url"]
         logger.info(f"Fetching proxy source: {job['name']} from {url}")
@@ -599,17 +673,50 @@ class ProxyManager:
             logger.error(f"Failed to fetch from {job['name']} ({url}): {e}")
             failures = job.get("failure_count", 0) + 1
             job["failure_count"] = failures
-            backoff_seconds = min(3600, 60 * (2 ** min(failures - 1, 5)))
+            backoff_seconds = self._fetch_backoff_seconds(e, failures)
             job["last_run"] = time.time() + backoff_seconds - job["interval_minutes"] * 60
             logger.warning(
-                "Fetcher job '{}' backed off for {}s after {} consecutive failure(s).",
+                "Fetcher job '{}' backed off for {}s after {} consecutive "
+                "{} failure(s).",
                 job["name"],
                 backoff_seconds,
                 failures,
+                "transient" if self._is_transient_fetch_error(e) else "persistent",
             )
         else:
             job["failure_count"] = 0
         return proxies_to_insert
+
+    @staticmethod
+    def _is_transient_fetch_error(error: Exception) -> bool:
+        """
+        Whether a fetch failure is worth retrying soon.
+
+        Anything the fetch layer did not classify counts as transient: the
+        failure this backoff exists to contain is a connectivity blip being
+        amplified into a half-hour outage, so an unknown error waits the short
+        cap rather than the long one.
+        """
+        return bool(getattr(error, "transient", True))
+
+    def _fetch_backoff_seconds(self, error: Exception, failures: int) -> int:
+        """
+        Exponential backoff, capped by the failure class.
+
+        A connection reset is a blip: with the shipped defaults it tops out at
+        backoff_transient_max_s, so a source cannot be locked out for the rest
+        of the hour by a network that is only intermittently broken. A 404 is
+        the source itself saying no, and gets the longer backoff_max_s.
+        """
+        cap = (
+            self.fetch_backoff_transient_max_s
+            if self._is_transient_fetch_error(error)
+            else self.fetch_backoff_max_s
+        )
+        # The exponent is bounded before the shift so a long-broken source
+        # cannot build a 2**n that costs anything to compute.
+        growth = self.fetch_backoff_base_s * (2 ** min(max(failures - 1, 0), 16))
+        return int(min(cap, growth))
 
     @staticmethod
     def _parse_proxy_line(
@@ -675,29 +782,115 @@ class ProxyManager:
         return (protocol, ip, port)
 
     def _fetch_source_text(self, url: str) -> str:
+        """
+        Fetch one proxy list, with the two transports backing each other up.
+
+        curl and aiohttp are not interchangeable on every host: traffic can be
+        routed per process, so one of them may reach a public URL while the
+        other is reset. Whichever transport the config prefers is tried first
+        and the other one covers it, which keeps supply alive across a routing
+        change without a config edit. Both raise FetchError, so the backoff
+        above can tell a blip from a source that is genuinely gone.
+        """
         if self.fetcher_use_curl:
+            primary, fallback = self._fetch_source_text_curl, self._fetch_source_text_aiohttp
+            primary_name, fallback_name = "curl", "aiohttp"
+        else:
+            primary, fallback = self._fetch_source_text_aiohttp, self._fetch_source_text_curl
+            primary_name, fallback_name = "aiohttp", "curl"
+
+        try:
+            return primary(url)
+        except FetchError as primary_error:
+            if not self.fetch_fallback_enabled:
+                raise
+            logger.warning(
+                "Fetch of {} via {} failed ({}); retrying via {}.",
+                url,
+                primary_name,
+                primary_error,
+                fallback_name,
+            )
+            try:
+                return fallback(url)
+            except FetchError as fallback_error:
+                # Transient if either path thinks so: one path may be reset
+                # while the other reports the same 404, and the cheaper wait is
+                # the safer default when the two disagree.
+                raise FetchError(
+                    f"{primary_name}: {primary_error}; "
+                    f"{fallback_name}: {fallback_error}",
+                    transient=primary_error.transient or fallback_error.transient,
+                ) from fallback_error
+
+    def _fetch_source_text_curl(self, url: str) -> str:
+        command = [
+            "curl",
+            "-s",
+            "-f",
+            # Follow redirects, so this transport and aiohttp (which follows by
+            # default) resolve the same URL to the same body.
+            "-L",
+            "--connect-timeout",
+            str(self.fetch_connect_timeout_s),
+            "--max-time",
+            str(self.fetch_total_timeout_s),
+        ]
+        if self.fetch_curl_retries > 0:
+            command += [
+                "--retry",
+                str(self.fetch_curl_retries),
+                "--retry-delay",
+                str(self.fetch_curl_retry_delay_s),
+                # curl does not retry a refused connection unless asked, and a
+                # refused connection is exactly the blip worth one more try.
+                "--retry-connrefused",
+            ]
+        command.append(url)
+
+        # --max-time bounds one attempt, so the process budget has to cover
+        # every retry plus its delay, or the subprocess timeout fires first and
+        # the retries never happen.
+        attempts = self.fetch_curl_retries + 1
+        process_timeout = (
+            attempts * (self.fetch_total_timeout_s + self.fetch_curl_retry_delay_s) + 5
+        )
+        try:
             result = subprocess.run(
-                [
-                    "curl",
-                    "-s",
-                    "-f",
-                    "--connect-timeout",
-                    str(self.fetch_connect_timeout_s),
-                    "--max-time",
-                    str(self.fetch_total_timeout_s),
-                    url,
-                ],
+                command,
                 capture_output=True,
                 text=True,
-                timeout=self.fetch_total_timeout_s + 5,
+                timeout=process_timeout,
             )
-            if result.returncode != 0:
-                raise RuntimeError(
-                    f"curl failed with return code {result.returncode}: {result.stderr}"
-                )
-            return result.stdout
+        except subprocess.TimeoutExpired as e:
+            raise FetchError(
+                f"curl timed out after {process_timeout}s", transient=True
+            ) from e
+        except FileNotFoundError as e:
+            # No curl binary on this host. Waiting will not install one, so this
+            # is persistent - the fallback transport is the way out, not a retry.
+            raise FetchError("curl executable not found", transient=False) from e
 
-        return asyncio.run(self._fetch_source_text_async(url))
+        if result.returncode != 0:
+            raise FetchError(
+                f"curl failed with return code {result.returncode}: "
+                f"{result.stderr.strip()}",
+                transient=result.returncode in TRANSIENT_CURL_EXIT_CODES,
+            )
+        return result.stdout
+
+    def _fetch_source_text_aiohttp(self, url: str) -> str:
+        try:
+            return asyncio.run(self._fetch_source_text_async(url))
+        except aiohttp.ClientResponseError as e:
+            raise FetchError(
+                f"HTTP {e.status} from {url}",
+                transient=e.status in TRANSIENT_HTTP_STATUS_CODES,
+            ) from e
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+            raise FetchError(
+                f"{type(e).__name__}: {e}", transient=True
+            ) from e
 
     async def _fetch_source_text_async(self, url: str) -> str:
         timeout = aiohttp.ClientTimeout(
@@ -1068,6 +1261,13 @@ class ProxyManager:
             )
             return
 
+        # A proxy the stats pool has never seen - or has evicted since - is
+        # about to be seeded. Bring its persisted feedback history back with it,
+        # or eviction plus one validation pass would launder the record into a
+        # pristine baseline score. Queried outside the lock; the query is
+        # skipped entirely when nothing needs seeding.
+        feedback_history = self._load_feedback_history_for(newly_active_proxies)
+
         with self.lock:
             self.active_proxies = newly_active_proxies
             for source in self.predefined_sources:
@@ -1075,14 +1275,35 @@ class ProxyManager:
 
                 for proxy_url in self.active_proxies:
                     if proxy_url not in stats_pool:
-                        stats_pool[proxy_url] = self._get_new_proxy_stat()
+                        stats_pool[proxy_url] = self._get_new_proxy_stat(
+                            source, feedback_history.get(proxy_url)
+                        )
 
                 # Recompute every score before ranking. Scores are otherwise only
                 # refreshed inside _apply_feedback_to_stat, which freezes idle
                 # proxies: time decay never applies, and a proxy knocked out of
                 # the pool by one failure can never earn its way back.
+                #
+                # Two passes, because the untried baseline is the median of the
+                # measured proxies' scores. Measured proxies score without
+                # reference to the baseline, so they go first; the baseline is
+                # then read off them and the unmeasured ones scored against it.
+                # One pass would make the baseline a fixed point of itself -
+                # when most of the pool is unmeasured, the median of "everyone"
+                # is just whatever the baseline already was.
+                measured, unmeasured = [], []
+                for proxy_url, stat in stats_pool.items():
+                    bucket = measured if self._unexpired_results(stat) else unmeasured
+                    bucket.append((proxy_url, stat))
+
                 if self.rescore_on_sync_enabled:
-                    for proxy_url, stat in stats_pool.items():
+                    for _, stat in measured:
+                        stat["score"] = self._calculate_elo_score(stat, source)
+
+                self.baseline_scores[source] = self._compute_baseline_score(measured)
+
+                if self.rescore_on_sync_enabled:
+                    for _, stat in unmeasured:
                         stat["score"] = self._calculate_elo_score(stat, source)
 
                 stats_pool = self._truncate_stats_pool(source, stats_pool)
@@ -1112,11 +1333,169 @@ class ProxyManager:
                     f"Source '{source}' synced. "
                     f"Stats pool: {len(sorted_proxies)} proxies, "
                     f"of which {len(usable_proxies)} are alive and usable. "
+                    f"Untried baseline: {self.baseline_scores[source]:.1f} "
+                    f"(median of {len(measured)} measured). "
                     f"Top Tier: {len(top_tier)} proxies. "
                     f"Bottom Tier: {len(bottom_tier)} proxies."
                 )
 
             self._sync_premium_proxies_locked()
+
+    @staticmethod
+    def _split_proxy_url(proxy_url: str) -> Optional[Tuple[str, str, int]]:
+        """Split a stored proxy URL back into its (protocol, ip, port) key."""
+        if not isinstance(proxy_url, str) or "://" not in proxy_url:
+            return None
+        protocol, rest = proxy_url.split("://", 1)
+        if ":" not in rest:
+            return None
+        # rsplit, so a bracketed IPv6 literal keeps its colons and only the
+        # port is taken off the end.
+        ip, port_str = rest.rsplit(":", 1)
+        try:
+            port = int(port_str)
+        except ValueError:
+            return None
+        if not protocol or not ip:
+            return None
+        return protocol, ip, port
+
+    def _load_feedback_history_for(self, active_proxies: Set[str]) -> Dict[str, Dict]:
+        """
+        Persisted feedback records for proxies this sync is about to seed.
+
+        Skipped entirely when every live proxy is already in every pool, which
+        is the steady state - the query only runs on the cycles where a proxy
+        is actually joining or rejoining a pool.
+        """
+        with self.lock:
+            needs_seeding = any(
+                proxy_url not in self.source_stats.get(source, {})
+                for source in self.predefined_sources
+                for proxy_url in active_proxies
+            )
+        if not needs_seeding:
+            return {}
+
+        history = self.db.get_active_feedback_history()
+        if not isinstance(history, dict):
+            logger.warning(
+                "Feedback history unavailable this cycle; new stats are seeded "
+                "at the untried baseline instead of their persisted record."
+            )
+            return {}
+        return history
+
+    def _persist_feedback_history(self):
+        """
+        Write the in-memory feedback counters of recently updated proxies back
+        to the proxies table.
+
+        Only proxies whose counters have actually moved are written, so this
+        stays proportional to feedback volume rather than to pool size. The
+        pending set is cleared even if the write fails: the counters are
+        absolute, so the next feedback for that proxy re-queues it and carries
+        the missed total along with it.
+        """
+        with self.lock:
+            pending = self.pending_feedback_persist
+            self.pending_feedback_persist = set()
+
+            rows = []
+            for proxy_url in pending:
+                key = self._split_proxy_url(proxy_url)
+                if key is None:
+                    continue
+                # A proxy can be tracked under several sources with different
+                # counters. Persist the record of the source that has observed
+                # it most: that is the fullest history available, and the
+                # re-seed it feeds is per-source anyway.
+                best_stat, best_total = None, -1
+                for stats in self.source_stats.values():
+                    stat = stats.get(proxy_url)
+                    if not isinstance(stat, dict):
+                        continue
+                    total = int(stat.get("success_count", 0) or 0) + int(
+                        stat.get("failure_count", 0) or 0
+                    )
+                    if total > best_total:
+                        best_stat, best_total = stat, total
+                if best_stat is None:
+                    continue
+                protocol, ip, port = key
+                rows.append(
+                    (
+                        protocol,
+                        ip,
+                        port,
+                        int(best_stat.get("success_count", 0) or 0),
+                        int(best_stat.get("failure_count", 0) or 0),
+                        self._coerce_timestamp(
+                            best_stat.get("last_feedback_ts"), time.time()
+                        ),
+                    )
+                )
+
+        if not rows:
+            return
+        self.db.upsert_proxy_feedback_history(rows)
+
+    def _flush_stats(self):
+        """Periodic persistence: minute aggregates plus per-proxy reputation."""
+        self._flush_feedback_buffer()
+        self._persist_feedback_history()
+
+    def _compute_baseline_score(self, measured: List[Tuple[str, Dict]]) -> float:
+        """
+        The untried baseline: the median score of the live, measured proxies.
+
+        A fixed 50.0 baseline is only meaningful while the pool's real scores
+        straddle 50. Once they do not - as happens whenever the population's
+        honest success rate is low - every proxy that has ever been measured
+        sorts below every proxy that has not, and the ranking inverts: the pool
+        fills with proxies whose only qualification is that nothing is known
+        about them. Pinning the baseline to the middle of the measured
+        distribution keeps "unknown" where it belongs, mid-pack, whatever the
+        absolute numbers happen to be.
+
+        Only measured *and* live proxies vote. Unmeasured ones are excluded
+        because their score *is* this baseline, and dead ones because they
+        cannot be handed out, so they say nothing about what a fresh candidate
+        is competing against.
+        """
+        scores = sorted(
+            float(stat.get("score", DEFAULT_NEUTRAL_SCORE))
+            for proxy_url, stat in measured
+            if proxy_url in self.active_proxies
+        )
+        if not scores:
+            # Nothing measured yet: an empty pool, a fresh restart, or a source
+            # whose every live proxy is still untried. There is no distribution
+            # to take a median of, so fall back to the neutral constant.
+            return DEFAULT_NEUTRAL_SCORE
+        return float(statistics.median(scores))
+
+    def _baseline_score(self, source: Optional[str] = None) -> float:
+        """
+        The baseline a stat should score at when it has no usable evidence.
+
+        Every "no evidence" path in the scorer routes through here, so there is
+        exactly one untried baseline in the system rather than a dynamic one in
+        some branches and a hardcoded 50.0 in the others.
+        """
+        # self.lock is an RLock and every writer holds it, so this is safe to
+        # take from inside an already-locked scoring loop. Without it, a restore
+        # migrating stats could iterate the dict while a sync inserts into it.
+        with self.lock:
+            if source is not None:
+                baseline = self.baseline_scores.get(source)
+                if baseline is not None:
+                    return baseline
+            if not self.baseline_scores:
+                return DEFAULT_NEUTRAL_SCORE
+            # No source given (or an unknown one): the middle of the per-source
+            # baselines is the closest thing to a pool-wide answer.
+            return float(statistics.median(list(self.baseline_scores.values())))
 
     @staticmethod
     def _coerce_latency(
@@ -1342,7 +1721,7 @@ class ProxyManager:
                 if now - last_flush_time >= self.stats_flush_interval_s:
                     last_flush_time = now
                     threading.Thread(
-                        target=self._flush_feedback_buffer, daemon=True
+                        target=self._flush_stats, daemon=True
                     ).start()
                 if (
                     now - self.last_source_refresh_time
@@ -1374,7 +1753,7 @@ class ProxyManager:
 
     def stop_scheduler(self):
         logger.info("Stopping scheduler and flushing final stats...")
-        self._flush_feedback_buffer()
+        self._flush_stats()
         if self.stats_backup_enabled:
             self.backup_stats()  # Backup before shutdown
         if self.scheduler_thread and self.scheduler_thread.is_alive():
@@ -1383,16 +1762,24 @@ class ProxyManager:
             self.scheduler_thread.join(timeout=10)
             logger.info("Background scheduler stopped.")
 
-    def _get_new_proxy_stat(self) -> Dict:
+    def _get_new_proxy_stat(
+        self, source: Optional[str] = None, history: Optional[Dict] = None
+    ) -> Dict:
         """
         Create a new proxy stat entry with ELO-inspired scoring fields.
-        
-        Score range: 0-100 (starts at 50 as neutral)
+
+        Score range: 0-100, starting at the untried baseline for `source`.
         - recent_results: sliding window of (timestamp, success, latency_ms)
         - avg_latency_ms: exponential moving average of latency
+
+        `history` is the proxy's persisted feedback record, when the proxies
+        table has one. Seeding those counters is what stops eviction from the
+        stats pool being an amnesty: a proxy that failed its way out and later
+        passed validation again comes back with its record, not with the
+        untried baseline it never earned.
         """
-        return {
-            "score": 50.0,              # ELO-like score, bounded 0-100
+        stat = {
+            "score": self._baseline_score(source),
             "success_count": 0,         # Total historical success
             "failure_count": 0,         # Total historical failure
             "consecutive_failures": 0,  # Diagnostic only; selection is score-based
@@ -1401,6 +1788,25 @@ class ProxyManager:
             "avg_latency_ms": None,     # Exponential moving average of latency
             "last_feedback_ts": None,   # Unix timestamp of latest feedback
         }
+        if not history:
+            return stat
+
+        def nonnegative_int(value) -> int:
+            # `type(value) is int`, not isinstance: bool subclasses int, and a
+            # JSON `true` in a restored record must not read as a count of 1.
+            return value if type(value) is int and value >= 0 else 0
+
+        stat["success_count"] = nonnegative_int(history.get("success_count"))
+        stat["failure_count"] = nonnegative_int(history.get("failure_count"))
+        stat["last_feedback_ts"] = self._coerce_timestamp(
+            history.get("last_feedback_ts"), time.time()
+        )
+        if stat["success_count"] or stat["failure_count"]:
+            # The window is empty, so this lands in the historical-counters
+            # branch of the scorer: the restored record decays back toward the
+            # baseline with age rather than being applied at full force forever.
+            stat["score"] = self._calculate_elo_score(stat, source)
+        return stat
 
     def backup_stats(self) -> Dict:
         """Backup source_stats to a JSON file."""
@@ -1719,9 +2125,10 @@ class ProxyManager:
 
     def _select_weighted_by_score(self, source: str, candidates: List[str], softmax: bool = False) -> str:
         stats = self.source_stats.get(source, {})
+        default_score = self._baseline_score(source)
         weights = []
         for proxy_url in candidates:
-            score = float(stats.get(proxy_url, {}).get("score", 50.0))
+            score = float(stats.get(proxy_url, {}).get("score", default_score))
             if softmax:
                 weights.append(math.exp((score - 50.0) / self.softmax_temperature))
             else:
@@ -1907,19 +2314,22 @@ class ProxyManager:
             last_feedback_ts = max(result[0] for result in normalized_results)
         stat["last_feedback_ts"] = last_feedback_ts
 
+        baseline = self._baseline_score()
         if not had_recent_results:
             total = success_count + failure_count
             if total > 0:
                 stat["score"] = min(100.0, max(0.0, success_count / total * 100))
             else:
-                stat["score"] = 50.0
+                stat["score"] = baseline
         else:
             raw_score = stat.get("score")
             try:
                 score = float(raw_score)
             except (OverflowError, TypeError, ValueError):
-                score = 50.0
-            stat["score"] = min(100.0, max(0.0, score)) if math.isfinite(score) else 50.0
+                score = baseline
+            stat["score"] = (
+                min(100.0, max(0.0, score)) if math.isfinite(score) else baseline
+            )
 
         return stat
 
@@ -1937,16 +2347,26 @@ class ProxyManager:
         - Latency:        0-30 points, multiplied by the smoothed success rate
         - Consistency:    0-10 points (bonus for stability)
 
-        Calibration (defaults, fresh results, 200ms latency):
-        - no observations:   50.0    (neutral baseline)
-        - 1 success:         ~59     (optimistic, but not a coronation)
-        - 1 failure:         ~29     (punished, but recoverable)
-        - 48/50 successes:   ~90-93  (depending on where the failures land)
+        Calibration (defaults, fresh results, successes at 15000ms - the middle
+        of the latency band these proxies actually occupy):
+        - no observations:   baseline  (the live pool's median measured score)
+        - 1 success:         ~52       (optimistic, but not a coronation)
+        - 1 failure:         ~29       (punished, but recoverable)
+        - 50% success rate:  ~44
+        - 48/50 successes:   ~79
         - 50/50 failures:    ~2
-        - 35% success rate:  ~32     (below the untried baseline)
+        - 35% success rate:  ~29
+
+        These are absolute numbers; whether each one is above or below the
+        untried baseline depends on the pool, which is the point. The old table
+        was written at 200ms, a latency no proxy in this population has, and
+        every row of it was wrong by 15-25 points in practice.
         """
         window_size = self.elo_scoring_window
         now_ts = time.time()
+        # Every "nothing usable to score on" path returns this, so there is one
+        # untried baseline rather than a dynamic one here and a 50.0 there.
+        baseline = self._baseline_score(source)
 
         raw_results = stat.get("recent_results", [])
         raw_recent = raw_results[-window_size:] if isinstance(raw_results, list) else []
@@ -1957,10 +2377,11 @@ class ProxyManager:
             # failure_count counters below are NOT a fallback here: they never
             # expire, so reading them would re-apply the very result that
             # elo_max_result_age_hours just forgave and leave a single failure
-            # decaying asymptotically toward 50 without ever arriving. The
+            # decaying asymptotically toward the baseline without ever
+            # arriving. The
             # recovery contract in docs/specs/proxy-quality-scoring.md is that
             # the proxy returns to the untried baseline, so return it.
-            return 50.0
+            return baseline
 
         if not recent:
             # Never had a windowed result: fall back to the historical counters
@@ -1979,13 +2400,15 @@ class ProxyManager:
                         age_seconds = max(0.0, now_ts - last_feedback_ts)
                         half_life_seconds = self.elo_decay_half_life_hours * 3600
                         decay_factor = math.pow(0.5, age_seconds / half_life_seconds)
-                        # Pull old historical scores back to neutral over time.
-                        return 50 + (historical_score - 50) * decay_factor
+                        # Pull old historical scores back to the baseline over
+                        # time: as the evidence ages the proxy converges on what
+                        # an unknown proxy is worth, not on a fixed 50.
+                        return baseline + (historical_score - baseline) * decay_factor
                     # Timestamp unknown: treat historical counters as stale.
-                    return 50.0
+                    return baseline
 
                 return historical_score  # Range 10-90 for historical
-            return 50.0  # Neutral for completely new proxies
+            return baseline  # Untried: worth exactly what an unknown is worth
 
         if self.elo_time_decay_enabled:
             half_life_seconds = self.elo_decay_half_life_hours * 3600
@@ -2188,7 +2611,10 @@ class ProxyManager:
         if len(stat["recent_results"]) > self.elo_max_window:
             stat["recent_results"] = stat["recent_results"][-self.elo_max_window:]
         stat["last_feedback_ts"] = current_timestamp
-        
+        # Queue the updated counters for write-back, so this proxy's record
+        # outlives its entry in the in-memory pool.
+        self.pending_feedback_persist.add(proxy_url)
+
         # Recalculate ELO score
         old_score = stat["score"]
         stat["score"] = self._calculate_elo_score(stat, source)

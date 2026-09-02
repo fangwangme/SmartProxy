@@ -3,6 +3,7 @@ import asyncio
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import time
 import unittest
@@ -12,7 +13,7 @@ import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch, AsyncMock
 
-from src.core.proxy_manager import ProxyManager, FAILED_STATUS_CODES
+from src.core.proxy_manager import ProxyManager, FetchError, FAILED_STATUS_CODES
 from src.database.db import DatabaseManager
 
 
@@ -100,6 +101,9 @@ class ProxyManagerTestBase(unittest.TestCase):
 
         self.manager = ProxyManager(self.config_path)
         self.mock_db_instance = self.MockDatabaseManager.return_value
+        # Default to "no persisted history"; tests about reputation
+        # persistence override this with real rows.
+        self.mock_db_instance.get_active_feedback_history.return_value = {}
 
     def make_manager(self, overrides: dict, name: str = "override.ini") -> ProxyManager:
         """Build a second manager from a real ini file with merged overrides."""
@@ -502,22 +506,28 @@ class TestProxyManager(ProxyManagerTestBase):
         self.assertLessEqual(score, 85)
 
     def test_elo_score_latency_impact(self):
-        """Test that lower latency results in higher score."""
+        """
+        Lower latency scores higher, at latencies these proxies really have.
+
+        The two samples sit inside the observed free-proxy band (8-33s). The
+        200ms/1500ms pair this used to compare is below latency_full_score_ms
+        now, where both ends score full marks and the component says nothing -
+        which is the mirror image of the bug being fixed, where the calibration
+        was so tight that every real proxy scored zero.
+        """
         import time
-        
-        # Low latency proxy (200ms)
+
         stat_low = self.manager._get_new_proxy_stat()
         for i in range(50):
-            stat_low["recent_results"].append([time.time() - i, True, 200])
-        
-        # High latency proxy (1500ms)
+            stat_low["recent_results"].append([time.time() - i, True, 8000])
+
         stat_high = self.manager._get_new_proxy_stat()
         for i in range(50):
-            stat_high["recent_results"].append([time.time() - i, True, 1500])
-        
+            stat_high["recent_results"].append([time.time() - i, True, 25000])
+
         score_low = self.manager._calculate_elo_score(stat_low)
         score_high = self.manager._calculate_elo_score(stat_high)
-        
+
         # Low latency should score higher
         self.assertGreater(score_low, score_high)
         # Difference should be meaningful (about 10-20 points)
@@ -2264,6 +2274,529 @@ class TestFeedbackLatencyBoundary(unittest.TestCase):
     def test_ordinary_latency_still_accepted(self):
         self.mock_proxy_manager.is_valid_feedback_status.return_value = True
         self.assertEqual(self._post(250).status_code, 200)
+
+
+class TestIssue17FetcherSupply(ProxyManagerTestBase):
+    """
+    Issue #17 A+B: proxy supply died because the only fetch transport was the
+    one this host routes to a broken egress, and the backoff turned a 35%
+    failure rate into a near-total outage.
+    """
+
+    def _curl_result(self, stdout, returncode=0, stderr=""):
+        return subprocess.CompletedProcess(
+            args=["curl"], returncode=returncode, stdout=stdout, stderr=stderr
+        )
+
+    def test_curl_is_the_default_transport(self):
+        """A config that says nothing about use_curl must still use curl."""
+        merged = {
+            section: dict(options) for section, options in self.config_dict.items()
+        }
+        merged.pop("fetcher", None)
+        manager = ProxyManager(write_config_file(self.tmp_dir, merged, "nofetcher.ini"))
+
+        self.assertTrue(manager.fetcher_use_curl)
+
+    def test_fetch_source_text_uses_curl_and_parses_the_output(self):
+        manager = self.make_manager({"fetcher": {"use_curl": "true"}}, "curl.ini")
+        body = "1.2.3.4:8080\nsocks5://5.6.7.8:1080\nnot-a-proxy\n"
+
+        with patch(
+            "src.core.proxy_manager.subprocess.run",
+            return_value=self._curl_result(body),
+        ) as mock_run:
+            parsed = manager._fetch_and_parse_source(
+                {
+                    "name": "proxy_source_A",
+                    "url": "http://source-a.com/list.txt",
+                    "interval_minutes": 10,
+                    "default_protocol": "http",
+                }
+            )
+
+        command = mock_run.call_args.args[0]
+        self.assertEqual(command[0], "curl")
+        self.assertEqual(command[-1], "http://source-a.com/list.txt")
+        # Retry is the point: a single reset connection must not cost the whole
+        # fetch cycle.
+        self.assertIn("--retry", command)
+        self.assertEqual(
+            command[command.index("--retry") + 1], str(manager.fetch_curl_retries)
+        )
+        self.assertEqual(
+            parsed, [("http", "1.2.3.4", 8080), ("socks5", "5.6.7.8", 1080)]
+        )
+
+    def test_curl_process_timeout_covers_every_retry(self):
+        """
+        --max-time bounds one attempt. If the subprocess timeout only allowed
+        one attempt's worth of seconds it would fire first and the retries
+        configured above would never actually happen.
+        """
+        manager = self.make_manager(
+            {
+                "fetcher": {
+                    "use_curl": "true",
+                    "total_timeout_s": "60",
+                    "curl_retries": "2",
+                    "curl_retry_delay_s": "1",
+                }
+            },
+            "curl_timeout.ini",
+        )
+
+        with patch(
+            "src.core.proxy_manager.subprocess.run",
+            return_value=self._curl_result(""),
+        ) as mock_run:
+            manager._fetch_source_text("http://source-a.com/list.txt")
+
+        self.assertGreaterEqual(mock_run.call_args.kwargs["timeout"], 3 * 60)
+
+    def test_aiohttp_failure_falls_back_to_curl(self):
+        """
+        The transports cover each other, so a change in how the host routes
+        traffic does not stop supply until somebody edits the config.
+        """
+        manager = self.make_manager({"fetcher": {"use_curl": "false"}}, "fallback.ini")
+
+        with patch.object(
+            manager,
+            "_fetch_source_text_aiohttp",
+            side_effect=FetchError("Connection reset by peer", transient=True),
+        ), patch(
+            "src.core.proxy_manager.subprocess.run",
+            return_value=self._curl_result("9.9.9.9:3128\n"),
+        ) as mock_run:
+            text = manager._fetch_source_text("http://source-a.com/list.txt")
+
+        self.assertEqual(text, "9.9.9.9:3128\n")
+        self.assertEqual(mock_run.call_args.args[0][0], "curl")
+
+    def test_curl_failure_falls_back_to_aiohttp(self):
+        manager = self.make_manager({"fetcher": {"use_curl": "true"}}, "fallback2.ini")
+
+        with patch(
+            "src.core.proxy_manager.subprocess.run",
+            return_value=self._curl_result("", returncode=7, stderr="conn refused"),
+        ), patch.object(
+            manager, "_fetch_source_text_aiohttp", return_value="9.9.9.9:3128\n"
+        ) as mock_aiohttp:
+            text = manager._fetch_source_text("http://source-a.com/list.txt")
+
+        self.assertEqual(text, "9.9.9.9:3128\n")
+        mock_aiohttp.assert_called_once()
+
+    def test_fallback_can_be_disabled(self):
+        manager = self.make_manager(
+            {"fetcher": {"use_curl": "true", "fallback_enabled": "false"}},
+            "nofallback.ini",
+        )
+
+        with patch(
+            "src.core.proxy_manager.subprocess.run",
+            return_value=self._curl_result("", returncode=7, stderr="conn refused"),
+        ), patch.object(manager, "_fetch_source_text_aiohttp") as mock_aiohttp:
+            with self.assertRaises(FetchError):
+                manager._fetch_source_text("http://source-a.com/list.txt")
+
+        mock_aiohttp.assert_not_called()
+
+    def test_curl_exit_codes_are_classified(self):
+        manager = self.make_manager({"fetcher": {"use_curl": "true"}}, "classify.ini")
+        cases = {
+            56: True,   # recv failure - the reset that started this issue
+            7: True,    # failed to connect
+            28: True,   # operation timed out
+            22: False,  # -f and the server said 4xx/5xx
+            3: False,   # malformed URL
+        }
+        for returncode, expected_transient in cases.items():
+            with self.subTest(returncode=returncode):
+                with patch(
+                    "src.core.proxy_manager.subprocess.run",
+                    return_value=self._curl_result("", returncode=returncode),
+                ):
+                    with self.assertRaises(FetchError) as ctx:
+                        manager._fetch_source_text_curl("http://source-a.com")
+                self.assertEqual(ctx.exception.transient, expected_transient)
+
+    def test_transient_backoff_never_exceeds_the_transient_cap(self):
+        """
+        The outage this fixes: a source with an intermittently reset connection
+        sat in a 16-32 minute backoff, so a 35% failure rate became no supply
+        at all. A blip must stay inside the short cap no matter how many times
+        it repeats.
+        """
+        transient = FetchError("Connection reset by peer", transient=True)
+        cap = self.manager.fetch_backoff_transient_max_s
+
+        for failures in range(1, 25):
+            with self.subTest(failures=failures):
+                self.assertLessEqual(
+                    self.manager._fetch_backoff_seconds(transient, failures), cap
+                )
+        self.assertLess(cap, 3600)
+        # The old curve: 60 * 2**min(n-1, 5) reached 1920s by the sixth failure.
+        self.assertLess(self.manager._fetch_backoff_seconds(transient, 6), 1920)
+
+    def test_persistent_failure_waits_longer_than_a_blip(self):
+        transient = FetchError("reset", transient=True)
+        persistent = FetchError("HTTP 404", transient=False)
+
+        self.assertGreater(
+            self.manager._fetch_backoff_seconds(persistent, 12),
+            self.manager._fetch_backoff_seconds(transient, 12),
+        )
+        for failures in range(1, 25):
+            with self.subTest(failures=failures):
+                self.assertLessEqual(
+                    self.manager._fetch_backoff_seconds(persistent, failures),
+                    self.manager.fetch_backoff_max_s,
+                )
+
+    def test_repeated_transient_failures_reschedule_within_the_cap(self):
+        """End to end: the backoff the job actually gets, not just the helper."""
+        job = {
+            "name": "proxy_source_A",
+            "url": "http://source-a.com/list.txt",
+            "interval_minutes": 10,
+            "default_protocol": "http",
+            "last_run": 0,
+        }
+        with patch.object(
+            self.manager,
+            "_fetch_source_text",
+            side_effect=FetchError("Connection reset by peer", transient=True),
+        ):
+            for _ in range(10):
+                self.assertEqual(self.manager._fetch_and_parse_source(job), [])
+
+        self.assertEqual(job["failure_count"], 10)
+        applied_backoff = job["last_run"] + job["interval_minutes"] * 60 - time.time()
+        self.assertLessEqual(
+            applied_backoff, self.manager.fetch_backoff_transient_max_s + 1
+        )
+        self.assertGreater(applied_backoff, 0)
+
+    def test_a_success_clears_the_backoff(self):
+        job = {
+            "name": "proxy_source_A",
+            "url": "http://source-a.com/list.txt",
+            "interval_minutes": 10,
+            "default_protocol": "http",
+            "last_run": 0,
+        }
+        with patch.object(
+            self.manager,
+            "_fetch_source_text",
+            side_effect=FetchError("reset", transient=True),
+        ):
+            self.manager._fetch_and_parse_source(job)
+        self.assertEqual(job["failure_count"], 1)
+
+        with patch.object(
+            self.manager, "_fetch_source_text", return_value="1.2.3.4:8080\n"
+        ):
+            self.manager._fetch_and_parse_source(job)
+
+        self.assertEqual(job["failure_count"], 0)
+
+
+class TestIssue17DynamicBaseline(ProxyManagerTestBase):
+    """
+    Issue #17 C: with a hardcoded 50.0 baseline, every proxy that had ever been
+    measured sorted below every proxy that had not, and the pool filled with
+    proxies whose only qualification was that nothing was known about them.
+    """
+
+    def _measured_stat(self, successes, failures, latency_ms=15000):
+        results = [(True, latency_ms)] * successes + [(False, None)] * failures
+        return self.make_stat(results)
+
+    def _population(self, count=9, trials=20, top_rate=0.4):
+        """
+        A live pool shaped like the real one: mostly poor performers, a thin
+        tail of decent ones. The measured population's window success rate runs
+        well under 50% (the service's own end-to-end rate was 11-48%), which is
+        exactly why a fixed 50.0 baseline sorted every measured proxy below
+        every unmeasured one.
+        """
+        pool = {}
+        for i in range(count):
+            successes = round(trials * top_rate * i / (count - 1))
+            pool[f"http://m{i}:80"] = self._measured_stat(
+                successes, trials - successes
+            )
+        return pool
+
+    def _sync_with(self, pool, live=None):
+        self.manager.source_stats["source1"] = pool
+        self.mock_db_instance.get_active_proxies.return_value = set(
+            pool if live is None else live
+        )
+        self.manager._sync_and_select_top_proxies()
+
+    def test_untried_baseline_is_the_median_of_the_measured_live_pool(self):
+        pool = self._population()
+        measured_urls = list(pool)
+        pool["http://untried:80"] = self.manager._get_new_proxy_stat()
+
+        self._sync_with(pool)
+
+        measured_scores = sorted(pool[url]["score"] for url in measured_urls)
+        expected = measured_scores[len(measured_scores) // 2]
+        baseline = self.manager.baseline_scores["source1"]
+        self.assertAlmostEqual(baseline, expected, places=6)
+        self.assertNotAlmostEqual(baseline, 50.0, places=3)
+        self.assertAlmostEqual(
+            pool["http://untried:80"]["score"], expected, places=6
+        )
+
+    def test_a_measured_mid_quality_proxy_outranks_an_untried_one(self):
+        """
+        The inversion this fixes: at a real 15s latency a 50%-success proxy
+        scored 35 while a proxy nobody had ever measured scored 50, so every
+        blank slate outranked every proxy with a record.
+        """
+        pool = self._population()
+        untried = "http://untried:80"
+        pool[untried] = self.manager._get_new_proxy_stat()
+        # The proxy from the issue's table: half its requests succeed, at the
+        # 15s latency these proxies really run at. It used to score 35 against
+        # an untried proxy's 50.
+        mid = "http://mid:80"
+        pool[mid] = self._measured_stat(10, 10, latency_ms=15000)
+
+        self._sync_with(pool)
+
+        self.assertGreater(pool[mid]["score"], self.manager.baseline_scores["source1"])
+        self.assertGreater(pool[mid]["score"], pool[untried]["score"])
+        top_tier = self.manager.available_proxies["source1"]["top_tier"]
+        self.assertLess(top_tier.index(mid), top_tier.index(untried))
+
+    def test_proven_proxies_reach_the_top_tier_ahead_of_blank_slates(self):
+        """
+        The production symptom: 100/100 top-tier slots held by unmeasured
+        proxies while proxies with a proven record sat outside the pool.
+        """
+        self.manager.top_tier_size = 5
+        # Blanks are inserted first, so under the old scoring they won every
+        # tie at 50.0 and took the whole top tier by dict order alone.
+        pool = {f"http://blank{i}:80": self.manager._get_new_proxy_stat()
+                for i in range(50)}
+        pool.update(self._population())
+        # "Proven good" as the issue defines it: >=20 observations at >=40%
+        # window success rate. There were 44 such proxies and none of them was
+        # in the pool, because at a real 15s latency they scored ~35 while every
+        # blank slate scored the hardcoded 50.
+        proven = {f"http://proven{i}:80": self._measured_stat(10, 10)
+                  for i in range(5)}
+        pool.update(proven)
+
+        self._sync_with(pool)
+
+        top_tier = self.manager.available_proxies["source1"]["top_tier"]
+        self.assertEqual(set(top_tier), set(proven))
+
+    def test_baseline_falls_back_to_neutral_when_nothing_is_measured(self):
+        pool = {f"http://blank{i}:80": self.manager._get_new_proxy_stat()
+                for i in range(3)}
+
+        self._sync_with(pool)
+
+        self.assertEqual(self.manager.baseline_scores["source1"], 50.0)
+        for stat in pool.values():
+            self.assertEqual(stat["score"], 50.0)
+
+    def test_baseline_survives_an_empty_pool(self):
+        self._sync_with({}, live=set())
+
+        self.assertEqual(self.manager.baseline_scores["source1"], 50.0)
+        self.assertEqual(self.manager._baseline_score("source1"), 50.0)
+        self.assertEqual(self.manager._baseline_score(), 50.0)
+        self.assertEqual(self.manager._baseline_score("no-such-source"), 50.0)
+
+    def test_baseline_with_a_uniform_pool_is_that_uniform_score(self):
+        pool = {f"http://m{i}:80": self._measured_stat(5, 5) for i in range(4)}
+
+        self._sync_with(pool)
+
+        scores = {round(stat["score"], 6) for stat in pool.values()}
+        self.assertEqual(len(scores), 1)
+        self.assertAlmostEqual(
+            self.manager.baseline_scores["source1"], scores.pop(), places=6
+        )
+
+    def test_dead_proxies_do_not_vote_on_the_baseline(self):
+        """
+        The baseline says what a fresh candidate competes against, and a dead
+        proxy is not competing: it cannot be handed out at all.
+        """
+        live = "http://live:80"
+        pool = {
+            live: self._measured_stat(8, 2),
+            "http://dead1:80": self._measured_stat(0, 20),
+            "http://dead2:80": self._measured_stat(0, 20),
+        }
+
+        self._sync_with(pool, live={live})
+
+        self.assertAlmostEqual(
+            self.manager.baseline_scores["source1"], pool[live]["score"], places=6
+        )
+
+    def test_latency_component_discriminates_across_real_latencies(self):
+        """
+        Calibrated at 300/2000ms, every proxy in this population sat past the
+        zero point, so the 30-point latency component scored a constant 0 and
+        ranked nothing.
+        """
+        scores = [
+            self.manager._calculate_elo_score(self.make_stat([(True, lat)] * 20))
+            for lat in (8000, 15000, 25000, 33000)
+        ]
+        self.assertEqual(scores, sorted(scores, reverse=True))
+        self.assertGreater(scores[0] - scores[-1], 10)
+
+
+class TestIssue17ReputationPersistence(ProxyManagerTestBase):
+    """
+    Issue #17 D: the stats pool caps retained history, so a proxy that failed
+    its way out and later revalidated came back as a pristine candidate -
+    eviction was an amnesty.
+    """
+
+    def test_feedback_counters_are_queued_and_written_back(self):
+        proxy = "http://1.2.3.4:8080"
+        self.manager.source_stats["source1"][proxy] = self.manager._get_new_proxy_stat()
+
+        self.manager.process_feedback("source1", proxy, 500)
+        self.manager.process_feedback("source1", proxy, 200, 900)
+        self.assertIn(proxy, self.manager.pending_feedback_persist)
+
+        self.manager._persist_feedback_history()
+
+        rows = self.mock_db_instance.upsert_proxy_feedback_history.call_args.args[0]
+        self.assertEqual(len(rows), 1)
+        protocol, ip, port, successes, failures, last_ts = rows[0]
+        self.assertEqual((protocol, ip, port), ("http", "1.2.3.4", 8080))
+        self.assertEqual((successes, failures), (1, 1))
+        self.assertIsNotNone(last_ts)
+        # The queue is drained, so an idle service does not rewrite the same
+        # rows every flush interval.
+        self.assertEqual(self.manager.pending_feedback_persist, set())
+
+    def test_ipv6_proxy_urls_round_trip_through_the_write_back_key(self):
+        proxy = "http://[2001:db8::1]:8080"
+        self.manager.source_stats["source1"][proxy] = self.manager._get_new_proxy_stat()
+        self.manager.process_feedback("source1", proxy, 500)
+
+        self.manager._persist_feedback_history()
+
+        rows = self.mock_db_instance.upsert_proxy_feedback_history.call_args.args[0]
+        self.assertEqual(rows[0][:3], ("http", "[2001:db8::1]", 8080))
+
+    def test_evicted_proxy_returns_with_its_failure_history(self):
+        """
+        Evict a proxy with a bad record through the real cap, bring it back
+        through the real sync, and it must not be a blank slate.
+        """
+        punished = "http://punished:80"
+        self.manager.source_stats["source1"] = {
+            punished: self.manager._get_new_proxy_stat()
+            | {
+                "score": 8.0,
+                "success_count": 2,
+                "failure_count": 40,
+                # Stale feedback: this is the proxy the cap drops first, which
+                # is precisely the population that came back whitewashed.
+                "last_feedback_ts": time.time() - 2 * 3600,
+            }
+        }
+        self.manager.pending_feedback_persist.add(punished)
+        self.manager._persist_feedback_history()
+
+        # Round-trip the row the manager just wrote back through the reader's
+        # shape, so the test exercises the real serialisation both ways.
+        written = self.mock_db_instance.upsert_proxy_feedback_history.call_args.args[0]
+        protocol, ip, port, successes, failures, last_ts = written[0]
+        self.mock_db_instance.get_active_feedback_history.return_value = {
+            f"{protocol}://{ip}:{port}": {
+                "success_count": successes,
+                "failure_count": failures,
+                "last_feedback_ts": last_ts,
+            }
+        }
+
+        # It goes dead, gets evicted by the cap, then passes validation again.
+        self.manager.max_pool_size = 1
+        self.manager.stats_pool_max_multiplier = 1
+        self.manager.active_proxies = set()
+        self.manager.source_stats["source1"] = self.manager._truncate_stats_pool(
+            "source1",
+            self.manager.source_stats["source1"]
+            | {
+                "http://other:80": self.manager._get_new_proxy_stat()
+                | {"last_feedback_ts": time.time()}
+            },
+        )
+        self.assertNotIn(punished, self.manager.source_stats["source1"])
+
+        self.mock_db_instance.get_active_proxies.return_value = {punished}
+        self.manager._sync_and_select_top_proxies()
+
+        restored = self.manager.source_stats["source1"][punished]
+        self.assertEqual(restored["failure_count"], 40)
+        self.assertEqual(restored["success_count"], 2)
+        self.assertLess(restored["score"], self.manager.baseline_scores["source1"])
+
+    def test_history_is_only_queried_when_something_needs_seeding(self):
+        known = "http://known:80"
+        for source in self.manager.predefined_sources:
+            self.manager.source_stats[source] = {
+                known: self.manager._get_new_proxy_stat()
+            }
+        self.mock_db_instance.get_active_proxies.return_value = {known}
+
+        self.manager._sync_and_select_top_proxies()
+
+        self.mock_db_instance.get_active_feedback_history.assert_not_called()
+
+    def test_a_failed_history_query_does_not_break_the_sync(self):
+        self.mock_db_instance.get_active_feedback_history.return_value = None
+        newcomer = "http://newcomer:80"
+        self.mock_db_instance.get_active_proxies.return_value = {newcomer}
+
+        self.manager._sync_and_select_top_proxies()  # must not raise
+
+        self.assertIn(newcomer, self.manager.source_stats["source1"])
+        self.assertEqual(
+            self.manager.source_stats["source1"][newcomer]["score"], 50.0
+        )
+
+    def test_seeded_history_decays_toward_the_baseline_with_age(self):
+        """
+        A restored record is evidence, not a life sentence: an old one converges
+        on what an unknown proxy is worth rather than pinning the proxy forever.
+        """
+        fresh = self.manager._get_new_proxy_stat(
+            "source1",
+            {"success_count": 0, "failure_count": 40, "last_feedback_ts": time.time()},
+        )
+        stale = self.manager._get_new_proxy_stat(
+            "source1",
+            {
+                "success_count": 0,
+                "failure_count": 40,
+                "last_feedback_ts": time.time() - 10 * 24 * 3600,
+            },
+        )
+
+        self.assertLess(fresh["score"], stale["score"])
+        self.assertLess(stale["score"], 50.0)
+        self.assertAlmostEqual(stale["score"], 50.0, delta=1.0)
 
 
 if __name__ == "__main__":
