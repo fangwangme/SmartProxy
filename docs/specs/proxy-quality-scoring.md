@@ -122,8 +122,15 @@ Qualified proxies are not serialised. Their success rate is already known, so
 holding each to one outstanding request would cap the service at (qualified
 proxies / round-trip time) - single-digit requests per second for a pool of a
 hundred against a slow target. `proxy_max_inflight` is available as a per-proxy
-capacity guard and defaults to 0, meaning unlimited. Cooldown is an additional
-optional constraint, applied when the plan is built.
+capacity guard and defaults to 0, meaning unlimited.
+
+`proxy_cooldown_ms` spaces out *trial* handouts and nothing else. It cannot
+gate exploitation: the plan is rebuilt on an interval longer than any sane
+cooldown, so filtering the exploit set by it removes precisely the proxies that
+are getting traffic - the highest-scoring ones - for the whole life of the next
+plan. On a 40-proxy pool at a 500ms cooldown, a burst left every one of the top
+ten out of the following plan and dropped the best servable score from 99.7 to
+38.0.
 
 ## 5. Source-wide outage guard
 
@@ -177,9 +184,21 @@ the plan) or a weighted exploit pick (O(log n), against cumulative weights the
 plan precomputed). Nothing in it scales with the size of the pool.
 
 The plan is therefore allowed to be slightly stale, and that staleness is
-bounded by its refresh interval. What must not be stale - whether a trial
-candidate is currently out - is maintained by claim and return, not by
-rescanning.
+bounded by its refresh interval. Two things must not wait for a rebuild, and
+neither does:
+
+- whether a trial candidate is currently out, maintained by claim and return;
+- a proxy that has just qualified, which is promoted into the live exploit set
+  the moment its feedback crosses the line. Without that it falls into a hole -
+  feedback removes it from the trial pool because it is no longer a trial
+  candidate, while the exploit set was frozen before it qualified. During a cold
+  start that hole is most of the pool, and the service answers "no proxy
+  available" while holding one that is healthy.
+
+Staleness in the other direction is accepted: a proxy whose score has just
+dipped below the prior keeps drawing exploitation traffic until the next
+rebuild. That is bounded by `serving_plan_max_age_seconds` and is the cheaper
+error - it costs a few requests, where the reverse costs availability.
 
 ## 6. Persistence and migration
 

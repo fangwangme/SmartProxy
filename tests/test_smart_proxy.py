@@ -208,20 +208,67 @@ class TestProxyManager(ProxyManagerTestBase):
         
         self.assertEqual(proxy, "http://1.1.1.1:80")
 
-    def test_get_proxy_respects_cooldown(self):
-        """Recently handed out proxies should be skipped until cooldown expires."""
-        now = __import__("time").time()
+    def test_cooldown_spaces_out_trial_handouts(self):
+        """A trial candidate handed out recently stays out of the plan."""
+        now = time.time()
         self.manager.proxy_cooldown_ms = 10000
         self.manager.predefined_sources.add("source1")
-        self.manager.available_proxies["source1"] = {
-            "top_tier": ["http://1.1.1.1:80", "http://2.2.2.2:80"],
-            "bottom_tier": [],
+        cooling, ready = "http://1.1.1.1:80", "http://2.2.2.2:80"
+        self.manager.active_proxies = {cooling, ready}
+        self.manager.source_stats["source1"] = {
+            url: self.manager._get_new_proxy_stat("source1") for url in (cooling, ready)
         }
-        self.manager.proxy_last_handed_out_ts["source1"]["http://1.1.1.1:80"] = now
+        self.manager.available_proxies["source1"] = {"top_tier": [], "bottom_tier": []}
+        self.manager.proxy_last_handed_out_ts["source1"][cooling] = now
 
-        proxy = self.manager.get_proxy("source1")
+        plan = self.manager._build_serving_plan("source1")
 
-        self.assertEqual(proxy, "http://2.2.2.2:80")
+        self.assertEqual(plan["discovery"], [ready])
+        self.assertEqual(self.manager.get_proxy("source1"), ready)
+
+    def test_cooldown_does_not_drop_the_busiest_proxies_from_the_plan(self):
+        """
+        Cooldown must not gate exploitation.
+
+        The plan is rebuilt on an interval longer than any sane cooldown, so
+        filtering the exploit set by it excludes exactly the proxies that are
+        getting traffic - the highest-scoring ones - for the whole life of the
+        next plan, and the pool serves its tail instead of its head.
+        """
+        now = time.time()
+        self.manager.proxy_cooldown_ms = 10000
+        urls = [f"http://ranked-{index}:80" for index in range(20)]
+        self.manager.active_proxies = set(urls)
+        self.manager.source_stats["source1"] = {}
+        for index, url in enumerate(urls):
+            probability = 0.9 - index * 0.02
+            self.manager.source_stats["source1"][url] = self.manager._get_new_proxy_stat(
+                "source1"
+            ) | {
+                "score": 100 * probability,
+                "quality_slow": probability,
+                "quality_fast": probability,
+                "quality_updated_ts": now,
+                "success_count": 5,
+                "recent_results": [[now - 5 + tick, True, 900] for tick in range(5)],
+                "last_feedback_ts": now - 5,
+            }
+        self.manager.available_proxies["source1"] = {
+            "top_tier": urls[:10],
+            "bottom_tier": urls[10:],
+        }
+        # Everything has just been served, which is the steady state under load.
+        for url in urls:
+            self.manager.proxy_last_handed_out_ts["source1"][url] = now
+
+        plan = self.manager._build_serving_plan("source1")
+
+        self.assertEqual(len(plan["exploit"]), len(urls))
+        best = max(
+            self.manager.source_stats["source1"][url]["score"]
+            for url in plan["exploit"]
+        )
+        self.assertAlmostEqual(best, 90.0, places=6)
 
     def test_weighted_selection_uses_scores(self):
         """Weighted strategy should pass score-derived weights to random.choices."""
@@ -1078,7 +1125,7 @@ class TestIssue13PoolQuality(ProxyManagerTestBase):
             self.assertEqual(self.manager.get_proxy("source1"), untried)
 
     def test_exploration_is_disabled_when_ratio_is_zero(self):
-        """exploration_ratio = 0 restores the pure top-pool behaviour."""
+        """A zero exploration budget restores the pure ranked-pool behaviour."""
         manager = self.make_manager(
             {
                 "source_pool": {
@@ -3727,6 +3774,55 @@ class TestIssue23ReviewFixes(ProxyManagerTestBase):
         )
         self.assertEqual(expired["inflight"], [])
 
+    # --- a proxy that qualifies mid-plan must not fall into a hole ---------
+
+    def test_qualifying_mid_plan_promotes_into_the_live_exploit_set(self):
+        proxy = "http://promoted:80"
+        self._pool([proxy])
+        # A real plan lifetime, not the per-draw rebuild the base class uses.
+        self.manager.serving_plan_max_age_s = 60.0
+        plan = self.manager._build_serving_plan("source1")
+        self.assertEqual(plan["exploit"], [])
+        self.assertEqual(plan["discovery"], [proxy])
+
+        for _ in range(self.manager.qualification_min_results):
+            self.assertEqual(self.manager.get_proxy("source1"), proxy)
+            self.manager.process_feedback("source1", proxy, 200)
+
+        stat = self.manager.source_stats["source1"][proxy]
+        self.assertTrue(self.manager._is_qualified(stat))
+        # Feedback removed it from the trial pool, so without promotion the
+        # frozen exploit set would leave it unreachable until the next rebuild.
+        self.assertIs(self.manager.serving_plans["source1"], plan)
+        self.assertIn(proxy, plan["exploit"])
+        self.assertEqual(self.manager.get_proxy("source1"), proxy)
+
+    def test_cold_start_serves_continuously_while_the_pool_qualifies(self):
+        urls = [f"http://cold-{index}:80" for index in range(40)]
+        self._pool(urls)
+        self.manager.available_proxies["source1"] = {
+            "top_tier": urls,
+            "bottom_tier": [],
+        }
+        self.manager.serving_plan_max_age_s = 60.0
+        self.manager._build_serving_plan("source1")
+
+        misses = 0
+        for index in range(600):
+            selected = self.manager.get_proxy("source1")
+            if selected is None:
+                misses += 1
+                continue
+            self.manager.process_feedback(
+                "source1", selected, 200 if index % 3 else 500
+            )
+
+        self.assertEqual(misses, 0)
+        self.assertTrue(
+            self.manager.serving_plans["source1"]["exploit"],
+            "nothing was promoted while the pool qualified",
+        )
+
     # --- the outage guard has to work at this deployment's success rate -----
 
     def _low_baseline_guard(self):
@@ -3866,17 +3962,45 @@ class TestIssue23ReviewFixes(ProxyManagerTestBase):
         ):
             self.assertIsNotNone(self.manager.get_proxy("source1"))
 
-    def test_unexpired_count_matches_a_full_scan(self):
+    def test_o1_qualification_agrees_with_a_full_scan(self):
+        """
+        The fast paths answer "at least k unexpired" without counting. Check
+        them against a plain scan across every window size that matters.
+        """
         now = time.time()
         horizon = self.manager.probation_forgiveness_hours * 3600
-        stat = self.manager._get_new_proxy_stat("source1")
-        stat["recent_results"] = sorted(
-            [[now - horizon - 10, True, None], [now - horizon - 1, False, None]]
-            + [[now - offset, True, None] for offset in (900, 600, 300, 1)]
-        )
-        self.assertEqual(self.manager._unexpired_count(stat, now), 4)
-        self.assertEqual(self.manager._unexpired_count({"recent_results": []}, now), 0)
-        self.assertEqual(self.manager._unexpired_count({}, now), 0)
+        needed = self.manager.qualification_min_results
+        expired = [[now - horizon - 10, True, None], [now - horizon - 1, False, None]]
+
+        def scan(stat):
+            return sum(
+                1 for r in stat.get("recent_results") or [] if r[0] > now - horizon
+            )
+
+        for fresh in range(0, needed + 3):
+            stat = self.manager._get_new_proxy_stat("source1") | {"score": 40.0}
+            stat["recent_results"] = expired + [
+                [now - fresh + index, True, None] for index in range(fresh)
+            ]
+            self.assertEqual(
+                self.manager._is_qualified(stat, now),
+                scan(stat) >= needed,
+                f"qualification disagrees at {fresh} fresh results",
+            )
+            self.assertEqual(
+                self.manager._has_unexpired_results(stat, now),
+                scan(stat) > 0,
+                f"freshness disagrees at {fresh} fresh results",
+            )
+
+        # A score at or below the prior never qualifies, however much evidence.
+        plenty = self.manager._get_new_proxy_stat("source1") | {"score": 5.0}
+        plenty["recent_results"] = [[now, True, None]] * (needed + 5)
+        self.assertFalse(self.manager._is_qualified(plenty, now))
+
+        for empty in ({"recent_results": []}, {}):
+            self.assertFalse(self.manager._is_qualified(empty, now))
+            self.assertFalse(self.manager._has_unexpired_results(empty, now))
 
 
 class TestIssue23LauncherAndReplay(ProxyManagerTestBase):
