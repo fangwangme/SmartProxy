@@ -71,6 +71,9 @@ that has shipped so far came in through a pull request.
   see the Development Environment section above.
 - Open a pull request against `main` with `Closes #<issue>` in the body, and
   record the verification you actually ran.
+- **Changelog Policy**: Never add an `Unreleased` section to `CHANGELOG.md` in feature branches or PRs.
+  `CHANGELOG.md` is strictly updated during the explicit release/version bump step (e.g. `chore: release X.Y.Z`)
+  with a finalized version and date. Feature PRs must never touch or add placeholder sections to `CHANGELOG.md`.
 - Merging, tagging, and releasing are manual gates. Do not merge your own PR,
   create tags, or delete branches without being asked.
 
