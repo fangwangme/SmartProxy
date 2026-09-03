@@ -131,8 +131,8 @@ class ProxyManagerTestBase(unittest.TestCase):
     def exploration_ratio(self, source="source1", manager=None):
         """The adaptive exploration budget the router would use right now."""
         manager = self.manager if manager is None else manager
-        _, qualified_count, live_count = manager._scan_trial_pool(source)
-        return manager._exploration_ratio_for(live_count, qualified_count)
+        _, qualified, live_count = manager._scan_trial_pool(source)
+        return manager._exploration_ratio_for(live_count, len(qualified))
 
     def make_stat(self, results, **extra):
         """Build a stat whose sliding window holds `results` of (success, latency_ms)."""
@@ -303,9 +303,13 @@ class TestProxyManager(ProxyManagerTestBase):
             proxy = self.manager.get_proxy("source1")
 
         self.assertEqual(proxy, "http://2.2.2.2:80")
-        # Weights are cumulative because the plan precomputes them, which is
+        # The plan is ranked by score and its weights are cumulative, which is
         # what turns the draw into a bisect instead of a pass over the pool.
-        self.assertEqual(choices.call_args.kwargs["cum_weights"], [10.0, 100.0])
+        self.assertEqual(
+            choices.call_args.args[0],
+            ["http://2.2.2.2:80", "http://1.1.1.1:80"],
+        )
+        self.assertEqual(choices.call_args.kwargs["cum_weights"], [90.0, 100.0])
 
     def test_get_premium_proxy_returns_proxy_when_available(self):
         """Test get_premium_proxy returns a proxy when premium pool is available."""
@@ -720,15 +724,40 @@ class TestProxyManager(ProxyManagerTestBase):
         score = self.manager._refresh_score(stat)
         self.assertAlmostEqual(score, 5.0, delta=0.1)
 
-    def test_elo_score_historical_without_timestamp_is_neutral(self):
-        """If historical data has no timestamp, treat it as stale under decay mode."""
+    def test_history_without_a_timestamp_seeds_at_the_prior_but_keeps_counters(self):
+        """
+        Unknown evidence age is unbounded age, not fresh evidence.
+
+        Deliberate, and the conservative direction: the score drives
+        exploitation weight, so a record that cannot be dated is aged to the
+        prior rather than trusted. The raw counters survive - only the derived
+        estimator, which genuinely cannot be reconstructed without a date, is
+        reset - and the proxy re-enters as a discovery candidate, so it earns
+        its way back on fresh evidence.
+        """
         stat = self.manager._get_new_proxy_stat()
         stat["success_count"] = 95
         stat["failure_count"] = 5
         stat["last_feedback_ts"] = None
 
         score = self.manager._refresh_score(stat)
+
         self.assertEqual(score, 5.0)
+        self.assertEqual((stat["success_count"], stat["failure_count"]), (95, 5))
+        self.assertFalse(self.manager._is_qualified(stat))
+
+    def test_history_with_a_timestamp_keeps_its_seeded_score(self):
+        stat = self.manager._get_new_proxy_stat(
+            "source1",
+            {
+                "success_count": 900,
+                "failure_count": 100,
+                "last_feedback_ts": time.time() - 300,
+            },
+        )
+        self.assertGreater(stat["score"], 80.0)
+        # Seeded score, but no fresh evidence: it enters as a trial candidate.
+        self.assertFalse(self.manager._is_qualified(stat))
 
 
 class TestIssue13PoolQuality(ProxyManagerTestBase):
@@ -3823,6 +3852,125 @@ class TestIssue23ReviewFixes(ProxyManagerTestBase):
             "nothing was promoted while the pool qualified",
         )
 
+    # --- external review round: findings confirmed and fixed ---------------
+
+    def test_qualifying_outside_the_ranked_slice_still_reaches_the_exploit_set(self):
+        """
+        max_pool_size caps the tier lists, not who may be served.
+
+        available_proxies is recomputed only by the pool sync, so a proxy that
+        qualifies between syncs is not in it. Gating exploitation on that list
+        stranded such a proxy in nothing at all: feedback had already taken it
+        out of the trial pool for being qualified, and the exploit set would
+        not take it because it was outside the ranked slice.
+        """
+        self.manager.max_pool_size = 5
+        urls = [f"http://wide-{index}:80" for index in range(20)]
+        self.manager.active_proxies = set(urls)
+        self.manager.source_stats["source1"] = {
+            url: self.manager._get_new_proxy_stat("source1") for url in urls
+        }
+        self.mock_db_instance.get_active_proxies.return_value = set(urls)
+        self.manager._sync_and_select_top_proxies()
+        pools = self.manager.available_proxies["source1"]
+        ranked = set(pools["top_tier"]) | set(pools["bottom_tier"])
+        self.assertEqual(len(ranked), 5)
+        outsider = next(url for url in urls if url not in ranked)
+
+        for _ in range(self.manager.qualification_min_results):
+            self.manager.process_feedback("source1", outsider, 200)
+
+        stat = self.manager.source_stats["source1"][outsider]
+        self.assertTrue(self.manager._is_qualified(stat))
+        plan = self.manager._build_serving_plan("source1")
+        self.assertIn(outsider, plan["exploit"])
+        self.assertIn(
+            outsider,
+            [self.manager.get_proxy("source1") for _ in range(200)],
+        )
+
+    def test_plan_order_is_ranked_and_reproducible(self):
+        now = time.time()
+        urls = [f"http://ord-{index}:80" for index in range(8)]
+        pool = self._pool(urls)
+        for index, url in enumerate(urls):
+            probability = 0.2 + index * 0.08
+            pool[url] |= {
+                "score": 100 * probability,
+                "quality_slow": probability,
+                "quality_fast": probability,
+                "quality_updated_ts": now,
+                "success_count": 5,
+                "recent_results": [[now - 5 + tick, True, 900] for tick in range(5)],
+                "last_feedback_ts": now - 5,
+            }
+        first = self.manager._build_serving_plan("source1")["exploit"]
+        second = self.manager._build_serving_plan("source1")["exploit"]
+
+        self.assertEqual(first, second)
+        self.assertEqual(first, sorted(urls, reverse=True))
+
+    def test_max_inflight_is_enforced_on_the_draw_not_only_at_plan_build(self):
+        now = time.time()
+        proxy = "http://capped:80"
+        pool = self._pool([proxy])
+        pool[proxy] |= {
+            "score": 80.0,
+            "quality_slow": 0.8,
+            "quality_fast": 0.8,
+            "quality_updated_ts": now,
+            "success_count": 5,
+            "recent_results": [[now - 5 + tick, True, 900] for tick in range(5)],
+            "last_feedback_ts": now - 5,
+        }
+        self.manager.proxy_max_inflight = 2
+        # A real plan lifetime: the burst happens entirely inside it, which is
+        # exactly when the plan alone cannot enforce the cap.
+        self.manager.serving_plan_max_age_s = 60.0
+        self.manager._build_serving_plan("source1")
+
+        served = [self.manager.get_proxy("source1") for _ in range(10)]
+
+        self.assertEqual(served.count(proxy), 2)
+        self.assertEqual(len(pool[proxy]["inflight"]), 2)
+        self.manager.process_feedback("source1", proxy, 200)
+        self.assertEqual(self.manager.get_proxy("source1"), proxy)
+
+    def test_paused_source_does_not_broadcast_dead_to_other_sources(self):
+        urls = self._low_baseline_guard()
+        for source in ("source1", "source2"):
+            self.manager.source_stats[source] = {
+                url: self.manager._get_new_proxy_stat(source) for url in urls
+            }
+        self._window(urls, successes=1)
+        self._window(urls, successes=0)
+        self.assertTrue(self.manager._outage_state("source1")["active"])
+        other = dict(self.manager.source_stats["source2"][urls[0]])
+
+        self.manager.process_feedback("source1", urls[0], 0, None, "dead")
+
+        # The guard has judged this source unable to say anything reliable
+        # about a proxy; fanning its failures out would strip reputation the
+        # proxy earned everywhere else.
+        after = self.manager.source_stats["source2"][urls[0]]
+        self.assertEqual(after["failure_count"], other["failure_count"])
+        self.assertEqual(after["score"], other["score"])
+
+    def test_dead_still_propagates_when_the_source_is_healthy(self):
+        urls = [f"http://dead-{index}:80" for index in range(3)]
+        for source in ("source1", "source2"):
+            self.manager.source_stats[source] = {
+                url: self.manager._get_new_proxy_stat(source) for url in urls
+            }
+        self.manager.active_proxies = set(urls)
+        self.manager.outage_guard_enabled = False
+
+        self.manager.process_feedback("source1", urls[0], 0, None, "dead")
+
+        self.assertEqual(
+            self.manager.source_stats["source2"][urls[0]]["failure_count"], 1
+        )
+
     # --- routing state must not outlive what it describes ------------------
 
     def test_reload_drops_routing_state_for_a_removed_source(self):
@@ -4019,7 +4167,7 @@ class TestIssue23ReviewFixes(ProxyManagerTestBase):
             }
 
         _, qualified, live = self.manager._scan_trial_pool("source1")
-        self.assertEqual((qualified, live), (60, 600))
+        self.assertEqual((len(qualified), live), (60, 600))
         # 60 qualified out of 600 live is a 10%-evaluated pool. Measured against
         # the absolute target of 50 it reads as finished and collapses to the
         # 5% floor while 540 proxies have never been measured.

@@ -53,7 +53,12 @@ boundary, by `restore_stats()`, and by `_migrate_legacy_stat()` - and appended
 in timestamp order, so the selection path treats it as sorted and binary
 -searches the qualification cutoff instead of revalidating every stored entry
 on every request. Counter-only database history is seeded from a lifetime
-success rate shrunk toward `p0`, then aged from its last feedback timestamp.
+success rate shrunk toward `p0`, then aged from its last feedback timestamp. A
+record whose timestamp is missing or unusable is aged to the prior instead of
+trusted as fresh: unknown age is unbounded age, and the score drives
+exploitation weight. The raw counters survive either way, and the proxy
+re-enters as a discovery candidate, so it earns its score back on fresh
+evidence.
 
 ## 4. Qualification, exploration, and probation
 
@@ -107,10 +112,13 @@ Two rules follow, and both are load-bearing:
   life left it ineligible for exploitation *and* for every exploration group,
   which is unreachable rather than deprioritised.
 
-Exploitation draws from the whole ranked pool. Tiering weights the `tiered`
-strategy; it is not the eligibility set. Restricting eligibility to the top
-tier caps in-flight concurrency at `top_tier_size` and returns "no proxy
-available" while the rest of the ranked, qualified pool sits idle.
+Exploitation draws from every live, qualified proxy. Neither tiering nor
+`max_pool_size` is an eligibility gate: the tier lists weight the `tiered`
+strategy and are recomputed only by the pool sync, so gating on them stranded
+any proxy that qualified between syncs - feedback had already removed it from
+the trial pool for being qualified, and the exploit set would not take it for
+being outside the ranked slice. The plan is ordered by score so a rebuild is
+reproducible.
 
 A trial candidate is claimed out of the serving plan when it is handed out and
 returned when its feedback arrives, so one candidate cannot absorb a burst
@@ -122,7 +130,11 @@ Qualified proxies are not serialised. Their success rate is already known, so
 holding each to one outstanding request would cap the service at (qualified
 proxies / round-trip time) - single-digit requests per second for a pool of a
 hundred against a slow target. `proxy_max_inflight` is available as a per-proxy
-capacity guard and defaults to 0, meaning unlimited.
+capacity guard and defaults to 0, meaning unlimited. When it is set, the plan
+alone cannot enforce it - a burst inside one plan's lifetime would hand the
+same proxy out without limit - so the drawn candidate is checked and redrawn,
+which is O(1) on one proxy rather than a pass over the pool. With the cap off
+the draw does no checking at all.
 
 `proxy_cooldown_ms` spaces out *trial* handouts and nothing else. It cannot
 gate exploitation: the plan is rebuilt on an interval longer than any sane
@@ -160,7 +172,9 @@ Tentative proxy mutations from the triggering broad-failure window are rolled
 back, field by field rather than by deep-copying each proxy's full result
 history on every healthy feedback event. While active, aggregate per-minute
 feedback continues, in-flight leases are released, and proxy reputation
-mutation pauses - including the trial budget, which is reputation: a handout
+mutation pauses for every source rather than only the reporting one - a
+`dead` report from a source the guard has judged unreliable must not strip the
+reputation those proxies earned elsewhere - including the trial budget, which is reputation: a handout
 made while the source is paused produces no usable evidence and must not be
 charged. A completed recovery window reaching
 `outage_recovery_baseline_ratio` of the baseline, with enough distinct
