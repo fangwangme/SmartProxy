@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # SmartProxy 服务管理脚本
-# 用法: ./start.sh {start|stop|restart|status|logs|backup} [--debug]
+# 用法: ./start_proxy.sh {start|stop|restart|status|logs|backup} [flags]
 
 # 获取项目根目录（脚本所在目录的父目录）
 PROJECT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." && pwd )"
@@ -13,7 +13,9 @@ PID_FILE="$PROJECT_DIR/.smart_proxy.pid"
 # the dependencies installed.
 PYTHON="$PROJECT_DIR/.venv/bin/python"
 PORT=6942
-DEBUG_FLAG=""
+SERVICE_FLAGS=()
+DEBUG_ENABLED=false
+RESTORE_MODE="normal"
 
 # 确保日志目录存在
 mkdir -p "$LOG_DIR" 2>/dev/null
@@ -62,11 +64,12 @@ start_server() {
     echo " Project Path: $PROJECT_DIR"
     echo " URL: http://localhost:$PORT"
     echo " Log File: $LOG_FILE"
-    [ -n "$DEBUG_FLAG" ] && echo " Debug Mode: ENABLED"
+    $DEBUG_ENABLED && echo " Debug Mode: ENABLED"
+    echo " Restore Mode: $RESTORE_MODE"
     echo "=================================================="
 
     # 使用 setsid + nohup 完全脱离当前会话，避免父会话退出时子进程被连带终止
-    nohup setsid "$PYTHON" -u -m src.main $DEBUG_FLAG </dev/null >> "$LOG_FILE" 2>&1 &
+    nohup setsid "$PYTHON" -u -m src.main "${SERVICE_FLAGS[@]}" </dev/null >> "$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
 
     sleep 1
@@ -144,15 +147,43 @@ logs_server() {
     fi
 }
 
-# 解析 --debug 参数
+# Parse service flags after the management command. Arrays preserve argument
+# boundaries and avoid word-splitting values into executable shell fragments.
+COMMAND="${1:-start}"
+if [ "$#" -gt 0 ]; then
+    shift
+fi
 for arg in "$@"; do
-    if [ "$arg" = "--debug" ]; then
-        DEBUG_FLAG="--debug"
-    fi
+    case "$arg" in
+        --debug)
+            DEBUG_ENABLED=true
+            SERVICE_FLAGS+=("--debug")
+            ;;
+        --no-restore)
+            if [ "$RESTORE_MODE" != "normal" ]; then
+                echo "Only one restore mode may be selected."
+                exit 1
+            fi
+            RESTORE_MODE="no-restore"
+            SERVICE_FLAGS+=("--no-restore")
+            ;;
+        --fresh-scoring)
+            if [ "$RESTORE_MODE" != "normal" ]; then
+                echo "Only one restore mode may be selected."
+                exit 1
+            fi
+            RESTORE_MODE="fresh-scoring"
+            SERVICE_FLAGS+=("--fresh-scoring")
+            ;;
+        *)
+            echo "Unknown flag: $arg"
+            exit 1
+            ;;
+    esac
 done
 
 # 命令行参数处理
-case "${1:-start}" in
+case "$COMMAND" in
     start)
         start_server
         ;;
@@ -174,7 +205,7 @@ case "${1:-start}" in
         backup_stats
         ;;
     *)
-        echo "Usage: $0 {start|stop|restart|status|logs|backup} [--debug]"
+        echo "Usage: $0 {start|stop|restart|status|logs|backup} [--debug] [--no-restore|--fresh-scoring]"
         exit 1
         ;;
 esac

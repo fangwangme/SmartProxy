@@ -3,6 +3,7 @@ import asyncio
 import json
 import os
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
@@ -10,11 +11,18 @@ import unittest
 import configparser
 import copy
 import threading
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch, AsyncMock
 
-from src.core.proxy_manager import ProxyManager, FetchError, FAILED_STATUS_CODES
+from src.core.proxy_manager import (
+    ProxyManager,
+    FetchError,
+    FAILED_STATUS_CODES,
+    SCORING_VERSION,
+)
 from src.database.db import DatabaseManager
+from src.api.server import create_app
 
 
 def write_config_file(directory: str, config_dict: dict, name: str = "config.ini") -> str:
@@ -75,9 +83,9 @@ class ProxyManagerTestBase(unittest.TestCase):
                     "proxy_cooldown_ms": "0",
                     "top_tier_size": "50",
                     "top_tier_load_percentage": "70",
-                    "elo_time_decay_enabled": "true",
-                    "elo_decay_half_life_hours": "24",
-                    "elo_max_result_age_hours": "168",
+                    "reliability_prior": "0.05",
+                    "reliability_decay_half_life_hours": "24",
+                    "probation_forgiveness_hours": "168",
                     "max_feedback_latency_ms": "86400000",
                 },
                 "backup": {
@@ -119,8 +127,9 @@ class ProxyManagerTestBase(unittest.TestCase):
         """Build a stat whose sliding window holds `results` of (success, latency_ms)."""
         stat = self.manager._get_new_proxy_stat()
         now = time.time()
+        start = now - len(results)
         for index, (is_success, latency_ms) in enumerate(results):
-            stat["recent_results"].append([now - index, is_success, latency_ms])
+            stat["recent_results"].append([start + index, is_success, latency_ms])
         stat.update(extra)
         return stat
 
@@ -211,10 +220,26 @@ class TestProxyManager(ProxyManagerTestBase):
             "top_tier": ["http://1.1.1.1:80", "http://2.2.2.2:80"],
             "bottom_tier": [],
         }
+        now = time.time()
         self.manager.source_stats["source1"] = {
-            "http://1.1.1.1:80": {"score": 10},
-            "http://2.2.2.2:80": {"score": 90},
+            "http://1.1.1.1:80": self.manager._get_new_proxy_stat()
+            | {
+                "score": 10.0,
+                "quality_slow": 0.1,
+                "quality_fast": 0.1,
+                "quality_updated_ts": now,
+                "recent_results": [[now, True, None]] * 3,
+            },
+            "http://2.2.2.2:80": self.manager._get_new_proxy_stat()
+            | {
+                "score": 90.0,
+                "quality_slow": 0.9,
+                "quality_fast": 0.9,
+                "quality_updated_ts": now,
+                "recent_results": [[now, True, None]] * 3,
+            },
         }
+        self.manager.active_proxies = set(self.manager.source_stats["source1"])
 
         with patch("src.core.proxy_manager.random.choices", return_value=["http://2.2.2.2:80"]) as choices:
             proxy = self.manager.get_proxy("source1")
@@ -442,7 +467,9 @@ class TestProxyManager(ProxyManagerTestBase):
         """Test _get_new_proxy_stat returns correct initial ELO structure."""
         stat = self.manager._get_new_proxy_stat()
         
-        self.assertEqual(stat["score"], 50.0)  # ELO neutral starting score
+        self.assertEqual(stat["score"], 5.0)
+        self.assertEqual(stat["quality_slow"], 0.05)
+        self.assertEqual(stat["quality_fast"], 0.05)
         self.assertEqual(stat["success_count"], 0)
         self.assertEqual(stat["failure_count"], 0)
         self.assertEqual(stat["consecutive_failures"], 0)
@@ -462,8 +489,7 @@ class TestProxyManager(ProxyManagerTestBase):
         """Test ELO score for a completely new proxy with no history."""
         stat = self.manager._get_new_proxy_stat()
         score = self.manager._calculate_elo_score(stat)
-        # New proxy should get neutral score of 50
-        self.assertEqual(score, 50.0)
+        self.assertEqual(score, 5.0)
 
     def test_elo_score_perfect_proxy(self):
         """Test ELO score for a proxy with 100% success rate and low latency."""
@@ -501,16 +527,12 @@ class TestProxyManager(ProxyManagerTestBase):
             stat["recent_results"].append([time.time() - i, True, 500])
         
         score = self.manager._calculate_elo_score(stat)
-        # 80% success = 48pts, latency ~26pts, consistency varies
+        # A long recent success run approaches 100, independent of latency.
         self.assertGreaterEqual(score, 60)
-        self.assertLessEqual(score, 85)
+        self.assertLessEqual(score, 100)
 
     def test_elo_score_latency_impact(self):
-        """
-        Lower latency scores higher, at latencies these proxies really have.
-
-        The two samples sit inside the calibrated band (15-60s).
-        """
+        """Latency is observable but cannot change reliability."""
         import time
 
         stat_low = self.manager._get_new_proxy_stat()
@@ -524,10 +546,7 @@ class TestProxyManager(ProxyManagerTestBase):
         score_low = self.manager._calculate_elo_score(stat_low)
         score_high = self.manager._calculate_elo_score(stat_high)
 
-        # Low latency should score higher
-        self.assertGreater(score_low, score_high)
-        # Difference should be meaningful (about 10-20 points)
-        self.assertGreater(score_low - score_high, 8)
+        self.assertAlmostEqual(score_low, score_high, places=3)
 
     def test_elo_score_legacy_migration(self):
         """Test that legacy stats are properly migrated and scored."""
@@ -537,6 +556,7 @@ class TestProxyManager(ProxyManagerTestBase):
             "success_count": 80,
             "failure_count": 20,
             "consecutive_failures": 0,
+            "last_feedback_ts": time.time(),
         }
         
         migrated = self.manager._migrate_legacy_stat(legacy_stat)
@@ -546,12 +566,12 @@ class TestProxyManager(ProxyManagerTestBase):
         self.assertIn("avg_latency_ms", migrated)
         self.assertEqual(migrated["recent_results"], [])
         
-        # Score should be recalculated based on historical success rate (80%)
+        # Counter-only history is prior-shrunk instead of trusting score=150.
         self.assertGreaterEqual(migrated["score"], 70)
-        self.assertLessEqual(migrated["score"], 90)
+        self.assertLessEqual(migrated["score"], 80)
 
     def test_elo_score_consistency_bonus(self):
-        """Test that consistent recent performance gives bonus points."""
+        """A stronger reliability sequence still outranks a weaker one."""
         import time
         
         # Consistent proxy: 10/10 recent successes
@@ -569,9 +589,7 @@ class TestProxyManager(ProxyManagerTestBase):
         score_consistent = self.manager._calculate_elo_score(stat_consistent)
         score_inconsistent = self.manager._calculate_elo_score(stat_inconsistent)
         
-        # Consistent should score significantly higher
         self.assertGreater(score_consistent, score_inconsistent)
-        self.assertGreater(score_consistent - score_inconsistent, 30)
 
     def test_elo_score_bounded_0_to_100(self):
         """Test that ELO scores are always bounded between 0 and 100."""
@@ -600,8 +618,7 @@ class TestProxyManager(ProxyManagerTestBase):
         """Old recent results should age out and return neutral score when no fresh data exists."""
         import time
 
-        self.manager.elo_time_decay_enabled = True
-        self.manager.elo_max_result_age_hours = 24
+        self.manager.reliability_decay_half_life_hours = 24
         stat = self.manager._get_new_proxy_stat()
 
         stale_ts = time.time() - (3 * 24 * 3600)
@@ -609,14 +626,14 @@ class TestProxyManager(ProxyManagerTestBase):
             stat["recent_results"].append([stale_ts, True, 200])
 
         score = self.manager._calculate_elo_score(stat)
-        self.assertEqual(score, 50.0)
+        self.assertGreater(score, 5.0)
+        self.assertLess(score, 20.0)
 
     def test_elo_score_prefers_fresh_failures_over_old_successes(self):
         """Recent failures should dominate when old successes are out of age window."""
         import time
 
-        self.manager.elo_time_decay_enabled = True
-        self.manager.elo_max_result_age_hours = 24
+        self.manager.reliability_decay_half_life_hours = 24
         stat = self.manager._get_new_proxy_stat()
 
         old_ts = time.time() - (8 * 24 * 3600)
@@ -627,14 +644,13 @@ class TestProxyManager(ProxyManagerTestBase):
             stat["recent_results"].append([time.time(), False, None])
 
         score = self.manager._calculate_elo_score(stat)
-        self.assertLessEqual(score, 25)
+        self.assertLess(score, 5.0)
 
     def test_elo_score_historical_data_decays_toward_neutral(self):
         """Historical counters should decay toward neutral when feedback is very old."""
         import time
 
-        self.manager.elo_time_decay_enabled = True
-        self.manager.elo_decay_half_life_hours = 24
+        self.manager.reliability_decay_half_life_hours = 24
 
         stat = self.manager._get_new_proxy_stat()
         stat["success_count"] = 80
@@ -642,20 +658,17 @@ class TestProxyManager(ProxyManagerTestBase):
         stat["last_feedback_ts"] = time.time() - (10 * 24 * 3600)
 
         score = self.manager._calculate_elo_score(stat)
-        self.assertGreaterEqual(score, 49)
-        self.assertLessEqual(score, 52)
+        self.assertAlmostEqual(score, 5.0, delta=0.1)
 
     def test_elo_score_historical_without_timestamp_is_neutral(self):
         """If historical data has no timestamp, treat it as stale under decay mode."""
-        self.manager.elo_time_decay_enabled = True
-
         stat = self.manager._get_new_proxy_stat()
         stat["success_count"] = 95
         stat["failure_count"] = 5
         stat["last_feedback_ts"] = None
 
         score = self.manager._calculate_elo_score(stat)
-        self.assertEqual(score, 50.0)
+        self.assertEqual(score, 5.0)
 
 
 class TestIssue13PoolQuality(ProxyManagerTestBase):
@@ -705,7 +718,7 @@ class TestIssue13PoolQuality(ProxyManagerTestBase):
         )
 
     def test_get_proxy_never_returns_a_dead_proxy_after_sync(self):
-        """End-to-end: 20 get_proxy calls after a sync never hit a dead proxy."""
+        """End-to-end: repeated completed requests never hit a dead proxy."""
         dead = "http://dead:80"
         alive = "http://alive:80"
         self.manager.source_stats["source1"] = {
@@ -715,7 +728,11 @@ class TestIssue13PoolQuality(ProxyManagerTestBase):
         self.mock_db_instance.get_active_proxies.return_value = {alive}
         self.manager._sync_and_select_top_proxies()
 
-        handed_out = {self.manager.get_proxy("source1") for _ in range(20)}
+        handed_out = set()
+        for _ in range(20):
+            selected = self.manager.get_proxy("source1")
+            handed_out.add(selected)
+            self.manager.process_feedback("source1", selected, 200)
 
         self.assertNotIn(dead, handed_out)
         self.assertEqual(handed_out, {alive})
@@ -724,7 +741,7 @@ class TestIssue13PoolQuality(ProxyManagerTestBase):
 
     def test_single_success_scores_between_baseline_and_veteran(self):
         """
-        One success must stay optimistic (> the 50 baseline) but must not
+        One success must stay optimistic (> the fixed prior) but must not
         outrank a proxy with a full window of successes.
         """
         rookie = self.manager._calculate_elo_score(self.make_stat([(True, 200)]))
@@ -735,26 +752,24 @@ class TestIssue13PoolQuality(ProxyManagerTestBase):
             self.manager._get_new_proxy_stat()
         )
 
-        self.assertEqual(untried, 50.0)
-        self.assertGreater(rookie, 50.0)
+        self.assertEqual(untried, 5.0)
+        self.assertGreater(rookie, 5.0)
         self.assertLess(rookie, veteran)
-        # Exploration budget, not a coronation: issue #13 pins 1 success to 50-75.
-        self.assertLessEqual(rookie, 75.0)
-        self.assertGreaterEqual(veteran, 90.0)
+        self.assertAlmostEqual(rookie, 16.4, places=2)
 
     def test_single_success_without_latency_still_beats_baseline(self):
         """The optimistic bonus must not depend on a latency being reported."""
         score = self.manager._calculate_elo_score(self.make_stat([(True, None)]))
 
-        self.assertGreater(score, 50.0)
-        self.assertLessEqual(score, 75.0)
+        self.assertGreater(score, 5.0)
+        self.assertAlmostEqual(score, 16.4, places=2)
 
     def test_single_failure_is_not_permanent_exile(self):
         """One failure lands well above 0, leaving a recovery path."""
         score = self.manager._calculate_elo_score(self.make_stat([(False, None)]))
 
-        self.assertGreater(score, 5.0)
-        self.assertLess(score, 50.0)
+        self.assertGreater(score, 0.0)
+        self.assertAlmostEqual(score, 3.5, places=2)
 
     # ---------- Finding 5: an all-failure window got a neutral latency score ----------
 
@@ -770,7 +785,7 @@ class TestIssue13PoolQuality(ProxyManagerTestBase):
         """The neutral score belongs to proxies with no data, not broken ones."""
         self.assertEqual(
             self.manager._calculate_elo_score(self.manager._get_new_proxy_stat()),
-            50.0,
+            5.0,
         )
 
     # ---------- Finding 4: latency masked a low success rate ----------
@@ -781,7 +796,7 @@ class TestIssue13PoolQuality(ProxyManagerTestBase):
             self.make_stat([(True, 200)] * 17 + [(False, None)] * 33)
         )
 
-        self.assertLess(score, 50.0)
+        self.assertLess(score, 5.0)
 
     def test_latency_score_is_scaled_by_success_rate(self):
         """Same latency, different reliability: the reliable one scores higher."""
@@ -792,7 +807,7 @@ class TestIssue13PoolQuality(ProxyManagerTestBase):
             self.make_stat([(True, 200)] * 20 + [(False, None)] * 30)
         )
 
-        self.assertGreater(reliable - flaky, 30.0)
+        self.assertGreater(reliable, flaky)
 
     # ---------- Finding 3: time decay never applied to idle proxies ----------
 
@@ -816,10 +831,10 @@ class TestIssue13PoolQuality(ProxyManagerTestBase):
 
         self.assertEqual(score_before, 100.0)
         self.assertNotEqual(score_after, score_before)
-        self.assertEqual(score_after, 50.0)
+        self.assertAlmostEqual(score_after, 5.0, delta=0.2)
 
     def test_sync_rescore_can_be_disabled_by_config(self):
-        """rescore_on_sync_enabled is a real config switch, not a hardcode."""
+        """The removed legacy switch cannot freeze wall-clock forgiveness."""
         manager = self.make_manager(
             {"source_pool": {"rescore_on_sync_enabled": "false"}},
             name="no_rescore.ini",
@@ -835,8 +850,9 @@ class TestIssue13PoolQuality(ProxyManagerTestBase):
 
         manager._sync_and_select_top_proxies()
 
-        self.assertFalse(manager.rescore_on_sync_enabled)
-        self.assertEqual(manager.source_stats["source1"][proxy_url]["score"], 100.0)
+        self.assertNotEqual(
+            manager.source_stats["source1"][proxy_url]["score"], 100.0
+        )
 
     # ---------- Finding 8: one dirty row rolled back the whole insert ----------
 
@@ -1011,7 +1027,6 @@ class TestIssue13PoolQuality(ProxyManagerTestBase):
         """After a full sync the punished proxy still carries its history."""
         self.manager.max_pool_size = 2
         self.manager.stats_pool_max_multiplier = 1
-        self.manager.rescore_on_sync_enabled = False
         punished = "http://punished:80"
         self.manager.source_stats["source1"] = {
             punished: self.manager._get_new_proxy_stat()
@@ -1024,14 +1039,15 @@ class TestIssue13PoolQuality(ProxyManagerTestBase):
         self.manager._sync_and_select_top_proxies()
 
         stat = self.manager.source_stats["source1"][punished]
-        self.assertEqual(stat["score"], 20.0)
+        self.assertLess(stat["score"], 5.0)
         self.assertEqual(stat["failure_count"], 30)
 
     # ---------- Finding 12 (batch 2): exploration quota for untried proxies ----------
 
     def test_exploration_can_hand_out_a_proxy_outside_the_top_pool(self):
         """An untried but live proxy must be reachable even when not in a tier."""
-        self.manager.exploration_ratio = 1.0
+        self.manager.exploration_min_ratio = 1.0
+        self.manager.exploration_max_ratio = 1.0
         untried = "http://untried:80"
         incumbent = "http://incumbent:80"
         self.manager.active_proxies = {untried, incumbent}
@@ -1045,30 +1061,48 @@ class TestIssue13PoolQuality(ProxyManagerTestBase):
             "bottom_tier": [],
         }
 
-        self.assertEqual(self.manager.get_proxy("source1"), untried)
+        with patch("src.core.proxy_manager.random.random", return_value=0.0):
+            self.assertEqual(self.manager.get_proxy("source1"), untried)
 
     def test_exploration_is_disabled_when_ratio_is_zero(self):
         """exploration_ratio = 0 restores the pure top-pool behaviour."""
         manager = self.make_manager(
-            {"source_pool": {"exploration_ratio": "0"}}, name="no_explore.ini"
+            {
+                "source_pool": {
+                    "exploration_min_ratio": "0",
+                    "exploration_max_ratio": "0",
+                }
+            },
+            name="no_explore.ini",
         )
         untried = "http://untried:80"
         incumbent = "http://incumbent:80"
         manager.active_proxies = {untried, incumbent}
-        manager.source_stats["source1"] = {untried: manager._get_new_proxy_stat()}
+        now = time.time()
+        manager.source_stats["source1"] = {
+            untried: manager._get_new_proxy_stat(),
+            incumbent: manager._get_new_proxy_stat()
+            | {
+                "score": 80.0,
+                "quality_slow": 0.8,
+                "quality_fast": 0.8,
+                "quality_updated_ts": now,
+                "recent_results": [[now, True, None]] * 3,
+            },
+        }
         manager.available_proxies["source1"] = {
             "top_tier": [incumbent],
             "bottom_tier": [],
         }
 
-        self.assertEqual(manager.exploration_ratio, 0.0)
-        self.assertEqual(
-            {manager.get_proxy("source1") for _ in range(20)}, {incumbent}
-        )
+        self.assertEqual(manager.exploration_min_ratio, 0.0)
+        self.assertEqual(manager.exploration_max_ratio, 0.0)
+        self.assertEqual(manager.get_proxy("source1"), incumbent)
 
     def test_exploration_never_returns_a_dead_proxy(self):
         """The exploration pool is gated on active_proxies too."""
-        self.manager.exploration_ratio = 1.0
+        self.manager.exploration_min_ratio = 1.0
+        self.manager.exploration_max_ratio = 1.0
         dead_untried = "http://dead-untried:80"
         incumbent = "http://incumbent:80"
         self.manager.active_proxies = {incumbent}
@@ -1149,16 +1183,25 @@ class TestIssue13PoolQuality(ProxyManagerTestBase):
     def test_backup_then_restore_round_trips(self):
         backup_path = Path(self.tmp_dir) / "stats.json"
         self.manager.stats_backup_path = backup_path
+        now = time.time()
         self.manager.source_stats["source1"] = {
-            "http://1.1.1.1:80": self.manager._get_new_proxy_stat() | {"score": 77.0}
+            "http://1.1.1.1:80": self.manager._get_new_proxy_stat()
+            | {
+                "score": 77.0,
+                "quality_slow": 0.77,
+                "quality_fast": 0.77,
+                "quality_updated_ts": now,
+            }
         }
 
         self.assertEqual(self.manager.backup_stats()["status"], "success")
         self.manager.source_stats["source1"] = {}
         self.assertEqual(self.manager.restore_stats()["status"], "success")
 
-        self.assertEqual(
-            self.manager.source_stats["source1"]["http://1.1.1.1:80"]["score"], 77.0
+        self.assertAlmostEqual(
+            self.manager.source_stats["source1"]["http://1.1.1.1:80"]["score"],
+            77.0,
+            places=3,
         )
 
     def test_restore_sanitizes_oversized_timestamps_before_sync(self):
@@ -1314,12 +1357,15 @@ class TestIssue13PoolQuality(ProxyManagerTestBase):
         example = configparser.ConfigParser()
         example.read(CONFIG_EXAMPLE_PATH, encoding="utf-8")
         for section, option in [
-            ("source_pool", "exploration_ratio"),
-            ("source_pool", "elo_prior_successes"),
-            ("source_pool", "elo_prior_failures"),
-            ("source_pool", "elo_new_proxy_consistency_bonus"),
-            ("source_pool", "elo_circuit_breaker_multiplier"),
-            ("source_pool", "rescore_on_sync_enabled"),
+            ("source_pool", "exploration_min_ratio"),
+            ("source_pool", "exploration_max_ratio"),
+            ("source_pool", "exploration_target_qualified"),
+            ("source_pool", "reliability_prior"),
+            ("source_pool", "reliability_slow_alpha"),
+            ("source_pool", "reliability_fast_alpha"),
+            ("source_pool", "proxy_inflight_timeout_seconds"),
+            ("source_pool", "retry_delay_seconds"),
+            ("source_pool", "outage_guard_enabled"),
             ("source_pool", "max_feedback_latency_ms"),
             ("validator", "validation_new_proxy_ratio"),
         ]:
@@ -1480,7 +1526,6 @@ class TestReviewRegressions(ProxyManagerTestBase):
         """
         self.manager.max_pool_size = 2
         self.manager.stats_pool_max_multiplier = 1
-        self.manager.rescore_on_sync_enabled = False
         now = time.time()
         newcomer = "http://new:80"
         self.manager.source_stats["source1"] = {
@@ -1565,7 +1610,8 @@ class TestReviewRegressions(ProxyManagerTestBase):
         now = time.time()
         incumbent, newcomer = "http://incumbent:80", "http://newcomer:80"
         self.manager.proxy_cooldown_ms = 10000
-        self.manager.exploration_ratio = 1.0
+        self.manager.exploration_min_ratio = 1.0
+        self.manager.exploration_max_ratio = 1.0
         self.manager.active_proxies = {incumbent, newcomer}
         self.manager.source_stats["source1"] = {
             incumbent: self.manager._get_new_proxy_stat() | {"recent_results": [[now, True, 100]]},
@@ -1582,7 +1628,8 @@ class TestReviewRegressions(ProxyManagerTestBase):
         caller that never reports back would otherwise let one proxy absorb the
         whole exploration budget forever.
         """
-        self.manager.exploration_ratio = 1.0
+        self.manager.exploration_min_ratio = 1.0
+        self.manager.exploration_max_ratio = 1.0
         self.manager.proxy_cooldown_ms = 0
         urls = [f"http://n{i}:80" for i in range(3)]
         self.manager.active_proxies = set(urls)
@@ -1593,8 +1640,8 @@ class TestReviewRegressions(ProxyManagerTestBase):
 
         picks = [self.manager.get_proxy("source1") for _ in range(6)]
 
-        self.assertEqual(set(picks[:3]), set(urls))   # every untried one first
-        self.assertEqual(set(picks[3:]), set(urls))   # then rotate, not repeat
+        self.assertEqual(set(picks[:3]), set(urls))
+        self.assertEqual(picks[3:], [None, None, None])
 
     # --- Backup concurrency ---
 
@@ -1990,11 +2037,12 @@ class TestSecondReviewRegressions(ProxyManagerTestBase):
         for result in stat["recent_results"]:
             result[0] = old
         stat["last_feedback_ts"] = old
+        stat["quality_updated_ts"] = old
         return stat
 
     def _manager_with_three_proxies(self, age_hours="48"):
         manager = self.make_manager(
-            {"source_pool": {"elo_max_result_age_hours": age_hours}},
+            {"source_pool": {"probation_forgiveness_hours": age_hours}},
             name=f"recovery-{age_hours}.ini",
         )
         urls = ["http://bad:1", "http://n1:1", "http://n2:1"]
@@ -2009,9 +2057,10 @@ class TestSecondReviewRegressions(ProxyManagerTestBase):
         manager = self._manager_with_three_proxies()
         stat = self._aged_single_failure(manager, "http://bad:1", hours=49)
 
-        # The cumulative counter is still there; it just must not be consulted.
         self.assertEqual(stat["failure_count"], 1)
-        self.assertEqual(manager._calculate_elo_score(stat, "source1"), 50.0)
+        recovered = manager._calculate_elo_score(stat, "source1")
+        self.assertGreater(recovered, 3.5)
+        self.assertLess(recovered, 5.0)
 
     def test_fresh_failure_is_still_punished(self):
         manager = self._manager_with_three_proxies()
@@ -2022,17 +2071,15 @@ class TestSecondReviewRegressions(ProxyManagerTestBase):
     def test_expired_failure_can_re_enter_the_ranked_pool(self):
         manager = self._manager_with_three_proxies()
         self._aged_single_failure(manager, "http://bad:1", hours=49)
-        manager.max_pool_size = 2
-
         manager._sync_and_select_top_proxies()
-
-        pool = manager.available_proxies["source1"]
-        self.assertIn("http://bad:1", list(pool["top_tier"]) + list(pool["bottom_tier"]))
+        groups = manager._exploration_candidate_groups("source1")
+        self.assertIn("http://bad:1", groups["discovery"])
 
     def test_expired_failure_is_reachable_by_exploration(self):
         manager = self._manager_with_three_proxies()
         self._aged_single_failure(manager, "http://bad:1", hours=49)
-        manager.exploration_ratio = 1.0
+        manager.exploration_min_ratio = 1.0
+        manager.exploration_max_ratio = 1.0
 
         picks = {manager._maybe_select_exploration_candidate("source1") for _ in range(200)}
 
@@ -2041,11 +2088,12 @@ class TestSecondReviewRegressions(ProxyManagerTestBase):
     def test_unexpired_failure_is_not_treated_as_unproven(self):
         manager = self._manager_with_three_proxies()
         self._aged_single_failure(manager, "http://bad:1", hours=1)
-        manager.exploration_ratio = 1.0
+        manager.exploration_min_ratio = 1.0
+        manager.exploration_max_ratio = 1.0
 
         picks = {manager._maybe_select_exploration_candidate("source1") for _ in range(200)}
 
-        self.assertNotIn("http://bad:1", picks)
+        self.assertIn("http://bad:1", picks)
 
     def test_never_observed_proxy_still_uses_historical_counters(self):
         """The recovery rule must not swallow the restored-backup fallback."""
@@ -2060,16 +2108,17 @@ class TestSecondReviewRegressions(ProxyManagerTestBase):
             }
         )
 
-        # 90% historical success rate -> 0.9 * 80 + 10, undecayed because the
-        # counters were just touched.
-        self.assertAlmostEqual(manager._calculate_elo_score(stat, "source1"), 82.0, places=1)
+        expected = (9 + 5 * 0.05) / (10 + 5) * 100
+        self.assertAlmostEqual(
+            manager._calculate_elo_score(stat, "source1"), expected, places=1
+        )
 
     def test_code_fallback_matches_the_shipped_default(self):
         merged = {s: dict(o) for s, o in self.config_dict.items()}
-        del merged["source_pool"]["elo_max_result_age_hours"]
+        del merged["source_pool"]["probation_forgiveness_hours"]
         manager = ProxyManager(write_config_file(self.tmp_dir, merged, name="nokey.ini"))
 
-        self.assertEqual(manager.elo_max_result_age_hours, 48.0)
+        self.assertEqual(manager.probation_forgiveness_hours, 48.0)
 
     # --- Finding 2: the cap must not launder a live proxy over two syncs ---
 
@@ -2467,11 +2516,7 @@ class TestIssue17FetcherSupply(ProxyManagerTestBase):
 
 
 class TestIssue17DynamicBaseline(ProxyManagerTestBase):
-    """
-    Issue #17 C: with a hardcoded 50.0 baseline, every proxy that had ever been
-    measured sorted below every proxy that had not, and the pool filled with
-    proxies whose only qualification was that nothing was known about them.
-    """
+    """Issue #23 replaces the issue #17 dynamic baseline with a fixed prior."""
 
     def _measured_stat(self, successes, failures, latency_ms=15000):
         # Interleave successes and failures to represent a sustained rate rather than a tail outage
@@ -2512,19 +2557,15 @@ class TestIssue17DynamicBaseline(ProxyManagerTestBase):
 
     def test_untried_baseline_is_the_median_of_the_measured_live_pool(self):
         pool = self._population()
-        measured_urls = list(pool)
         pool["http://untried:80"] = self.manager._get_new_proxy_stat()
 
         self._sync_with(pool)
 
-        measured_scores = sorted(pool[url]["score"] for url in measured_urls)
-        expected = measured_scores[len(measured_scores) // 2]
-        baseline = self.manager.baseline_scores["source1"]
-        self.assertAlmostEqual(baseline, expected, places=6)
-        self.assertNotAlmostEqual(baseline, 50.0, places=3)
-        self.assertAlmostEqual(
-            pool["http://untried:80"]["score"], expected, places=6
+        self.assertEqual(self.manager._baseline_score("source1"), 5.0)
+        self.assertEqual(
+            self.manager._compute_baseline_score(list(pool.items())), 5.0
         )
+        self.assertEqual(pool["http://untried:80"]["score"], 5.0)
 
     def test_a_measured_mid_quality_proxy_outranks_an_untried_one(self):
         """
@@ -2543,7 +2584,7 @@ class TestIssue17DynamicBaseline(ProxyManagerTestBase):
 
         self._sync_with(pool)
 
-        self.assertGreater(pool[mid]["score"], self.manager.baseline_scores["source1"])
+        self.assertGreater(pool[mid]["score"], self.manager._baseline_score("source1"))
         self.assertGreater(pool[mid]["score"], pool[untried]["score"])
         top_tier = self.manager.available_proxies["source1"]["top_tier"]
         self.assertLess(top_tier.index(mid), top_tier.index(untried))
@@ -2578,28 +2619,24 @@ class TestIssue17DynamicBaseline(ProxyManagerTestBase):
 
         self._sync_with(pool)
 
-        self.assertEqual(self.manager.baseline_scores["source1"], 50.0)
+        self.assertEqual(self.manager._baseline_score("source1"), 5.0)
         for stat in pool.values():
-            self.assertEqual(stat["score"], 50.0)
+            self.assertEqual(stat["score"], 5.0)
 
     def test_baseline_survives_an_empty_pool(self):
         self._sync_with({}, live=set())
 
-        self.assertEqual(self.manager.baseline_scores["source1"], 50.0)
-        self.assertEqual(self.manager._baseline_score("source1"), 50.0)
-        self.assertEqual(self.manager._baseline_score(), 50.0)
-        self.assertEqual(self.manager._baseline_score("no-such-source"), 50.0)
+        self.assertEqual(self.manager._baseline_score("source1"), 5.0)
+        self.assertEqual(self.manager._baseline_score(), 5.0)
+        self.assertEqual(self.manager._baseline_score("no-such-source"), 5.0)
 
     def test_baseline_with_a_uniform_pool_is_that_uniform_score(self):
         pool = {f"http://m{i}:80": self._measured_stat(5, 5) for i in range(4)}
 
         self._sync_with(pool)
 
-        scores = {round(stat["score"], 6) for stat in pool.values()}
-        self.assertEqual(len(scores), 1)
-        self.assertAlmostEqual(
-            self.manager.baseline_scores["source1"], scores.pop(), places=6
-        )
+        self.assertEqual(self.manager._baseline_score("source1"), 5.0)
+        self.assertGreater(next(iter(pool.values()))["score"], 5.0)
 
     def test_dead_proxies_do_not_vote_on_the_baseline(self):
         """
@@ -2615,21 +2652,26 @@ class TestIssue17DynamicBaseline(ProxyManagerTestBase):
 
         self._sync_with(pool, live={live})
 
-        self.assertAlmostEqual(
-            self.manager.baseline_scores["source1"], pool[live]["score"], places=6
-        )
+        self.assertEqual(self.manager._baseline_score("source1"), 5.0)
+        self.assertGreater(pool[live]["score"], 5.0)
 
     def test_latency_component_discriminates_across_real_latencies(self):
-        """
-        Calibrated at 15000/60000ms, the latency component discriminates across
-        real free-proxy target response latencies.
-        """
-        scores = [
-            self.manager._calculate_elo_score(self.make_stat([(True, lat)] * 20))
-            for lat in (15000, 25000, 40000, 55000)
-        ]
-        self.assertEqual(scores, sorted(scores, reverse=True))
-        self.assertGreater(scores[0] - scores[-1], 10)
+        """Equal reliability is ordered by diagnostic latency only as a tie-break."""
+        now = time.time()
+        urls = [f"http://p{i}:80" for i in range(4)]
+        pool = {}
+        for url, latency in zip(urls, (15000, 25000, 40000, 55000)):
+            pool[url] = self.manager._get_new_proxy_stat() | {
+                "score": 60.0,
+                "quality_slow": 0.6,
+                "quality_fast": 0.6,
+                "quality_updated_ts": now,
+                "recent_results": [[now, True, latency]] * 3,
+                "avg_latency_ms": latency,
+            }
+        with patch("src.core.proxy_manager.time.time", return_value=now):
+            self._sync_with(pool)
+        self.assertEqual(self.manager.available_proxies["source1"]["top_tier"], urls)
 
 
 class TestIssue17ReputationPersistence(ProxyManagerTestBase):
@@ -2753,7 +2795,7 @@ class TestIssue17ReputationPersistence(ProxyManagerTestBase):
         restored = self.manager.source_stats["source1"][punished]
         self.assertEqual(restored["failure_count"], 40)
         self.assertEqual(restored["success_count"], 2)
-        self.assertLess(restored["score"], self.manager.baseline_scores["source1"])
+        self.assertLess(restored["score"], self.manager._baseline_score("source1"))
 
     def test_history_is_only_queried_when_something_needs_seeding(self):
         known = "http://known:80"
@@ -2776,7 +2818,7 @@ class TestIssue17ReputationPersistence(ProxyManagerTestBase):
 
         self.assertIn(newcomer, self.manager.source_stats["source1"])
         self.assertEqual(
-            self.manager.source_stats["source1"][newcomer]["score"], 50.0
+            self.manager.source_stats["source1"][newcomer]["score"], 5.0
         )
 
     def test_seeded_history_decays_toward_the_baseline_with_age(self):
@@ -2798,112 +2840,68 @@ class TestIssue17ReputationPersistence(ProxyManagerTestBase):
         )
 
         self.assertLess(fresh["score"], stale["score"])
-        self.assertLess(stale["score"], 50.0)
-        self.assertAlmostEqual(stale["score"], 50.0, delta=1.0)
+        self.assertLess(stale["score"], 5.0)
+        self.assertAlmostEqual(stale["score"], 5.0, delta=0.1)
 
 
-class TestIssue21AdaptiveScoringAndSoftmax(ProxyManagerTestBase):
-    """
-    Issue #21: Restore adaptive feedback scoring, introduce sudden breakdown
-    circuit breaker, and switch default selection to Softmax.
-    """
+class TestIssue23OnlineReliability(ProxyManagerTestBase):
+    """Issue #23 scoring regressions supersede issue #21 calibration."""
 
     def test_scoring_ladder_40pct_beats_untried_beats_two_consecutive_failures(self):
-        """
-        Scoring ladder constraint:
-        score(40% success rate) >> score(untried baseline) >> score(2 consecutive failures).
-        The baseline is derived through a realistic pool distribution with broken/failing proxies,
-        verifying that elo_baseline_floor prevents inversion under production-like conditions.
-        """
-        # Populate pool with a realistic distribution of active measured proxies:
-        # 1 high performer, 2 mediocre, and 10 failing/broken proxies (where raw median < 3.0)
         now = time.time()
-        measured = []
-        for i in range(10):
-            url = f"http://failing-proxy-{i}:8080"
+
+        def replay(outcomes):
             stat = self.manager._get_new_proxy_stat("source1")
-            stat["recent_results"] = [[now - j, False, None] for j in range(15)]
-            stat["score"] = self.manager._calculate_elo_score(stat, "source1")
-            self.manager.active_proxies.add(url)
-            self.manager.source_stats["source1"][url] = stat
-            measured.append((url, stat))
+            for outcome in outcomes:
+                self.manager._update_reliability_state(stat, outcome, now)
+            return stat["score"]
 
-        # Add 2 mid-tier proxies
-        for i in range(2):
-            url = f"http://mid-proxy-{i}:8080"
-            stat = self.manager._get_new_proxy_stat("source1")
-            stat["recent_results"] = [
-                [now - j, (j % 3 == 0), 20000 if (j % 3 == 0) else None]
-                for j in range(15)
-            ]
-            stat["score"] = self.manager._calculate_elo_score(stat, "source1")
-            self.manager.active_proxies.add(url)
-            self.manager.source_stats["source1"][url] = stat
-            measured.append((url, stat))
-
-        # Derive baseline dynamically through pool sync logic
-        derived_baseline = self.manager._compute_baseline_score(measured)
-        self.manager.baseline_scores["source1"] = derived_baseline
-
-        untried_stat = self.manager._get_new_proxy_stat("source1")
-        score_untried = self.manager._calculate_elo_score(untried_stat, "source1")
-
-        # 40% success rate: 20 successes at 20000ms, 30 failures (interleaved)
-        results_40 = ([(True, 20000), (False, None), (False, None)] * 10) + (
-            [(True, 20000), (False, None)] * 10
-        )
-        stat_40 = self.make_stat(results_40)
-        score_40 = self.manager._calculate_elo_score(stat_40, "source1")
-
-        # 2 consecutive failures
-        results_2_fail = [(False, None)] * 2
-        stat_2_fail = self.make_stat(results_2_fail)
-        score_2_fail = self.manager._calculate_elo_score(stat_2_fail, "source1")
+        score_untried = replay([])
+        score_failure = replay([False])
+        score_2_fail = replay([False, False])
+        score_40 = replay([False, True, False, True, False] * 20)
 
         print(
-            f"\n[Scoring Ladder (Realistic Derived Baseline)] 40% success: {score_40:.2f}, "
-            f"untried baseline: {score_untried:.2f} (derived: {derived_baseline:.2f}), "
-            f"2 consecutive failures: {score_2_fail:.2f}"
+            f"\n[Online reliability ladder] 40% stable: {score_40:.4f}, "
+            f"untried: {score_untried:.4f}, F: {score_failure:.4f}, "
+            f"FF: {score_2_fail:.4f}"
         )
 
         self.assertGreater(score_40, score_untried)
-        self.assertGreater(score_untried, score_2_fail)
-        self.assertGreaterEqual(score_40, 30.0)
-        self.assertAlmostEqual(score_untried, derived_baseline, places=2)
-        self.assertLessEqual(score_2_fail, score_untried * 0.51)
+        self.assertGreater(score_untried, score_failure)
+        self.assertGreater(score_failure, score_2_fail)
+        self.assertAlmostEqual(score_untried, 5.0, places=6)
+        self.assertAlmostEqual(score_failure, 3.5, places=6)
+        self.assertAlmostEqual(score_2_fail, 2.45, places=6)
 
-    def test_recency_circuit_breaker_plunges_score_below_untried_baseline(self):
-        """
-        Recency Circuit Breaker:
-        A top performer with 40 successes (15s latency) that experiences 10 consecutive
-        failures is dynamically capped below the untried baseline (score < baseline).
-        """
-        self.manager.baseline_scores["source1"] = 10.0
-        untried_score = self.manager._baseline_score("source1")
+        all_failures = [False] * 6
+        base = replay(all_failures)
+        for index in range(len(all_failures)):
+            changed = list(all_failures)
+            changed[index] = True
+            with self.subTest(changed_index=index):
+                self.assertGreater(replay(changed), base)
 
+    def test_deterioration_thresholds_are_strictly_monotonic(self):
         now = time.time()
-        # Top-tier veteran proxy: 40 consecutive successes at 15000ms latency
-        stat = self.manager._get_new_proxy_stat("source1")
-        for i in range(40):
-            stat["recent_results"].append([now - 50 + i, True, 15000])
-
-        score_before = self.manager._calculate_elo_score(stat, "source1")
-
-        # Sudden outage: 10 consecutive failures at tail of window
-        for i in range(10):
-            stat["recent_results"].append([now - 10 + i, False, None])
-
-        score_after = self.manager._calculate_elo_score(stat, "source1")
-
-        print(
-            f"\n[Circuit Breaker (40-win Veteran Outage)] score_before: {score_before:.2f}, "
-            f"score_after: {score_after:.2f}, "
-            f"untried baseline: {untried_score:.2f}"
-        )
-
-        self.assertGreater(score_before, 70.0)
-        self.assertLess(score_after, untried_score)
-        self.assertLessEqual(score_after, untried_score - 1.0)
+        for initial, failures in ((0.40, 6), (0.60, 7), (0.80, 8)):
+            stat = self.manager._get_new_proxy_stat("source1") | {
+                "quality_slow": initial,
+                "quality_fast": initial,
+                "quality_updated_ts": now,
+                "score": initial * 100,
+            }
+            sequence = []
+            for _ in range(failures):
+                previous = stat["score"]
+                self.manager._update_reliability_state(stat, False, now)
+                sequence.append(stat["score"])
+                self.assertLess(stat["score"], previous)
+            print(f"\n[Deterioration {initial:.0%}] {sequence}")
+            self.assertLess(stat["score"], 5.0)
+            before_success = stat["score"]
+            self.manager._update_reliability_state(stat, True, now)
+            self.assertGreater(stat["score"], before_success)
 
     def test_historical_all_failure_record_does_not_bypass_baseline(self):
         """
@@ -2911,7 +2909,6 @@ class TestIssue21AdaptiveScoringAndSoftmax(ProxyManagerTestBase):
         historical record (e.g. 0 successes, 10 failures) must not receive a 10.0 floor
         and must score strictly below the baseline.
         """
-        self.manager.baseline_scores["source1"] = 10.0
         stat = self.manager._get_new_proxy_stat("source1")
         stat.update({
             "success_count": 0,
@@ -2921,9 +2918,41 @@ class TestIssue21AdaptiveScoringAndSoftmax(ProxyManagerTestBase):
         })
 
         score = self.manager._calculate_elo_score(stat, "source1")
-        print(f"\n[Historical All-Failure Counter] score: {score:.2f} vs baseline: 10.0")
+        print(f"\n[Historical all-failure counter] score: {score:.2f} vs prior: 5.0")
         self.assertLess(score, 5.0)
         self.assertLess(score, self.manager._baseline_score("source1"))
+
+    def test_stale_estimator_state_converges_toward_fixed_prior(self):
+        now = time.time()
+        old = now - 12 * 24 * 3600
+        stat = self.manager._get_new_proxy_stat("source1") | {
+            "score": 80.0,
+            "quality_slow": 0.8,
+            "quality_fast": 0.8,
+            "quality_updated_ts": old,
+        }
+
+        with patch("src.core.proxy_manager.time.time", return_value=now):
+            stale_score = self.manager._calculate_elo_score(stat, "source1")
+
+        self.assertGreater(stale_score, 5.0)
+        self.assertAlmostEqual(stale_score, 5.0, delta=0.1)
+
+    def test_feedback_reputation_remains_source_isolated(self):
+        proxy = "http://shared:80"
+        self.manager.source_stats["source1"][proxy] = (
+            self.manager._get_new_proxy_stat("source1")
+        )
+        self.manager.source_stats["source2"][proxy] = (
+            self.manager._get_new_proxy_stat("source2")
+        )
+
+        self.manager.process_feedback("source1", proxy, 500)
+
+        self.assertAlmostEqual(
+            self.manager.source_stats["source1"][proxy]["score"], 3.5, places=6
+        )
+        self.assertEqual(self.manager.source_stats["source2"][proxy]["score"], 5.0)
 
     def test_config_drift_check_returns_clean_for_shipped_config(self):
         """
@@ -2938,7 +2967,7 @@ class TestIssue21AdaptiveScoringAndSoftmax(ProxyManagerTestBase):
         self.assertEqual(drift["unknown"], [])
         self.assertTrue(drift["checked"])
 
-    def test_default_config_values_align_with_issue_21(self):
+    def test_default_config_values_align_with_issue_23(self):
         """
         Verify default selection strategy and scoring configuration fallbacks.
         """
@@ -2946,15 +2975,636 @@ class TestIssue21AdaptiveScoringAndSoftmax(ProxyManagerTestBase):
         example_manager = ProxyManager(CONFIG_EXAMPLE_PATH)
         self.assertEqual(example_manager.selection_strategy, "softmax")
         self.assertEqual(example_manager.softmax_temperature, 14.0)
-        self.assertEqual(example_manager.exploration_ratio, 0.15)
-        self.assertEqual(example_manager.latency_full_score_ms, 15000)
-        self.assertEqual(example_manager.latency_zero_score_ms, 60000)
-        self.assertEqual(example_manager.elo_prior_successes, 0.25)
-        self.assertEqual(example_manager.elo_prior_failures, 0.75)
-        self.assertEqual(example_manager.elo_new_proxy_consistency_bonus, 0.0)
-        self.assertEqual(example_manager.elo_circuit_breaker_multiplier, 0.15)
+        self.assertEqual(example_manager.reliability_prior, 0.05)
+        self.assertEqual(example_manager.reliability_slow_alpha, 0.12)
+        self.assertEqual(example_manager.reliability_fast_alpha, 0.30)
+        self.assertEqual(example_manager.exploration_min_ratio, 0.05)
+        self.assertEqual(example_manager.exploration_max_ratio, 0.30)
+        self.assertEqual(example_manager.exploration_target_qualified, 50)
+
+
+class TestIssue23AdaptiveExplorationAndProbation(ProxyManagerTestBase):
+    def _qualified_stat(self, score=60.0):
+        now = time.time()
+        probability = score / 100
+        return self.manager._get_new_proxy_stat("source1") | {
+            "score": score,
+            "quality_slow": probability,
+            "quality_fast": probability,
+            "quality_updated_ts": now,
+            "recent_results": [[now, True, None]] * 3,
+            "success_count": 3,
+            "completed_feedback_count": 3,
+            "trial_handout_count": 3,
+        }
+
+    def test_adaptive_exploration_ratio_hits_max_midpoint_and_min(self):
+        self.manager.exploration_target_qualified = 50
+
+        self.assertEqual(self.manager._compute_exploration_ratio("source1"), 0.30)
+
+        for index in range(25):
+            url = f"http://qualified-mid-{index}:80"
+            self.manager.source_stats["source1"][url] = self._qualified_stat()
+            self.manager.active_proxies.add(url)
+        self.assertAlmostEqual(
+            self.manager._compute_exploration_ratio("source1"), 0.175, places=6
+        )
+
+        for index in range(25, 55):
+            url = f"http://qualified-full-{index}:80"
+            self.manager.source_stats["source1"][url] = self._qualified_stat()
+            self.manager.active_proxies.add(url)
+        self.assertAlmostEqual(
+            self.manager._compute_exploration_ratio("source1"), 0.05, places=9
+        )
+
+    def test_one_total_budget_covers_all_exploration_groups_and_top_unknowns(self):
+        now = time.time()
+        qualified = "http://qualified:80"
+        discovery = "http://discovery:80"
+        probation = "http://probation:80"
+        retry = "http://retry:80"
+        self.manager.exploration_target_qualified = 100
+        self.manager.source_stats["source1"] = {
+            qualified: self._qualified_stat(),
+            discovery: self.manager._get_new_proxy_stat("source1"),
+            probation: self.manager._get_new_proxy_stat("source1")
+            | {
+                "score": 3.5,
+                "quality_slow": 0.044,
+                "quality_fast": 0.035,
+                "quality_updated_ts": now,
+                "recent_results": [[now, False, None]],
+                "trial_handout_count": 1,
+            },
+            retry: self.manager._get_new_proxy_stat("source1")
+            | {
+                "score": 1.715,
+                "quality_slow": 0.034,
+                "quality_fast": 0.01715,
+                "quality_updated_ts": now,
+                "recent_results": [[now, False, None]] * 3,
+                "trial_handout_count": 3,
+                "retry_after_ts": 0.0,
+            },
+        }
+        self.manager.active_proxies = set(self.manager.source_stats["source1"])
+        # The unqualified probation proxy deliberately coexists in top_tier;
+        # it still cannot leak into exploitation outside the one budget.
+        self.manager.available_proxies["source1"] = {
+            "top_tier": [qualified, probation],
+            "bottom_tier": [],
+        }
+        ratio = self.manager._compute_exploration_ratio("source1")
+        rolls = [(index + 0.5) / 100 for index in range(100)]
+        with (
+            patch("src.core.proxy_manager.random.random", side_effect=rolls),
+            patch.object(
+                self.manager,
+                "_select_exploration_candidate",
+                return_value="exploration",
+            ),
+            patch.object(self.manager, "_mark_proxy_handed_out"),
+        ):
+            picks = [self.manager.get_proxy("source1") for _ in range(100)]
+
+        exploration_count = picks.count("exploration")
+        print(
+            f"\n[Exploration budget] ratio={ratio:.4f}, "
+            f"exploration={exploration_count}/100"
+        )
+        self.assertEqual(exploration_count, 30)
+        self.assertEqual(set(picks) - {"exploration"}, {qualified})
+        self.assertLessEqual(exploration_count / 100, ratio + 0.01)
+
+    def test_discovery_gets_two_thirds_of_exploration_when_both_sides_exist(self):
+        groups = {
+            "discovery": ["discovery"],
+            "probation": ["probation"],
+            "retry": ["retry"],
+        }
+        with (
+            patch("src.core.proxy_manager.random.random", return_value=0.65),
+            patch("src.core.proxy_manager.random.choice", side_effect=lambda seq: seq[0]),
+        ):
+            self.assertEqual(
+                self.manager._select_exploration_candidate(groups), "discovery"
+            )
+        with (
+            patch("src.core.proxy_manager.random.random", return_value=0.70),
+            patch("src.core.proxy_manager.random.choice", side_effect=lambda seq: seq[0]),
+        ):
+            self.assertEqual(
+                self.manager._select_exploration_candidate(groups), "probation"
+            )
+
+    def test_three_probation_attempts_then_two_delayed_retries(self):
+        proxy = "http://probation:80"
+        self.manager.active_proxies = {proxy}
+        self.manager.source_stats["source1"] = {
+            proxy: self.manager._get_new_proxy_stat("source1")
+        }
+        self.manager.available_proxies["source1"] = {
+            "top_tier": [proxy],
+            "bottom_tier": [],
+        }
+
+        scores = []
+        for _ in range(3):
+            self.assertEqual(self.manager.get_proxy("source1"), proxy)
+            self.manager.process_feedback("source1", proxy, 500)
+            scores.append(self.manager.source_stats["source1"][proxy]["score"])
+
+        self.assertAlmostEqual(scores[0], 3.5, places=6)
+        self.assertGreater(scores[0], scores[1])
+        self.assertGreater(scores[1], scores[2])
+        self.assertIsNone(self.manager.get_proxy("source1"))
+
+        for _ in range(2):
+            stat = self.manager.source_stats["source1"][proxy]
+            stat["retry_after_ts"] = time.time() - 1
+            self.assertEqual(self.manager.get_proxy("source1"), proxy)
+            self.manager.process_feedback("source1", proxy, 500)
+
+        stat = self.manager.source_stats["source1"][proxy]
+        stat["retry_after_ts"] = time.time() - 1
+        self.assertEqual(stat["trial_handout_count"], 5)
+        self.assertIsNone(self.manager.get_proxy("source1"))
+
+    def test_inflight_blocks_concurrent_handout_and_timeout_recovers(self):
+        proxy = "http://single:80"
+        self.manager.active_proxies = {proxy}
+        self.manager.source_stats["source1"] = {
+            proxy: self.manager._get_new_proxy_stat("source1")
+        }
+        self.manager.available_proxies["source1"] = {
+            "top_tier": [],
+            "bottom_tier": [],
+        }
+
+        self.assertEqual(self.manager.get_proxy("source1"), proxy)
+        self.assertIsNone(self.manager.get_proxy("source1"))
+        self.manager.source_stats["source1"][proxy]["outstanding_until"] = (
+            time.time() - 1
+        )
+        self.assertEqual(self.manager.get_proxy("source1"), proxy)
+
+    def test_time_forgiveness_opens_a_new_trial_epoch_without_erasing_history(self):
+        proxy = "http://forgiven:80"
+        old = time.time() - 49 * 3600
+        stat = self.manager._get_new_proxy_stat("source1") | {
+            "score": 1.0,
+            "quality_slow": 0.01,
+            "quality_fast": 0.01,
+            "quality_updated_ts": old,
+            "success_count": 0,
+            "failure_count": 5,
+            "completed_feedback_count": 5,
+            "recent_results": [[old, False, None]] * 5,
+            "handout_count": 5,
+            "trial_handout_count": 5,
+            "last_feedback_ts": old,
+            "last_handed_out_ts": old,
+            "retry_after_ts": time.time() + 9999,
+        }
+        self.manager.source_stats["source1"] = {proxy: stat}
+        self.manager.active_proxies = {proxy}
+        self.manager.probation_forgiveness_hours = 48
+
+        groups = self.manager._exploration_candidate_groups("source1")
+
+        self.assertIn(proxy, groups["discovery"])
+        self.assertEqual(stat["trial_handout_count"], 0)
+        self.assertEqual(stat["failure_count"], 5)
+
+
+class TestIssue23PersistenceAndRuntimeModes(ProxyManagerTestBase):
+    def test_scoring_version_mismatch_replays_results_in_timestamp_order(self):
+        backup_path = Path(self.tmp_dir) / "mismatch.json"
+        now = time.time()
+        backup_path.write_text(
+            json.dumps(
+                {
+                    "scoring_version": 1,
+                    "timestamp": "fixture",
+                    "source_stats": {
+                        "source1": {
+                            "http://replay:80": {
+                                "score": 99.0,
+                                "quality_slow": 0.99,
+                                "quality_fast": 0.99,
+                                "quality_updated_ts": now,
+                                "success_count": 1,
+                                "failure_count": 1,
+                                "recent_results": [
+                                    [now, False, None],
+                                    [now - 1, True, None],
+                                ],
+                            }
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.manager.stats_backup_path = backup_path
+
+        with patch("src.core.proxy_manager.time.time", return_value=now):
+            result = self.manager.restore_stats()
+
+        restored = self.manager.source_stats["source1"]["http://replay:80"]
+        expected = self.manager._get_new_proxy_stat("source1")
+        self.manager._update_reliability_state(expected, True, now - 1)
+        self.manager._update_reliability_state(expected, False, now)
+        self.assertEqual(result["status"], "success")
+        self.assertAlmostEqual(restored["score"], expected["score"], places=9)
+        self.assertNotEqual(restored["score"], 99.0)
+
+    def test_matching_scoring_version_round_trips_derived_state(self):
+        backup_path = Path(self.tmp_dir) / "matching.json"
+        now = time.time()
+        backup_path.write_text(
+            json.dumps(
+                {
+                    "scoring_version": SCORING_VERSION,
+                    "timestamp": "fixture",
+                    "source_stats": {
+                        "source1": {
+                            "http://matching:80": {
+                                "score": 42.0,
+                                "quality_slow": 0.42,
+                                "quality_fast": 0.55,
+                                "quality_updated_ts": now,
+                                "success_count": 4,
+                                "failure_count": 2,
+                                "recent_results": [],
+                            }
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.manager.stats_backup_path = backup_path
+        with patch("src.core.proxy_manager.time.time", return_value=now):
+            self.manager.restore_stats()
+        restored = self.manager.source_stats["source1"]["http://matching:80"]
+        self.assertEqual(restored["quality_slow"], 0.42)
+        self.assertEqual(restored["quality_fast"], 0.55)
+        self.assertEqual(restored["score"], 42.0)
+
+    def test_failed_durable_write_remains_queued_until_retry_succeeds(self):
+        proxy = "http://1.2.3.4:8080"
+        self.manager.source_stats["source1"][proxy] = (
+            self.manager._get_new_proxy_stat("source1")
+        )
+        self.manager.process_feedback("source1", proxy, 500)
+        self.mock_db_instance.upsert_proxy_feedback_history.return_value = False
+
+        self.manager._persist_feedback_history()
+        self.assertEqual(self.manager.pending_feedback_persist, {proxy})
+
+        self.mock_db_instance.upsert_proxy_feedback_history.return_value = True
+        self.manager._persist_feedback_history()
+        self.assertEqual(self.manager.pending_feedback_persist, set())
+        self.assertEqual(
+            self.mock_db_instance.upsert_proxy_feedback_history.call_count, 2
+        )
+
+    def test_absolute_counter_sql_is_monotonic_and_non_incremental(self):
+        db = object.__new__(DatabaseManager)
+        db.pool = MagicMock()
+        connection = MagicMock()
+        db.pool.getconn.return_value = connection
+        rows = [("http", "1.2.3.4", 8080, 7, 3, time.time())]
+
+        with patch("src.database.db.psycopg2.extras.execute_values") as execute:
+            self.assertTrue(db.upsert_proxy_feedback_history(rows))
+            self.assertTrue(db.upsert_proxy_feedback_history(rows))
+
+        self.assertEqual(execute.call_count, 2)
+        first_query = execute.call_args_list[0].args[1]
+        first_values = execute.call_args_list[0].args[2]
+        second_values = execute.call_args_list[1].args[2]
+        self.assertIn("GREATEST", first_query)
+        self.assertNotIn("feedback_success_count +", first_query)
+        self.assertNotIn("feedback_failure_count +", first_query)
+        self.assertEqual(first_values, second_values)
+        self.assertEqual(first_values[0][3:5], (7, 3))
+
+    def _mode_manager(self, mode):
+        normal_path = Path(self.tmp_dir) / f"{mode}.normal.json"
+        merged = {section: dict(values) for section, values in self.config_dict.items()}
+        merged["backup"] = {
+            "stats_backup_enabled": "true",
+            "stats_backup_path": str(normal_path),
+        }
+        config_path = write_config_file(
+            self.tmp_dir, merged, name=f"{mode}.ini"
+        )
+        return ProxyManager(config_path, restore_mode=mode), normal_path
+
+    def test_no_restore_skips_json_only_and_writes_isolated_state(self):
+        manager, normal_path = self._mode_manager("no-restore")
+        normal_path.write_text("normal-state", encoding="utf-8")
+        proxy = "http://db-history:80"
+        history = {
+            proxy: {
+                "success_count": 3,
+                "failure_count": 1,
+                "last_feedback_ts": time.time(),
+            }
+        }
+        manager.db.reset_mock()
+        manager.db.get_active_feedback_history.return_value = history
+
+        with patch("src.core.proxy_manager.logger.info") as mode_log:
+            result = manager.restore_stats()
+        hydrated = manager._load_feedback_history_for({proxy})
+        manager.source_stats["source1"][proxy] = manager._get_new_proxy_stat(
+            "source1", history[proxy]
+        )
+        backup = manager.backup_stats()
+
+        self.assertEqual(result["status"], "skipped")
+        self.assertTrue(
+            any("Restore mode" in str(call.args[0]) for call in mode_log.call_args_list)
+        )
+        self.assertEqual(hydrated, history)
+        manager.db.get_active_feedback_history.assert_called_once()
+        self.assertEqual(normal_path.read_text(encoding="utf-8"), "normal-state")
+        self.assertEqual(backup["status"], "success")
+        self.assertTrue(manager.stats_backup_path.exists())
+        self.assertNotEqual(manager.stats_backup_path, normal_path)
+
+    def test_fresh_scoring_skips_db_reputation_and_keeps_aggregate_feedback(self):
+        manager, normal_path = self._mode_manager("fresh-scoring")
+        normal_path.write_text("normal-state", encoding="utf-8")
+        proxy = "http://fresh:80"
+        manager.db.reset_mock()
+        manager.source_stats["source1"][proxy] = manager._get_new_proxy_stat(
+            "source1"
+        )
+
+        with patch("src.core.proxy_manager.logger.info") as mode_log:
+            self.assertEqual(manager.restore_stats()["status"], "skipped")
+        self.assertTrue(
+            any("Restore mode" in str(call.args[0]) for call in mode_log.call_args_list)
+        )
+        self.assertEqual(manager._load_feedback_history_for({proxy}), {})
+        manager.process_feedback("source1", proxy, 200)
+        manager._persist_feedback_history()
+        backup = manager.backup_stats()
+
+        manager.db.get_active_feedback_history.assert_not_called()
+        manager.db.upsert_proxy_feedback_history.assert_not_called()
+        self.assertEqual(manager.pending_feedback_persist, set())
+        self.assertTrue(manager.feedback_buffer)
+        self.assertEqual(normal_path.read_text(encoding="utf-8"), "normal-state")
+        self.assertEqual(backup["status"], "success")
+        self.assertIn("fresh-scoring", manager.stats_backup_path.name)
+
+    def test_load_proxy_manager_threads_restore_mode(self):
+        from src.main import load_proxy_manager
+
+        fake = MagicMock()
+        fake.active_proxies = {"http://active:80"}
+        with patch("src.main.ProxyManager", return_value=fake) as manager_class:
+            result = load_proxy_manager("config.ini", restore_mode="fresh-scoring")
+
+        self.assertIs(result, fake)
+        manager_class.assert_called_once_with(
+            "config.ini", restore_mode="fresh-scoring"
+        )
+        fake.restore_stats.assert_called_once()
+        fake._sync_and_select_top_proxies.assert_called_once()
+
+
+class TestIssue23OutageGuard(ProxyManagerTestBase):
+    def setUp(self):
+        super().setUp()
+        self.manager.outage_window_size = 4
+        self.manager.outage_min_distinct_proxies = 4
+        self.manager.outage_healthy_success_ratio = 0.50
+        self.manager.outage_failure_ratio = 0.75
+        self.manager.outage_recovery_success_ratio = 0.50
+        now = time.time()
+        self.urls = [f"http://outage-{index}:80" for index in range(4)]
+        self.manager.active_proxies = set(self.urls)
+        self.manager.source_stats["source1"] = {
+            url: self.manager._get_new_proxy_stat("source1")
+            | {
+                "score": 80.0,
+                "quality_slow": 0.8,
+                "quality_fast": 0.8,
+                "quality_updated_ts": now,
+                "success_count": 3,
+                "recent_results": [[now, True, None]] * 3,
+                "trial_handout_count": 3,
+            }
+            for url in self.urls
+        }
+
+    def test_broad_outage_rolls_back_window_pauses_then_recovers(self):
+        for url in self.urls:
+            self.manager.process_feedback("source1", url, 200)
+        healthy_scores = {
+            url: self.manager.source_stats["source1"][url]["score"]
+            for url in self.urls
+        }
+        self.assertTrue(
+            self.manager._outage_state("source1")["previous_window_healthy"]
+        )
+        self.manager._persist_feedback_history()
+        self.mock_db_instance.upsert_proxy_feedback_history.reset_mock()
+
+        self.manager.process_feedback("source1", self.urls[0], 500)
+        self.manager._persist_feedback_history()
+        self.mock_db_instance.upsert_proxy_feedback_history.assert_not_called()
+        self.assertIn(self.urls[0], self.manager.pending_feedback_persist)
+        candidate_backup = Path(self.tmp_dir) / "outage-candidate.json"
+        self.manager.stats_backup_path = candidate_backup
+        self.assertEqual(self.manager.backup_stats()["status"], "success")
+        backed_up = json.loads(candidate_backup.read_text(encoding="utf-8"))
+        backed_up_stat = backed_up["source_stats"]["source1"][self.urls[0]]
+        self.assertEqual(backed_up_stat["failure_count"], 0)
+        self.assertEqual(backed_up_stat["score"], healthy_scores[self.urls[0]])
+
+        with patch("src.core.proxy_manager.logger.error") as outage_log:
+            for url in self.urls[1:]:
+                self.manager.process_feedback("source1", url, 500)
+        self.assertTrue(
+            any("activated" in str(call.args[0]) for call in outage_log.call_args_list)
+        )
+
+        state = self.manager._outage_state("source1")
+        self.assertTrue(state["active"])
+        self.assertEqual(
+            {
+                url: self.manager.source_stats["source1"][url]["score"]
+                for url in self.urls
+            },
+            healthy_scores,
+        )
+        self.manager._persist_feedback_history()
+        durable_rows = (
+            self.mock_db_instance.upsert_proxy_feedback_history.call_args.args[0]
+        )
+        self.assertEqual({row[4] for row in durable_rows}, {0})
+        current_minute = datetime.now().replace(second=0, microsecond=0)
+        aggregate = self.manager.feedback_buffer[current_minute]["source1"]
+        self.assertEqual((aggregate["success"], aggregate["failure"]), (4, 4))
+
+        for url in self.urls:
+            self.manager.process_feedback("source1", url, 200)
+        self.assertFalse(self.manager._outage_state("source1")["active"])
+        self.assertEqual(
+            {
+                url: self.manager.source_stats["source1"][url]["score"]
+                for url in self.urls
+            },
+            healthy_scores,
+        )
+
+        before = self.manager.source_stats["source1"][self.urls[0]]["score"]
+        self.manager.process_feedback("source1", self.urls[0], 200)
+        self.assertGreater(
+            self.manager.source_stats["source1"][self.urls[0]]["score"], before
+        )
+
+    def test_uniformly_poor_cold_start_never_arms_guard(self):
+        for _ in range(2):
+            for url in self.urls:
+                self.manager.process_feedback("source1", url, 500)
+        state = self.manager._outage_state("source1")
+        self.assertFalse(state["active"])
+        self.assertFalse(state["previous_window_healthy"])
+
+    def test_metrics_expose_outage_state_and_paused_count(self):
+        self.manager.outage_states["source1"] = {
+            "active": True,
+            "paused_updates": 7,
+        }
+        response = create_app(self.manager).test_client().get(
+            "/metrics", environ_base={"REMOTE_ADDR": "127.0.0.1"}
+        )
+        body = response.get_data(as_text=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(
+            'smartproxy_source_outage_guard_active{source="source1"} 1', body
+        )
+        self.assertIn(
+            'smartproxy_source_outage_guard_paused_updates_total{source="source1"} 7',
+            body,
+        )
+
+
+class TestIssue23LauncherAndReplay(ProxyManagerTestBase):
+    def _run_launcher(self, command, flags):
+        project = Path(self.tmp_dir) / f"launcher-{command}"
+        (project / "scripts").mkdir(parents=True)
+        (project / ".venv" / "bin").mkdir(parents=True)
+        shutil.copy2("scripts/start_proxy.sh", project / "scripts" / "start_proxy.sh")
+        capture = project / "argv.txt"
+        fake_python = project / ".venv" / "bin" / "python"
+        fake_python.write_text(
+            "#!/bin/bash\nprintf '%s\\n' \"$@\" > \"$CAPTURE_FILE\"\nsleep 10\n",
+            encoding="utf-8",
+        )
+        fake_python.chmod(0o755)
+        env = os.environ.copy()
+        env["CAPTURE_FILE"] = str(capture)
+        try:
+            completed = subprocess.run(
+                [str(project / "scripts" / "start_proxy.sh"), command, *flags],
+                cwd=project,
+                env=env,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            return capture.read_text(encoding="utf-8").splitlines()
+        finally:
+            pid_path = project / ".smart_proxy.pid"
+            if pid_path.exists():
+                try:
+                    os.kill(int(pid_path.read_text().strip()), signal.SIGTERM)
+                except (ProcessLookupError, ValueError):
+                    pass
+
+    def test_launcher_forwards_flags_for_start_and_restart(self):
+        start_args = self._run_launcher("start", ["--debug", "--no-restore"])
+        restart_args = self._run_launcher("restart", ["--fresh-scoring"])
+
+        self.assertEqual(
+            start_args, ["-u", "-m", "src.main", "--debug", "--no-restore"]
+        )
+        self.assertEqual(
+            restart_args, ["-u", "-m", "src.main", "--fresh-scoring"]
+        )
+
+    def test_deterministic_replay_reports_learning_curve_and_bucket_precision(self):
+        fixture = json.loads(
+            Path("tests/fixtures/proxy_learning_replay.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        proxy_names = sorted({proxy for proxy, _ in fixture["events"]})
+        stats = {
+            proxy: self.manager._get_new_proxy_stat("source1")
+            for proxy in proxy_names
+        }
+        buckets = {
+            "initial_failure": [0, 0],
+            "developing": [0, 0],
+            "high": [0, 0],
+        }
+        routed_outcomes = []
+        learning_curve = []
+        now = time.time()
+
+        events = fixture["events"]
+        for offset in range(0, len(events), len(proxy_names)):
+            round_events = events[offset : offset + len(proxy_names)]
+            outcomes = dict(round_events)
+            selected = max(
+                proxy_names,
+                key=lambda proxy: (stats[proxy]["score"], proxy),
+            )
+            routed_outcomes.append(bool(outcomes[selected]))
+
+            for proxy, outcome in round_events:
+                score_before = stats[proxy]["score"]
+                bucket = (
+                    "high"
+                    if score_before >= 30
+                    else "initial_failure"
+                    if score_before <= 5
+                    else "developing"
+                )
+                buckets[bucket][0] += int(outcome)
+                buckets[bucket][1] += 1
+                self.manager._update_reliability_state(stats[proxy], outcome, now)
+
+            learning_curve.append(
+                sum(routed_outcomes) / len(routed_outcomes)
+            )
+
+        rates = {
+            name: successes / total if total else None
+            for name, (successes, total) in buckets.items()
+        }
+        print(
+            f"\n[Deterministic learning curve] {learning_curve}; "
+            f"next-request bucket rates={rates}"
+        )
+        self.assertGreater(learning_curve[-1], learning_curve[0])
+        self.assertGreater(rates["high"], rates["initial_failure"])
+        self.assertGreater(stats["proxy-good"]["score"], stats["proxy-bad"]["score"])
 
 
 if __name__ == "__main__":
     unittest.main()
-

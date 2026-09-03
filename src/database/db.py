@@ -302,7 +302,7 @@ class DatabaseManager:
             }
         return history
 
-    def upsert_proxy_feedback_history(self, rows: List[Tuple]):
+    def upsert_proxy_feedback_history(self, rows: List[Tuple]) -> bool:
         """
         Write absolute feedback totals for a batch of proxies.
 
@@ -315,12 +315,18 @@ class DatabaseManager:
         last_feedback_ts) where the timestamp is Unix seconds or None.
         """
         if not rows:
-            return
+            return True
         query = """
             UPDATE proxies SET
-                feedback_success_count = data.success_count,
-                feedback_failure_count = data.failure_count,
-                feedback_last_ts = data.last_ts
+                feedback_success_count = GREATEST(
+                    proxies.feedback_success_count, data.success_count
+                ),
+                feedback_failure_count = GREATEST(
+                    proxies.feedback_failure_count, data.failure_count
+                ),
+                feedback_last_ts = GREATEST(
+                    proxies.feedback_last_ts, data.last_ts
+                )
             FROM (VALUES %s) AS data(protocol, ip, port, success_count, failure_count, last_ts)
             WHERE proxies.protocol = data.protocol
               AND proxies.ip = data.ip
@@ -353,10 +359,12 @@ class DatabaseManager:
                 )
                 conn.commit()
             logger.debug(f"Persisted feedback history for {len(values)} proxies.")
+            return True
         except psycopg2.Error as e:
             logger.error(f"Failed to persist proxy feedback history: {e}")
             if conn:
                 conn.rollback()
+            return False
         finally:
             if conn:
                 self.pool.putconn(conn)

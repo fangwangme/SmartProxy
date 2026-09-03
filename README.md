@@ -5,8 +5,8 @@ SmartProxy is a sophisticated proxy management system designed to provide reliab
 ## **Core Features**
 
 * **Automated Proxy Fetching**: Gathers proxies from multiple user-defined sources.  
-* **Intelligent Validation & Scoring**: Validation is a liveness gate (`is_active`); ranking is owned entirely by client feedback, which drives a 0-100 ELO-style score over a sliding window.
-* **Feedback-Driven Adaptation**: Success and failure both move the score, with small samples shrunk toward the neutral baseline so a single observation cannot crown or exile a proxy.
+* **Intelligent Validation & Scoring**: Validation is a liveness gate (`is_active`); ranking is owned entirely by client feedback, which drives a 0-100 online reliability score.
+* **Feedback-Driven Adaptation**: Slow and fast estimators learn on every result from a fixed 5% prior; adaptive exploration supplies probation and delayed retry traffic without inflating the score.
 * **Dynamic Configuration Reloading**: A hot-reload endpoint (/reload-sources) re-reads the whole config file - sources, fetcher jobs, and every tunable - authoritatively and transactionally, without restarting the service.
 * **Sustainable Validation Logic**: Employs a time-window-based attempt limit for re-validating failed proxies. This prevents proxy burnout, reduces database load, and ensures long-term service stability.  
 * **Source-Specific Pools**: Maintains separate proxy pools for different sources/use cases.  
@@ -17,13 +17,8 @@ SmartProxy is a sophisticated proxy management system designed to provide reliab
 
 1. **Fetch**: The service periodically fetches proxy lists from various sources defined in config.ini.  
 2. **Validate**: A validation cycle runs regularly. It prioritizes new and previously successful proxies. To avoid overwhelming unreliable proxies, it supplements the validation queue with failed proxies that have not been tested more than a configured number of times within a specific time window (e.g., 5 times in 30 minutes).  
-3. **Score**: Proxies are managed in memory for each source, with an ELO-inspired 0-100 score built from three additive components over a sliding window of recent results:
-   * **Success rate (0-60)** - the weighted success rate, shrunk toward 0.5 by a Beta prior (`elo_prior_successes` / `elo_prior_failures`). This is what keeps one lucky success from outranking a proven proxy: with the defaults and successes at 15000ms, 1 success scores about 52 and 48-of-50 successes about 79, while an untried proxy sits at the live measured pool's median score (falling back to 50 when nothing is measured).
-   * **Latency (0-30)** - a linear ramp between `latency_full_score_ms` and `latency_zero_score_ms`, then **multiplied by the smoothed success rate**. Latency is only ever measured on successful requests, so on its own it says nothing about how often a proxy fails; scaling it means a fast-but-unreliable proxy cannot hold a pool slot. A window with results but zero successes scores 0 here, not a neutral value.
-   * **Consistency (0-10)** - a bonus for a stable success rate across the last 10 results.
-
-   Results are weighted by age (`elo_decay_half_life_hours`) and dropped entirely past `elo_max_result_age_hours`. Scores are recomputed for the whole pool on every sync (`rescore_on_sync_enabled`), not only when feedback arrives - otherwise idle proxies freeze at their last score, time decay never fires, and a proxy knocked down by one failure can never earn its way back. Consecutive failures are kept only as diagnostic data; candidates are not hard-deleted by a failure threshold.
-4. **Select**: When a client requests a proxy for a specific source via /get-proxy, the system serves only proxies that passed the most recent validation, filters them by the optional per-proxy cooldown, and selects from the current top pool using the configured strategy (`uniform`, `tiered`, `weighted`, or `softmax`). A configurable share of requests (`exploration_ratio`) instead goes to a proxy without unexpired feedback. Never-handed proxies are preferred; once every candidate has been tried, exploration rotates to the least-recently-handed-out candidate.
+3. **Score**: Each source keeps independent slow and fast reliability estimates. Both start at `reliability_prior` (5% by default), update on every feedback event, and expose `score = 100 × min(slow, fast)`. The slow estimator limits one-hit promotion; the fast estimator reacts quickly to deterioration. Old state decays toward the same fixed prior. Latency is observable but never enters reliability; it only breaks equal-score ordering.
+4. **Select**: Only live proxies are eligible. Qualified proxies (three results and a score above the prior by default) receive score-driven exploitation traffic. One adaptive total exploration budget falls from 30% to 5% as the qualified pool fills; two thirds of it targets never-tried discovery and one third targets probation/delayed retries. Each proxy has three immediate probation attempts and at most two delayed retries per forgiveness epoch. An in-flight lease prevents another handout before feedback or timeout.
 5. **Adapt**: Through continuous validation and feedback, low-quality proxies are phased out, and high-performing ones are prioritized, ensuring the overall quality of the pool constantly improves.
 
 ## **Project Structure**
@@ -117,32 +112,38 @@ You can use the provided shell script to manage the backend service (start, stop
 
 1.  **Make executable** (first time only):
     ```bash
-    chmod +x scripts/start.sh
+    chmod +x scripts/start_proxy.sh
     ```
 
 2.  **Usage**:
 
     ```bash
     # Start service (background)
-    ./scripts/start.sh start
+    ./scripts/start_proxy.sh start
 
     # Start with debug mode
-    ./scripts/start.sh start --debug
+    ./scripts/start_proxy.sh start --debug
+
+    # Skip JSON restore but keep database reputation hydration; isolated backup
+    ./scripts/start_proxy.sh start --no-restore
+
+    # Isolated cold-start scoring; no JSON/DB reputation hydration or durable reputation writes
+    ./scripts/start_proxy.sh start --fresh-scoring
 
     # Check status
-    ./scripts/start.sh status
+    ./scripts/start_proxy.sh status
 
     # View logs
-    ./scripts/start.sh logs
+    ./scripts/start_proxy.sh logs
 
     # Restart service
-    ./scripts/start.sh restart
+    ./scripts/start_proxy.sh restart --fresh-scoring
 
     # Stop service
-    ./scripts/start.sh stop
+    ./scripts/start_proxy.sh stop
     
     # Manual backup of stats
-    ./scripts/start.sh backup
+    ./scripts/start_proxy.sh backup
     ```
 
 ## **Configuration (config.ini)**
@@ -177,15 +178,14 @@ The service is configured via the config.ini file.
 * **\[source\_pool\]**: Parameters for the scoring and selection algorithm.
   * selection\_strategy: `uniform`, `tiered`, `weighted`, or `softmax`. Note that `uniform` draws every proxy in the pool with equal probability, so the score only decides pool membership and the ranking is otherwise discarded; `softmax` is recommended.
   * softmax\_temperature: Controls temperature scaling for softmax selection (default `14.0`).
-  * proxy\_cooldown\_ms: Minimum delay before the same proxy is handed out again for the same source.
-  * exploration\_ratio: Share of requests spent on proxies without unexpired feedback (default `0.15`). Never-handed candidates are preferred; after all candidates have been tried, the least-recently-handed-out one is explored next. Set to `0` to disable.
-  * elo\_prior\_successes / elo\_prior\_failures: Beta prior (default `0.25` / `0.75`) providing weak regularization aligned with baseline proxy success rates.
-  * latency\_full\_score\_ms / latency\_zero\_score\_ms: The latency band the 30-point latency component is scaled over (default `15000` / `60000` ms). These bracket target response times via proxy. Re-check them if the proxy population changes.
-  * elo\_circuit\_breaker\_multiplier: Penalty multiplier for sudden 10-consecutive failure outages (default `0.15`), dynamically capping score below untried baseline.
-  * rescore\_on\_sync\_enabled: Recompute every score during pool sync so time decay applies to idle proxies.
-  * ELO window/decay settings and latency thresholds (`elo_max_window`, `elo_scoring_window`, `elo_decay_half_life_hours`, `elo_max_result_age_hours`, `latency_full_score_ms`, `latency_zero_score_ms`, `max_feedback_latency_ms`).
-  * elo\_max\_result\_age\_hours: How long one bad result costs a proxy its traffic. Past this age the result stops counting entirely and the proxy returns to the neutral baseline, so this is the real knob for failure recovery. Defaults to 48.
-  * The untried baseline is **not** a constant: a proxy with no usable feedback scores the median score of the live proxies that do have some, recomputed each pool sync (falling back to 50.0 when nothing is measured yet). A fixed baseline inverts the whole ranking as soon as the population's real scores stop straddling it. See `docs/specs/proxy-quality-scoring.md` §2.
+  * proxy\_cooldown\_ms / proxy\_inflight\_timeout\_seconds: Optional cooldown plus the mandatory outstanding-request lease.
+  * reliability\_prior / reliability\_slow\_alpha / reliability\_fast\_alpha: Fixed prior and two online update speeds (defaults `0.05`, `0.12`, `0.30`).
+  * reliability\_decay\_half\_life\_hours: Wall-clock forgiveness toward the fixed prior.
+  * exploration\_min\_ratio / exploration\_max\_ratio / exploration\_target\_qualified: One adaptive total exploration budget (defaults 5%, 30%, target 50).
+  * exploration\_discovery\_share: Share of exploration reserved for never-tried discovery (default two thirds); probation and delayed retry use the rest.
+  * qualification\_min\_results / probation\_attempts / retry\_attempts / retry\_delay\_seconds / probation\_forgiveness\_hours: Qualification and bounded trial lifecycle.
+  * outage\_guard\_*: Requires a healthy completed window before a broad distinct-proxy failure spike can pause and roll back proxy-level reputation updates. Aggregate traffic metrics continue, and a completed recovery window resumes learning.
+  * max\_feedback\_latency\_ms: Input-safety boundary for diagnostic latency. Latency never affects reliability.
   * Feedback counters are also persisted to `proxies.feedback_success_count` / `feedback_failure_count` / `feedback_last_ts`, so a proxy evicted from the stats pool and later revalidated comes back with its record instead of a clean sheet.
   * max\_pool\_size x stats\_pool\_max\_multiplier: The cap on retained **dead** proxy history - not on total memory. Proxies that passed the latest validation are never evicted, because evicting one would reset its failure history to zero on the next sync, so the stats pool grows with the number of genuinely active proxies. If the live set alone reaches the cap, all dead history is dropped and a warning is logged.
 * **\[proxy\_source\_\*\]**: Define your proxy sources here. Each source should have its own section (e.g., \[proxy\_source\_freeproxies\]).  
@@ -225,7 +225,7 @@ Submits feedback on a proxy's performance. This is crucial for the scoring syste
   * source (string, required): The source pool the proxy belongs to.  
   * proxy (string, required): The full proxy URL (e.g., http://1.2.3.4:8080).  
   * status (integer, required): 0 and 4 are legacy failures; 1/2/3 and HTTP 1xx-3xx are successes; HTTP 4xx-5xx are failures; other values are rejected.  
-  * response\_time\_ms (integer, optional): The response time in milliseconds for successful requests. Lower times result in a higher score bonus. Must be finite, non-negative, and no larger than `max_feedback_latency_ms` (defaults to one day, `86400000`); anything else is rejected with a 400.
+  * response\_time\_ms (integer, optional): Diagnostic response time in milliseconds. It does not affect reliability and is used only as a deterministic tie-break when scores are equal. Must be finite, non-negative, and no larger than `max_feedback_latency_ms` (defaults to one day, `86400000`); anything else is rejected with a 400.
   * failure\_kind (string, optional): One of `timeout`, `proxy_error`, `dead`, `blocked`, `slow`, or `content_error`. `dead` applies the failure to every source where that proxy is tracked; other kinds affect only the reported source.
 * **Success Response (200)**:  
 
