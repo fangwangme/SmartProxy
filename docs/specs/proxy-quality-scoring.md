@@ -48,7 +48,11 @@ Before applying a new event and during pool sync, both estimators decay toward
 of evidence: old good and bad state both converge on the initial score.
 
 `recent_results` is retained as bounded raw replay data. It is not a separate
-sliding-window scorer. Counter-only database history is seeded from a lifetime
+sliding-window scorer. It is normalized once on the way in - at the API
+boundary, by `restore_stats()`, and by `_migrate_legacy_stat()` - and appended
+in timestamp order, so the selection path treats it as sorted and binary
+-searches the qualification cutoff instead of revalidating every stored entry
+on every request. Counter-only database history is seeded from a lifetime
 success rate shrunk toward `p0`, then aged from its last feedback timestamp.
 
 ## 4. Qualification, exploration, and probation
@@ -59,15 +63,21 @@ forgiveness epoch (default 3), and scores strictly above the fixed prior.
 Qualified proxies receive score-driven exploitation traffic from the active
 ranked pool.
 
-There is one total exploration budget:
+There is one total exploration budget, driven by how much of the live pool has
+been evaluated rather than by an absolute count of winners:
 
 ```text
-progress = min(qualified_count / exploration_target_qualified, 1)
-ratio = max_ratio - (max_ratio - min_ratio) * progress
+target   = max(exploration_target_qualified,
+               live_count * exploration_target_qualified_ratio)
+progress = min(qualified_count / target, 1)
+ratio    = max_ratio - (max_ratio - min_ratio) * progress
 ```
 
-Defaults are 30% at zero qualified proxies, 5% at 50 or more, and linear
-interpolation between. Discovery, probation, retry, and unqualified proxies in
+Defaults are 30% at zero qualified proxies and 5% once half the live pool
+qualifies, with linear interpolation between and an absolute floor of 50 so a
+small pool still converges. The absolute target alone would read a 1200-proxy
+pool with 110 qualified members as finished and drop exploration to its minimum
+while 91% of the pool had never been measured. Discovery, probation, retry, and unqualified proxies in
 the ranked pool cannot create extra exploration outside that decision.
 
 Within exploration, two thirds goes to never-tried discovery by default. The
@@ -82,6 +92,26 @@ each only after `retry_delay_seconds`. Once the last handout/feedback is older
 than `probation_forgiveness_hours`, the trial epoch resets while historical
 counters remain intact.
 
+The trial budget is spent by trial handouts alone, and qualifying returns it.
+Two rules follow, and both are load-bearing:
+
+- A proxy that qualifies has its trial counter cleared, so a later dip below
+  the prior costs it probation and the delayed retries, not the pool. Charging
+  the budget for observed results instead meant any proxy with five recent
+  results carried an exhausted budget, and its first dip - which a 20%-success
+  proxy reaches on a routine losing streak - exiled it for a full forgiveness
+  epoch with no retry at all.
+- A proxy seeded from durable database counters has an empty result window and
+  therefore an untouched budget. It re-enters as a discovery candidate holding
+  its seeded score; pre-spending the budget on results earned in a previous
+  life left it ineligible for exploitation *and* for every exploration group,
+  which is unreachable rather than deprioritised.
+
+Exploitation draws from the whole ranked pool. Tiering weights the `tiered`
+strategy; it is not the eligibility set. Restricting eligibility to the top
+tier caps in-flight concurrency at `top_tier_size` and returns "no proxy
+available" while the rest of the ranked, qualified pool sits idle.
+
 Every handout creates an in-flight lease. That proxy is ineligible until its
 feedback arrives or `proxy_inflight_timeout_seconds` expires, preventing one
 candidate from absorbing a burst before its result is known. Cooldown is an
@@ -89,17 +119,37 @@ additional optional constraint.
 
 ## 5. Source-wide outage guard
 
-The outage guard observes source results separately from scoring. A uniformly
-poor cold start cannot arm it. Activation requires:
+The outage guard observes source results separately from scoring. Every
+threshold is a multiple of the source's own success baseline - an EMA over
+completed windows that outage windows never feed - because absolute ratios do
+not survive contact with a pool whose normal success rate is 10%: an absolute
+"healthy window is 50% successful" gate never opens there, and an absolute
+"90% failure" trigger sits below that pool's normal state.
 
-1. a completed window that met the configured healthy success threshold;
-2. a following completed window that met the broad failure threshold; and
+The window sizes itself to the baseline. A verdict needs enough observations
+that an all-failure run of that length is less likely than
+`outage_false_positive_budget` under the baseline: about 66 observations at a
+10% baseline, three at 90%, bounded by `outage_window_size` and
+`outage_window_max_size`.
+
+A uniformly poor cold start cannot arm the guard: the first completed window
+defines its own reference, and a reference of zero fails every gate.
+Activation requires:
+
+1. a completed window reaching `outage_healthy_baseline_ratio` of the baseline;
+2. a following completed window at or below `outage_failure_baseline_ratio` of
+   it; and
 3. the configured minimum number of distinct proxies in that failure window.
 
 Tentative proxy mutations from the triggering broad-failure window are rolled
-back. While active, aggregate per-minute feedback continues, in-flight leases
-are released, and proxy reputation mutation pauses. A completed recovery window
-with enough distinct proxies resumes learning. Transitions are logged, and
+back, field by field rather than by deep-copying each proxy's full result
+history on every healthy feedback event. While active, aggregate per-minute
+feedback continues, in-flight leases are released, and proxy reputation
+mutation pauses - including the trial budget, which is reputation: a handout
+made while the source is paused produces no usable evidence and must not be
+charged. A completed recovery window reaching
+`outage_recovery_baseline_ratio` of the baseline, with enough distinct
+proxies, resumes learning. Transitions are logged, and
 Prometheus metrics expose active state and paused-update totals per source.
 
 ## 6. Persistence and migration

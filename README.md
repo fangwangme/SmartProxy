@@ -18,7 +18,7 @@ SmartProxy is a sophisticated proxy management system designed to provide reliab
 1. **Fetch**: The service periodically fetches proxy lists from various sources defined in config.ini.  
 2. **Validate**: A validation cycle runs regularly. It prioritizes new and previously successful proxies. To avoid overwhelming unreliable proxies, it supplements the validation queue with failed proxies that have not been tested more than a configured number of times within a specific time window (e.g., 5 times in 30 minutes).  
 3. **Score**: Each source keeps independent slow and fast reliability estimates. Both start at `reliability_prior` (5% by default), update on every feedback event, and expose `score = 100 × min(slow, fast)`. The slow estimator limits one-hit promotion; the fast estimator reacts quickly to deterioration. Old state decays toward the same fixed prior. Latency is observable but never enters reliability; it only breaks equal-score ordering.
-4. **Select**: Only live proxies are eligible. Qualified proxies (three results and a score above the prior by default) receive score-driven exploitation traffic. One adaptive total exploration budget falls from 30% to 5% as the qualified pool fills; two thirds of it targets never-tried discovery and one third targets probation/delayed retries. Each proxy has three immediate probation attempts and at most two delayed retries per forgiveness epoch. An in-flight lease prevents another handout before feedback or timeout.
+4. **Select**: Only live proxies are eligible. Qualified proxies (three results and a score above the prior by default) receive score-driven exploitation traffic from the whole ranked pool. One adaptive total exploration budget falls from 30% to 5% as the live pool becomes evaluated; two thirds of it targets never-tried discovery and one third targets probation/delayed retries. Each proxy has three immediate probation attempts and at most two delayed retries per forgiveness epoch, and qualifying returns that budget so a later dip costs probation rather than the pool slot. An in-flight lease prevents another handout before feedback or timeout.
 5. **Adapt**: Through continuous validation and feedback, low-quality proxies are phased out, and high-performing ones are prioritized, ensuring the overall quality of the pool constantly improves.
 
 ## **Project Structure**
@@ -136,8 +136,8 @@ You can use the provided shell script to manage the backend service (start, stop
     # View logs
     ./scripts/start_proxy.sh logs
 
-    # Restart service
-    ./scripts/start_proxy.sh restart --fresh-scoring
+    # Restart service (add --no-restore / --fresh-scoring only on purpose)
+    ./scripts/start_proxy.sh restart
 
     # Stop service
     ./scripts/start_proxy.sh stop

@@ -9,6 +9,7 @@ import random
 import tempfile
 import threading
 import time
+from bisect import bisect_right
 import asyncio
 import subprocess
 import aiohttp
@@ -45,6 +46,19 @@ DEFAULT_MAX_FEEDBACK_LATENCY_MS = 24 * 60 * 60 * 1000
 # Persisted derived scoring state is only trusted when this version matches.
 SCORING_VERSION = 2
 DEFAULT_RELIABILITY_PRIOR = 0.05
+
+# Keys every live stat must carry before the feedback path may mutate it.
+REQUIRED_STAT_KEYS = frozenset(
+    {
+        "score",
+        "quality_slow",
+        "quality_fast",
+        "success_count",
+        "failure_count",
+        "recent_results",
+        "trial_handout_count",
+    }
+)
 RESTORE_MODES = frozenset({"normal", "no-restore", "fresh-scoring"})
 
 # curl exit codes that mean "the network path failed right now" rather than
@@ -67,6 +81,16 @@ VALID_FAILURE_KINDS = {
     "slow",
     "content_error",
 }
+
+def nonnegative_int(value) -> int:
+    """
+    A stored counter, or 0.
+
+    `type(value) is int`, not isinstance: bool subclasses int, and a JSON
+    `true` in a restored record must not read as a count of 1.
+    """
+    return value if type(value) is int and value >= 0 else 0
+
 
 class FetchError(RuntimeError):
     """
@@ -146,6 +170,38 @@ class ProxyManager:
         )
         self.is_validating = False
         self.debug_mode = False  # Set via command line --debug flag
+
+    def _cfg_float(
+        self,
+        section: str,
+        option: str,
+        fallback: float,
+        low: float = None,
+        high: float = None,
+    ) -> float:
+        """Read a float tunable and clamp it into [low, high]."""
+        value = self.config.getfloat(section, option, fallback=fallback)
+        if low is not None:
+            value = max(low, value)
+        if high is not None:
+            value = min(high, value)
+        return value
+
+    def _cfg_int(
+        self,
+        section: str,
+        option: str,
+        fallback: int,
+        low: int = None,
+        high: int = None,
+    ) -> int:
+        """Read an int tunable and clamp it into [low, high]."""
+        value = self.config.getint(section, option, fallback=fallback)
+        if low is not None:
+            value = max(low, value)
+        if high is not None:
+            value = min(high, value)
+        return value
 
     def _load_config(self):
         self.server_port = self.config.getint("server", "port", fallback=6942)
@@ -264,90 +320,73 @@ class ProxyManager:
         self.top_tier_load_percentage = self.config.getint(
             "source_pool", "top_tier_load_percentage", fallback=70
         )
-        self.proxy_cooldown_ms = max(
-            0, self.config.getint("source_pool", "proxy_cooldown_ms", fallback=0)
+        self.proxy_cooldown_ms = self._cfg_int(
+            "source_pool", "proxy_cooldown_ms", 0, low=0
         )
-        self.exploration_min_ratio = min(
-            1.0,
-            max(
-                0.0,
-                self.config.getfloat(
-                    "source_pool", "exploration_min_ratio", fallback=0.05
-                ),
-            ),
+        self.exploration_min_ratio = self._cfg_float(
+            "source_pool", "exploration_min_ratio", 0.05, low=0.0, high=1.0
         )
-        self.exploration_max_ratio = min(
-            1.0,
-            max(
-                self.exploration_min_ratio,
-                self.config.getfloat(
-                    "source_pool", "exploration_max_ratio", fallback=0.30
-                ),
-            ),
+        self.exploration_max_ratio = self._cfg_float(
+            "source_pool",
+            "exploration_max_ratio",
+            0.30,
+            low=self.exploration_min_ratio,
+            high=1.0,
         )
-        self.exploration_target_qualified = max(
-            1,
-            self.config.getint(
-                "source_pool", "exploration_target_qualified", fallback=50
-            ),
+        # The exploration ramp has to track how much of the *live* pool is still
+        # unevaluated, not an absolute count of winners. A deployment with 1200
+        # live proxies and 110 qualified ones is 9% evaluated, but an absolute
+        # target of 50 reads that as "done" and drops exploration to the floor
+        # while 91% of the pool has never been measured. The absolute target is
+        # kept as a lower bound so a genuinely small pool still converges.
+        self.exploration_target_qualified = self._cfg_int(
+            "source_pool", "exploration_target_qualified", 50, low=1
         )
-        self.exploration_discovery_share = min(
-            1.0,
-            max(
-                0.0,
-                self.config.getfloat(
-                    "source_pool", "exploration_discovery_share", fallback=2 / 3
-                ),
-            ),
+        self.exploration_target_qualified_ratio = self._cfg_float(
+            "source_pool",
+            "exploration_target_qualified_ratio",
+            0.5,
+            low=0.0,
+            high=1.0,
         )
-        self.qualification_min_results = max(
-            1,
-            self.config.getint(
-                "source_pool", "qualification_min_results", fallback=3
-            ),
+        self.exploration_discovery_share = self._cfg_float(
+            "source_pool", "exploration_discovery_share", 2 / 3, low=0.0, high=1.0
         )
-        self.probation_attempts = max(
-            self.qualification_min_results,
-            self.config.getint("source_pool", "probation_attempts", fallback=3),
+        self.qualification_min_results = self._cfg_int(
+            "source_pool", "qualification_min_results", 3, low=1
         )
-        self.retry_attempts = max(
-            0, self.config.getint("source_pool", "retry_attempts", fallback=2)
+        self.probation_attempts = self._cfg_int(
+            "source_pool",
+            "probation_attempts",
+            3,
+            low=self.qualification_min_results,
         )
-        self.retry_delay_s = max(
-            0.0,
-            self.config.getfloat("source_pool", "retry_delay_seconds", fallback=3600),
+        self.retry_attempts = self._cfg_int(
+            "source_pool", "retry_attempts", 2, low=0
         )
-        self.probation_forgiveness_hours = max(
-            0.1,
-            self.config.getfloat(
-                "source_pool", "probation_forgiveness_hours", fallback=48.0
-            ),
+        self.retry_delay_s = self._cfg_float(
+            "source_pool", "retry_delay_seconds", 3600.0, low=0.0
         )
-        self.proxy_inflight_timeout_s = max(
-            0.1,
-            self.config.getfloat(
-                "source_pool", "proxy_inflight_timeout_seconds", fallback=120.0
-            ),
+        self.probation_forgiveness_hours = self._cfg_float(
+            "source_pool", "probation_forgiveness_hours", 48.0, low=0.1
         )
-        self.selection_weight_floor = max(
-            0.01,
-            self.config.getfloat("source_pool", "selection_weight_floor", fallback=1.0),
+        self.proxy_inflight_timeout_s = self._cfg_float(
+            "source_pool", "proxy_inflight_timeout_seconds", 120.0, low=0.1
         )
-        self.softmax_temperature = max(
-            0.1,
-            self.config.getfloat("source_pool", "softmax_temperature", fallback=14.0),
+        self.selection_weight_floor = self._cfg_float(
+            "source_pool", "selection_weight_floor", 1.0, low=0.01
         )
-        self.avg_latency_alpha = min(
-            1.0,
-            max(0.01, self.config.getfloat("source_pool", "avg_latency_alpha", fallback=0.3)),
+        self.softmax_temperature = self._cfg_float(
+            "source_pool", "softmax_temperature", 14.0, low=0.1
         )
-        self.max_feedback_latency_ms = max(
-            1,
-            self.config.getint(
-                "source_pool",
-                "max_feedback_latency_ms",
-                fallback=DEFAULT_MAX_FEEDBACK_LATENCY_MS,
-            ),
+        self.avg_latency_alpha = self._cfg_float(
+            "source_pool", "avg_latency_alpha", 0.3, low=0.01, high=1.0
+        )
+        self.max_feedback_latency_ms = self._cfg_int(
+            "source_pool",
+            "max_feedback_latency_ms",
+            DEFAULT_MAX_FEEDBACK_LATENCY_MS,
+            low=1,
         )
 
         # Fetcher configuration.
@@ -361,28 +400,23 @@ class ProxyManager:
         self.fetch_total_timeout_s = self.config.getint(
             "fetcher", "total_timeout_s", fallback=60
         )
-        self.fetch_curl_retries = max(
-            0, self.config.getint("fetcher", "curl_retries", fallback=2)
+        self.fetch_curl_retries = self._cfg_int("fetcher", "curl_retries", 2, low=0)
+        self.fetch_curl_retry_delay_s = self._cfg_int(
+            "fetcher", "curl_retry_delay_s", 1, low=0
         )
-        self.fetch_curl_retry_delay_s = max(
-            0, self.config.getint("fetcher", "curl_retry_delay_s", fallback=1)
-        )
-        self.fetch_backoff_base_s = max(
-            1, self.config.getint("fetcher", "backoff_base_s", fallback=30)
+        self.fetch_backoff_base_s = self._cfg_int(
+            "fetcher", "backoff_base_s", 30, low=1
         )
         # Two caps, because the two failure classes deserve different patience.
-        self.fetch_backoff_max_s = max(
-            self.fetch_backoff_base_s,
-            self.config.getint("fetcher", "backoff_max_s", fallback=1800),
+        self.fetch_backoff_max_s = self._cfg_int(
+            "fetcher", "backoff_max_s", 1800, low=self.fetch_backoff_base_s
         )
-        self.fetch_backoff_transient_max_s = max(
-            self.fetch_backoff_base_s,
-            min(
-                self.fetch_backoff_max_s,
-                self.config.getint(
-                    "fetcher", "backoff_transient_max_s", fallback=300
-                ),
-            ),
+        self.fetch_backoff_transient_max_s = self._cfg_int(
+            "fetcher",
+            "backoff_transient_max_s",
+            300,
+            low=self.fetch_backoff_base_s,
+            high=self.fetch_backoff_max_s,
         )
 
         # Backup configuration
@@ -404,93 +438,75 @@ class ProxyManager:
         )
 
         # Two-speed online reliability. Latency never enters this score.
-        self.reliability_prior = min(
-            1.0,
-            max(
-                0.0,
-                self.config.getfloat(
-                    "source_pool", "reliability_prior", fallback=DEFAULT_RELIABILITY_PRIOR
-                ),
-            ),
+        self.reliability_prior = self._cfg_float(
+            "source_pool",
+            "reliability_prior",
+            DEFAULT_RELIABILITY_PRIOR,
+            low=0.0,
+            high=1.0,
         )
-        self.reliability_slow_alpha = min(
-            1.0,
-            max(
-                0.0001,
-                self.config.getfloat(
-                    "source_pool", "reliability_slow_alpha", fallback=0.12
-                ),
-            ),
+        self.reliability_slow_alpha = self._cfg_float(
+            "source_pool", "reliability_slow_alpha", 0.12, low=0.0001, high=1.0
         )
-        self.reliability_fast_alpha = min(
-            1.0,
-            max(
-                self.reliability_slow_alpha,
-                self.config.getfloat(
-                    "source_pool", "reliability_fast_alpha", fallback=0.30
-                ),
-            ),
+        self.reliability_fast_alpha = self._cfg_float(
+            "source_pool",
+            "reliability_fast_alpha",
+            0.30,
+            low=self.reliability_slow_alpha,
+            high=1.0,
         )
-        self.reliability_decay_half_life_hours = max(
-            0.1,
-            self.config.getfloat(
-                "source_pool", "reliability_decay_half_life_hours", fallback=24.0
-            ),
+        self.reliability_decay_half_life_hours = self._cfg_float(
+            "source_pool", "reliability_decay_half_life_hours", 24.0, low=0.1
         )
-        self.reliability_recent_results_limit = max(
-            1,
-            self.config.getint(
-                "source_pool", "reliability_recent_results_limit", fallback=100
-            ),
+        self.reliability_recent_results_limit = self._cfg_int(
+            "source_pool", "reliability_recent_results_limit", 100, low=1
         )
-        self.reliability_history_prior_weight = max(
-            0.0,
-            self.config.getfloat(
-                "source_pool", "reliability_history_prior_weight", fallback=5.0
-            ),
+        self.reliability_history_prior_weight = self._cfg_float(
+            "source_pool", "reliability_history_prior_weight", 5.0, low=0.0
         )
 
+        # Outage guard thresholds are relative to the source\'s own observed
+        # success rate, never absolute. An absolute "healthy window >= 50%" gate
+        # is unreachable for a source whose normal rate is 10%, so the guard
+        # would never arm; an absolute "failure >= 90%" trigger is *below* that
+        # same source\'s normal state, so it would fire on healthy traffic.
         self.outage_guard_enabled = self.config.getboolean(
             "source_pool", "outage_guard_enabled", fallback=True
         )
-        self.outage_window_size = max(
-            1, self.config.getint("source_pool", "outage_window_size", fallback=20)
+        self.outage_window_size = self._cfg_int(
+            "source_pool", "outage_window_size", 20, low=1
         )
-        self.outage_min_distinct_proxies = max(
-            1,
-            min(
-                self.outage_window_size,
-                self.config.getint(
-                    "source_pool", "outage_min_distinct_proxies", fallback=10
-                ),
-            ),
+        self.outage_min_distinct_proxies = self._cfg_int(
+            "source_pool",
+            "outage_min_distinct_proxies",
+            10,
+            low=1,
+            high=self.outage_window_size,
         )
-        self.outage_healthy_success_ratio = min(
-            1.0,
-            max(
-                0.0,
-                self.config.getfloat(
-                    "source_pool", "outage_healthy_success_ratio", fallback=0.50
-                ),
-            ),
+        self.outage_healthy_baseline_ratio = self._cfg_float(
+            "source_pool", "outage_healthy_baseline_ratio", 0.5, low=0.0, high=1.0
         )
-        self.outage_failure_ratio = min(
-            1.0,
-            max(
-                0.0,
-                self.config.getfloat(
-                    "source_pool", "outage_failure_ratio", fallback=0.90
-                ),
-            ),
+        self.outage_failure_baseline_ratio = self._cfg_float(
+            "source_pool", "outage_failure_baseline_ratio", 0.1, low=0.0, high=1.0
         )
-        self.outage_recovery_success_ratio = min(
-            1.0,
-            max(
-                0.0,
-                self.config.getfloat(
-                    "source_pool", "outage_recovery_success_ratio", fallback=0.30
-                ),
-            ),
+        self.outage_recovery_baseline_ratio = self._cfg_float(
+            "source_pool", "outage_recovery_baseline_ratio", 0.3, low=0.0, high=1.0
+        )
+        self.outage_baseline_alpha = self._cfg_float(
+            "source_pool", "outage_baseline_alpha", 0.2, low=0.001, high=1.0
+        )
+        # A window only counts as evidence of an outage once an all-failure run
+        # of that length is less likely than this under the source\'s own
+        # baseline. At a 10% baseline that needs ~66 observations; at 90% it
+        # needs 3. The window therefore sizes itself to the source.
+        self.outage_false_positive_budget = self._cfg_float(
+            "source_pool", "outage_false_positive_budget", 0.001, low=1e-9, high=0.5
+        )
+        self.outage_window_max_size = self._cfg_int(
+            "source_pool",
+            "outage_window_max_size",
+            200,
+            low=self.outage_window_size,
         )
 
         logger.info("Configuration loaded.")
@@ -1338,12 +1354,8 @@ class ProxyManager:
                 # Age every estimator toward the fixed prior before ranking.
                 # This is the recovery path for idle proxies; it does not use
                 # validator measurements or the measured population median.
-                for proxy_url, stat in list(stats_pool.items()):
-                    normalized = self._migrate_legacy_stat(stat)
-                    normalized["score"] = self._calculate_elo_score(
-                        normalized, source
-                    )
-                    stats_pool[proxy_url] = normalized
+                for stat in stats_pool.values():
+                    self._refresh_score(stat, source)
 
                 stats_pool = self._truncate_stats_pool(source, stats_pool)
                 self.source_stats[source] = stats_pool
@@ -1524,18 +1536,17 @@ class ProxyManager:
         self._flush_feedback_buffer()
         self._persist_feedback_history()
 
-    def _compute_baseline_score(self, measured: List[Tuple[str, Dict]]) -> float:
-        """Compatibility helper: unknown quality is always the fixed prior."""
-        return self._baseline_score()
-
     def _baseline_score(self, source: Optional[str] = None) -> float:
-        """Fixed per-source initial reliability score on the public 0-100 scale."""
+        """Fixed initial reliability score on the public 0-100 scale."""
         return self.reliability_prior * 100.0
 
     def _latency_sort_key(self, stat: Dict) -> float:
-        latency = self._coerce_latency(
-            stat.get("avg_latency_ms"), self.max_feedback_latency_ms
-        )
+        # Runs once per proxy inside the pool sort; avg_latency_ms is written
+        # as an int or None by this class and coerced on restore.
+        latency = stat.get("avg_latency_ms")
+        if type(latency) is int:
+            return float(latency)
+        latency = self._coerce_latency(latency, self.max_feedback_latency_ms)
         return float(latency) if latency is not None else math.inf
 
     @staticmethod
@@ -1607,22 +1618,24 @@ class ProxyManager:
         )
         return [timestamp, success, latency]
 
-    def _unexpired_results(self, stat: Dict) -> List:
-        """Valid results in the current probation/forgiveness epoch."""
-        raw_results = stat.get("recent_results", [])
-        if not isinstance(raw_results, list):
-            return []
-        now_ts = time.time()
-        max_age_seconds = self.probation_forgiveness_hours * 3600
-        recent = []
-        for raw_result in raw_results[-self.reliability_recent_results_limit :]:
-            result = self._normalize_recent_result(raw_result, now_ts)
-            if result is None:
-                continue
-            if now_ts - result[0] > max_age_seconds:
-                continue
-            recent.append(result)
-        return recent
+    def _unexpired_count(self, stat: Dict, now_ts: Optional[float] = None) -> int:
+        """
+        How many results still count toward qualification, in O(log n).
+
+        recent_results is normalized once on the way in - by the API boundary,
+        by restore_stats(), and by _migrate_legacy_stat() - and appended in
+        timestamp order, so the selection path may treat it as sorted floats
+        and binary-search the cutoff. Re-validating all 100 entries on every
+        read is what made get_proxy() cost hundreds of milliseconds per
+        request; the validation belongs at the boundary, not in the router.
+        """
+        results = stat.get("recent_results")
+        if not results:
+            return 0
+        now_ts = time.time() if now_ts is None else now_ts
+        cutoff = now_ts - self.probation_forgiveness_hours * 3600
+        window = results[-self.reliability_recent_results_limit :]
+        return len(window) - bisect_right(window, cutoff, key=lambda result: result[0])
 
     @staticmethod
     def _feedback_ts(stat: Dict) -> float:
@@ -1823,11 +1836,6 @@ class ProxyManager:
         if not history:
             return stat
 
-        def nonnegative_int(value) -> int:
-            # `type(value) is int`, not isinstance: bool subclasses int, and a
-            # JSON `true` in a restored record must not read as a count of 1.
-            return value if type(value) is int and value >= 0 else 0
-
         stat["success_count"] = nonnegative_int(history.get("success_count"))
         stat["failure_count"] = nonnegative_int(history.get("failure_count"))
         stat["completed_feedback_count"] = (
@@ -1838,20 +1846,12 @@ class ProxyManager:
             history.get("last_feedback_ts"), now_ts
         )
         if stat["success_count"] or stat["failure_count"]:
-            total = stat["completed_feedback_count"]
-            if (
-                stat["last_feedback_ts"] is not None
-                and now_ts - stat["last_feedback_ts"]
-                <= self.probation_forgiveness_hours * 3600
-            ):
-                stat["trial_handout_count"] = min(
-                    total, self.probation_attempts + self.retry_attempts
-                )
-                stat["handout_count"] = stat["trial_handout_count"]
-                if stat["trial_handout_count"] >= self.probation_attempts:
-                    stat["retry_after_ts"] = (
-                        stat["last_feedback_ts"] + self.retry_delay_s
-                    )
+            # The durable record seeds the *score*, never the trial budget. A
+            # re-seeded proxy has an empty result window, so it cannot qualify
+            # yet; pre-spending its trial handouts on results it earned in a
+            # previous life left it ineligible for exploitation *and* for every
+            # exploration group - unreachable until the forgiveness epoch
+            # expired. It re-enters as a discovery candidate holding its score.
             self._seed_reliability_from_history(stat, now_ts)
         return stat
 
@@ -1874,14 +1874,15 @@ class ProxyManager:
             # recent_results list with the live pool, which json.dump then walks
             # outside the lock while feedback threads mutate them.
             source_stats_snapshot = copy.deepcopy(self.source_stats)
+            # Persist the committed value of anything a live outage window has
+            # only tentatively changed.
             for source, outage_state in self.outage_states.items():
-                for proxy_url, committed_stat in outage_state.get(
+                for proxy_url, committed in outage_state.get(
                     "protected_stats", {}
                 ).items():
-                    if proxy_url in source_stats_snapshot.get(source, {}):
-                        source_stats_snapshot[source][proxy_url] = copy.deepcopy(
-                            committed_stat
-                        )
+                    tentative = source_stats_snapshot.get(source, {}).get(proxy_url)
+                    if tentative is not None:
+                        self._apply_stat_snapshot(tentative, committed)
             stats_snapshot = {
                 "scoring_version": SCORING_VERSION,
                 "timestamp": datetime.now().isoformat(),
@@ -2089,22 +2090,34 @@ class ProxyManager:
             stats_pool = self.source_stats.get(source, {})
             now_ts = time.time()
 
-            for stat in stats_pool.values():
-                self._refresh_trial_epoch(stat, now_ts)
-
-            exploit_pool = top_tier or bottom_tier
-            exploit_candidates = self._filter_cooldown_candidates(
-                source,
-                [
-                    proxy_url
-                    for proxy_url in exploit_pool
-                    if proxy_url not in stats_pool
-                    or self._is_qualified(stats_pool[proxy_url])
-                ],
+            # The whole ranked pool exploits, not just the top tier. Tiering is
+            # a weighting device for the `tiered` strategy; treating it as the
+            # eligibility set caps concurrency at top_tier_size and leaves the
+            # rest of the ranked, qualified pool idle while requests 404.
+            exploit_pool = top_tier + bottom_tier
+            exploit_candidates = [
+                proxy_url
+                for proxy_url in exploit_pool
+                if self._is_eligible(source, proxy_url, now_ts)
+                # Ranked-pool membership implies servability: a URL the sync put
+                # in the pool without a stat entry is still a live proxy.
+                and (
+                    proxy_url not in stats_pool
+                    or self._is_qualified(stats_pool[proxy_url], now_ts)
+                )
+            ]
+            # One pass over the live pool answers both questions: which proxies
+            # are trial candidates, and how much of the pool is already
+            # qualified. Scanning separately for each - and revalidating every
+            # stored result on the way - is what put this call in the hundreds
+            # of milliseconds.
+            exploration_groups, qualified_count, live_count = self._scan_trial_pool(
+                source, now_ts
             )
-            exploration_groups = self._exploration_candidate_groups(source, now_ts)
             has_exploration = any(exploration_groups.values())
-            exploration_ratio = self._compute_exploration_ratio(source)
+            exploration_ratio = self._exploration_ratio_for(
+                live_count, qualified_count
+            )
             if exploit_candidates:
                 self.cold_start_fallback_logged.discard(source)
 
@@ -2151,66 +2164,88 @@ class ProxyManager:
             self._mark_proxy_handed_out(source, selected, now_ts)
             return selected
 
-    def _compute_exploration_ratio(self, source: str) -> float:
-        stats_pool = self.source_stats.get(source, {})
-        qualified = sum(
-            1
-            for proxy_url, stat in stats_pool.items()
-            if proxy_url in self.active_proxies and self._is_qualified(stat)
+    def _exploration_ratio_for(self, live_count: int, qualified_count: int) -> float:
+        """
+        Interpolate the exploration budget from how evaluated the pool is.
+
+        The target is the larger of the absolute floor and a share of the live
+        pool, so the budget does not collapse to its minimum while most of a
+        large pool has never been measured.
+        """
+        target = max(
+            self.exploration_target_qualified,
+            live_count * self.exploration_target_qualified_ratio,
         )
-        progress = min(1.0, qualified / self.exploration_target_qualified)
+        progress = min(1.0, qualified_count / target) if target > 0 else 1.0
         return self.exploration_max_ratio - (
             self.exploration_max_ratio - self.exploration_min_ratio
         ) * progress
 
-    def _is_qualified(self, stat: Dict) -> bool:
+    def _is_qualified(self, stat: Dict, now_ts: Optional[float] = None) -> bool:
+        baseline = self._baseline_score()
         return (
-            len(self._unexpired_results(stat)) >= self.qualification_min_results
-            and float(stat.get("score", self._baseline_score()))
-            > self._baseline_score()
+            self._unexpired_count(stat, now_ts) >= self.qualification_min_results
+            and float(stat.get("score", baseline)) > baseline
         )
 
     def _refresh_trial_epoch(self, stat: Dict, now_ts: float):
-        outstanding = self._coerce_timestamp(stat.get("outstanding_until")) or 0.0
-        if outstanding <= now_ts:
+        # Reads only fields this class writes as floats, and _migrate_legacy_stat
+        # has already coerced anything that arrived from a file. Re-validating
+        # them per proxy per request is the kind of defence that only costs.
+        if (stat.get("outstanding_until") or 0.0) <= now_ts:
             stat["outstanding_until"] = 0.0
 
-        last_feedback = self._coerce_timestamp(stat.get("last_feedback_ts")) or 0.0
-        last_handout = self._coerce_timestamp(stat.get("last_handed_out_ts")) or 0.0
-        anchor = max(last_feedback, last_handout)
+        anchor = max(
+            stat.get("last_feedback_ts") or 0.0,
+            stat.get("last_handed_out_ts") or 0.0,
+        )
         if anchor and now_ts - anchor > self.probation_forgiveness_hours * 3600:
             stat["trial_handout_count"] = 0
             stat["retry_after_ts"] = 0.0
             stat["outstanding_until"] = 0.0
 
-    def _exploration_candidate_groups(
+    def _scan_trial_pool(
         self, source: str, now_ts: Optional[float] = None
-    ) -> Dict[str, List[str]]:
+    ) -> Tuple[Dict[str, List[str]], int, int]:
+        """
+        One pass over the live pool: trial candidates plus the qualified count.
+
+        Iterates active_proxies rather than the stats pool, which also holds
+        the retained history of every proxy that has died - typically an order
+        of magnitude more entries than are actually live.
+        """
         now_ts = time.time() if now_ts is None else now_ts
         groups = {"discovery": [], "probation": [], "retry": []}
         stats_pool = self.source_stats.get(source, {})
         max_trials = self.probation_attempts + self.retry_attempts
-        for proxy_url, stat in stats_pool.items():
-            if proxy_url not in self.active_proxies:
+        qualified_count = 0
+        live_count = 0
+        cooldown_s = self.proxy_cooldown_ms / 1000
+        last_handed_out = self.proxy_last_handed_out_ts.get(source, {})
+        for proxy_url in self.active_proxies:
+            stat = stats_pool.get(proxy_url)
+            if stat is None:
                 continue
+            live_count += 1
             self._refresh_trial_epoch(stat, now_ts)
-            if self._is_qualified(stat):
+            if self._is_qualified(stat, now_ts):
+                qualified_count += 1
                 continue
-            if (self._coerce_timestamp(stat.get("outstanding_until")) or 0.0) > now_ts:
+            # _is_eligible() inlined: this loop runs once per live proxy per
+            # request, and the call plus its two dict re-lookups showed up.
+            if (stat.get("outstanding_until") or 0.0) > now_ts:
                 continue
-            if not self._filter_cooldown_candidates(source, [proxy_url]):
+            if now_ts - last_handed_out.get(proxy_url, 0.0) < cooldown_s:
                 continue
             trial_handouts = int(stat.get("trial_handout_count", 0) or 0)
-            completed = len(self._unexpired_results(stat))
-            if trial_handouts == 0 and completed == 0:
+            if trial_handouts == 0 and self._unexpired_count(stat, now_ts) == 0:
                 groups["discovery"].append(proxy_url)
             elif trial_handouts < self.probation_attempts:
                 groups["probation"].append(proxy_url)
             elif trial_handouts < max_trials:
-                retry_after = self._coerce_timestamp(stat.get("retry_after_ts")) or 0.0
-                if retry_after <= now_ts:
+                if (stat.get("retry_after_ts") or 0.0) <= now_ts:
                     groups["retry"].append(proxy_url)
-        return groups
+        return groups, qualified_count, live_count
 
     def _select_exploration_candidate(self, groups: Dict[str, List[str]]) -> str:
         discovery = groups["discovery"]
@@ -2225,47 +2260,37 @@ class ProxyManager:
             candidates = discovery or probation_retry
         return random.choice(candidates)
 
-    def _maybe_select_exploration_candidate(self, source: str) -> Optional[str]:
-        """Compatibility helper for callers that only want an exploration pick."""
-        groups = self._exploration_candidate_groups(source)
-        if not any(groups.values()):
-            return None
-        if random.random() >= self._compute_exploration_ratio(source):
-            return None
-        return self._select_exploration_candidate(groups)
-
     def _mark_proxy_handed_out(self, source: str, proxy_url: str, now_ts: float):
         self.proxy_last_handed_out_ts[source][proxy_url] = now_ts
         stat = self.source_stats.get(source, {}).get(proxy_url)
         if stat is None:
             return
         stat["handout_count"] = int(stat.get("handout_count", 0) or 0) + 1
-        if not self._is_qualified(stat):
+        stat["last_handed_out_ts"] = now_ts
+        stat["outstanding_until"] = now_ts + self.proxy_inflight_timeout_s
+        # A paused source produces no usable evidence, so a handout made during
+        # one must not spend the trial budget it would otherwise be judged on:
+        # the guard exists to keep an outage from costing proxies their
+        # reputation, and the trial budget is part of that reputation.
+        if self.outage_states.get(source, {}).get("active"):
+            return
+        if not self._is_qualified(stat, now_ts):
             stat["trial_handout_count"] = int(
                 stat.get("trial_handout_count", 0) or 0
             ) + 1
-        stat["last_handed_out_ts"] = now_ts
-        stat["outstanding_until"] = now_ts + self.proxy_inflight_timeout_s
-        if stat["trial_handout_count"] >= self.probation_attempts:
-            stat["retry_after_ts"] = now_ts + self.retry_delay_s
+            if stat["trial_handout_count"] >= self.probation_attempts:
+                stat["retry_after_ts"] = now_ts + self.retry_delay_s
 
-    def _filter_cooldown_candidates(self, source: str, proxy_urls: List[str]) -> List[str]:
-        now = time.time()
-        cooldown_s = self.proxy_cooldown_ms / 1000
+    def _is_eligible(
+        self, source: str, proxy_url: str, now_ts: Optional[float] = None
+    ) -> bool:
+        """Cooldown and in-flight lease, the two gates every handout must pass."""
+        now_ts = time.time() if now_ts is None else now_ts
         last_handed_out = self.proxy_last_handed_out_ts.get(source, {})
-        stats_pool = self.source_stats.get(source, {})
-        return [
-            proxy_url
-            for proxy_url in proxy_urls
-            if now - last_handed_out.get(proxy_url, 0) >= cooldown_s
-            and (
-                self._coerce_timestamp(
-                    stats_pool.get(proxy_url, {}).get("outstanding_until")
-                )
-                or 0.0
-            )
-            <= now
-        ]
+        if now_ts - last_handed_out.get(proxy_url, 0.0) < self.proxy_cooldown_ms / 1000:
+            return False
+        stat = self.source_stats.get(source, {}).get(proxy_url)
+        return not stat or (stat.get("outstanding_until") or 0.0) <= now_ts
 
     def _select_from_tiers(
         self,
@@ -2446,9 +2471,6 @@ class ProxyManager:
         if not isinstance(stat, dict):
             raise ValueError("Proxy stat must be a mapping")
 
-        def nonnegative_int(value) -> int:
-            return value if type(value) is int and value >= 0 else 0
-
         success_count = nonnegative_int(stat.get("success_count", 0))
         failure_count = nonnegative_int(stat.get("failure_count", 0))
         stat["success_count"] = success_count
@@ -2495,16 +2517,6 @@ class ProxyManager:
             self._coerce_timestamp(stat.get("retry_after_ts")) or 0.0
         )
 
-        current_results = self._unexpired_results(stat)
-        if stat["trial_handout_count"] == 0 and current_results:
-            stat["trial_handout_count"] = min(
-                len(current_results), self.probation_attempts + self.retry_attempts
-            )
-        elif stat["trial_handout_count"] == 0 and total and last_feedback_ts:
-            if now_ts - last_feedback_ts <= self.probation_forgiveness_hours * 3600:
-                stat["trial_handout_count"] = min(
-                    total, self.probation_attempts + self.retry_attempts
-                )
         stat["handout_count"] = max(
             stat["handout_count"], stat["trial_handout_count"]
         )
@@ -2544,12 +2556,43 @@ class ProxyManager:
             return None
         return result if math.isfinite(result) and 0.0 <= result <= 1.0 else None
 
+    @staticmethod
+    def _has_valid_derived_state(stat: Dict) -> bool:
+        """
+        Whether the estimator triple can be used without revalidation.
+
+        Deliberately `type(...) is float` and a range test rather than the full
+        coercion helpers: this runs once per proxy per sync and once per
+        feedback event, and every value it reads was written as a float either
+        by this class or by _migrate_legacy_stat() on the way in from a file.
+        NaN and infinity both fail the range test, so nothing invalid slips
+        through the fast path - it just routes to migration instead.
+        """
+        slow = stat.get("quality_slow")
+        fast = stat.get("quality_fast")
+        updated = stat.get("quality_updated_ts")
+        return (
+            type(slow) is float
+            and 0.0 <= slow <= 1.0
+            and type(fast) is float
+            and 0.0 <= fast <= 1.0
+            and type(updated) is float
+            and updated >= 0.0
+        )
+
     def _age_reliability_state(self, stat: Dict, target_ts: float):
-        slow = self._coerce_probability(stat.get("quality_slow"))
-        fast = self._coerce_probability(stat.get("quality_fast"))
-        if slow is None or fast is None:
-            slow = fast = self.reliability_prior
-        updated_ts = self._coerce_timestamp(stat.get("quality_updated_ts"), target_ts)
+        if self._has_valid_derived_state(stat):
+            slow = stat["quality_slow"]
+            fast = stat["quality_fast"]
+            updated_ts = min(stat["quality_updated_ts"], target_ts)
+        else:
+            slow = self._coerce_probability(stat.get("quality_slow"))
+            fast = self._coerce_probability(stat.get("quality_fast"))
+            if slow is None or fast is None:
+                slow = fast = self.reliability_prior
+            updated_ts = self._coerce_timestamp(
+                stat.get("quality_updated_ts"), target_ts
+            )
         if updated_ts is not None:
             elapsed = max(0.0, target_ts - updated_ts)
             half_life_s = self.reliability_decay_half_life_hours * 3600
@@ -2606,16 +2649,55 @@ class ProxyManager:
             stat["quality_fast"] = self.reliability_prior
         self._age_reliability_state(stat, now_ts)
 
-    def _calculate_elo_score(self, stat: Dict, source: str = None) -> float:
-        """Compatibility name for the online reliability score."""
-        slow = self._coerce_probability(stat.get("quality_slow"))
-        fast = self._coerce_probability(stat.get("quality_fast"))
-        quality_ts = self._coerce_timestamp(stat.get("quality_updated_ts"))
-        if slow is None or fast is None or quality_ts is None:
+    def _refresh_score(self, stat: Dict, source: str = None) -> float:
+        """Age this proxy's estimators to now and return the resulting score."""
+        if self._has_valid_derived_state(stat):
+            self._age_reliability_state(stat, time.time())
+        elif (
+            self._coerce_probability(stat.get("quality_slow")) is None
+            or self._coerce_probability(stat.get("quality_fast")) is None
+            or self._coerce_timestamp(stat.get("quality_updated_ts")) is None
+        ):
             self._migrate_legacy_stat(stat, trust_derived=False)
         else:
             self._age_reliability_state(stat, time.time())
         return float(stat["score"])
+
+    # Fields the feedback path mutates, and therefore the only fields an
+    # outage rollback has to restore. Snapshotting these by value is what lets
+    # the guard protect a window without deep-copying every proxy\'s full
+    # result history on every healthy feedback event.
+    TENTATIVE_STAT_FIELDS = (
+        "score",
+        "quality_slow",
+        "quality_fast",
+        "quality_updated_ts",
+        "success_count",
+        "failure_count",
+        "consecutive_failures",
+        "avg_latency_ms",
+        "last_feedback_ts",
+        "completed_feedback_count",
+        "trial_handout_count",
+        "retry_after_ts",
+    )
+
+    def _snapshot_stat(self, stat: Dict) -> Dict:
+        snapshot = {field: stat.get(field) for field in self.TENTATIVE_STAT_FIELDS}
+        # recent_results only ever grows at the tail here, so its length is
+        # enough to undo the appends.
+        snapshot["_recent_results_len"] = len(stat.get("recent_results") or [])
+        return snapshot
+
+    def _apply_stat_snapshot(self, stat: Dict, snapshot: Dict) -> Dict:
+        for field in self.TENTATIVE_STAT_FIELDS:
+            stat[field] = snapshot.get(field)
+        results = stat.get("recent_results")
+        if isinstance(results, list):
+            kept = snapshot.get("_recent_results_len", len(results))
+            if 0 <= kept < len(results):
+                del results[kept:]
+        return stat
 
     def _outage_state(self, source: str) -> Dict:
         return self.outage_states.setdefault(
@@ -2628,7 +2710,31 @@ class ProxyManager:
                 "paused_updates": 0,
                 "completed_windows": 0,
                 "last_transition_ts": None,
+                # EMA of completed-window success ratio; every threshold below
+                # is a multiple of it.
+                "baseline": None,
             },
+        )
+
+    def _outage_required_window(self, state: Dict) -> int:
+        """
+        How many observations a verdict needs, given the source's own baseline.
+
+        A window is only evidence of an outage when a run this bad is less
+        likely than outage_false_positive_budget under normal operation. At a
+        90% success rate that takes 3 observations; at 10% it takes 66. A fixed
+        window cannot serve both, and a fixed *ratio* threshold serves neither.
+        """
+        baseline = state.get("baseline")
+        if baseline is None or baseline <= 0.0:
+            return self.outage_window_size
+        if baseline >= 1.0:
+            return self.outage_window_size
+        needed = math.ceil(
+            math.log(self.outage_false_positive_budget) / math.log(1.0 - baseline)
+        )
+        return max(
+            self.outage_window_size, min(needed, self.outage_window_max_size)
         )
 
     def _observe_source_outage_locked(
@@ -2646,65 +2752,92 @@ class ProxyManager:
             and state["previous_window_healthy"]
             and proxy_url not in state["protected_stats"]
         ):
-            state["protected_stats"][proxy_url] = copy.deepcopy(
+            state["protected_stats"][proxy_url] = self._snapshot_stat(
                 self.source_stats[source][proxy_url]
             )
         state["observations"].append((proxy_url, is_success))
 
-        if len(state["observations"]) < self.outage_window_size:
+        required_window = self._outage_required_window(state)
+        if len(state["observations"]) < required_window:
             if state["active"]:
                 state["paused_updates"] += 1
             return bool(state["active"])
 
-        window = state["observations"][: self.outage_window_size]
+        window = state["observations"][:required_window]
         distinct = len({url for url, _ in window})
         success_ratio = sum(1 for _, ok in window if ok) / len(window)
-        failure_ratio = 1.0 - success_ratio
         state["completed_windows"] += 1
+        baseline = state.get("baseline")
+        enough_proxies = distinct >= self.outage_min_distinct_proxies
 
         if state["active"]:
             state["paused_updates"] += 1
-            if (
-                distinct >= self.outage_min_distinct_proxies
-                and success_ratio >= self.outage_recovery_success_ratio
+            # An outage window says nothing about normal operation, so it must
+            # not drag the baseline it is being judged against down with it.
+            if enough_proxies and baseline is not None and success_ratio >= (
+                baseline * self.outage_recovery_baseline_ratio
             ):
                 state["active"] = False
                 state["previous_window_healthy"] = True
                 state["last_transition_ts"] = current_timestamp
                 logger.warning(
-                    "Source outage guard recovered for '{}': success_ratio={:.3f}, distinct_proxies={}.",
+                    "Source outage guard recovered for '{}': success_ratio={:.3f} "
+                    "(baseline {:.3f}), distinct_proxies={}.",
                     source,
                     success_ratio,
+                    baseline,
                     distinct,
                 )
             state["observations"] = []
             state["protected_stats"] = {}
             return True
 
+        # The first completed window has nothing to compare against, so it
+        # defines its own reference. A cold start that never succeeds yields a
+        # zero reference, which the `> 0` gates below refuse - that is what
+        # keeps a uniformly poor start from arming the guard.
+        reference = success_ratio if baseline is None else baseline
+
         broad_failure = (
             state["previous_window_healthy"]
-            and distinct >= self.outage_min_distinct_proxies
-            and failure_ratio >= self.outage_failure_ratio
+            and enough_proxies
+            and reference > 0.0
+            and success_ratio <= reference * self.outage_failure_baseline_ratio
         )
         if broad_failure:
             for protected_url, snapshot in state["protected_stats"].items():
-                if protected_url in self.source_stats.get(source, {}):
-                    self.source_stats[source][protected_url] = snapshot
+                protected_stat = self.source_stats.get(source, {}).get(protected_url)
+                if protected_stat is not None:
+                    self._apply_stat_snapshot(protected_stat, snapshot)
             state["active"] = True
             state["paused_updates"] += len(window)
             state["last_transition_ts"] = current_timestamp
             logger.error(
-                "Source outage guard activated for '{}': failure_ratio={:.3f}, distinct_proxies={}; rolled back {} tentative reputation update(s).",
+                "Source outage guard activated for '{}': success_ratio={:.3f} is at "
+                "or below {:.1%} of the {:.3f} baseline over {} observations from {} "
+                "distinct proxies; rolled back {} tentative reputation update(s).",
                 source,
-                failure_ratio,
+                success_ratio,
+                self.outage_failure_baseline_ratio,
+                baseline,
+                len(window),
                 distinct,
                 len(state["protected_stats"]),
             )
             paused = True
         else:
+            # Only windows that are not outages describe normal operation, so
+            # only they move the baseline.
+            state["baseline"] = (
+                success_ratio
+                if baseline is None
+                else (1.0 - self.outage_baseline_alpha) * baseline
+                + self.outage_baseline_alpha * success_ratio
+            )
             state["previous_window_healthy"] = (
-                distinct >= self.outage_min_distinct_proxies
-                and success_ratio >= self.outage_healthy_success_ratio
+                enough_proxies
+                and reference > 0.0
+                and success_ratio >= reference * self.outage_healthy_baseline_ratio
             )
             paused = False
         state["observations"] = []
@@ -2786,8 +2919,13 @@ class ProxyManager:
         response_time_ms: Optional[int],
         current_timestamp: float,
     ):
-        stat = self._migrate_legacy_stat(stat)
-        
+        # Normalize only what is not already normalized. Every stat reaching
+        # this path was built by _get_new_proxy_stat() or migrated by
+        # restore_stats(); re-validating the whole record - including all 100
+        # stored results - on every single feedback event was pure overhead.
+        if not REQUIRED_STAT_KEYS <= stat.keys():
+            stat = self._migrate_legacy_stat(stat)
+
         # Update historical counters
         if is_success:
             stat["success_count"] += 1
@@ -2831,13 +2969,6 @@ class ProxyManager:
         stat["completed_feedback_count"] = (
             stat["success_count"] + stat["failure_count"]
         )
-        stat["trial_handout_count"] = max(
-            int(stat.get("trial_handout_count", 0) or 0),
-            min(
-                len(self._unexpired_results(stat)),
-                self.probation_attempts + self.retry_attempts,
-            ),
-        )
         # Queue the updated counters for write-back, so this proxy's record
         # outlives its entry in the in-memory pool.
         if self.durable_reputation_enabled:
@@ -2845,10 +2976,15 @@ class ProxyManager:
 
         old_score = stat["score"]
         self._update_reliability_state(stat, is_success, current_timestamp)
-        if (
-            not self._is_qualified(stat)
-            and stat["trial_handout_count"] >= self.probation_attempts
-        ):
+        if self._is_qualified(stat, current_timestamp):
+            # Qualifying closes the trial epoch. Without this the trial budget
+            # is only ever spent, never returned, so the first dip below the
+            # prior - which a 20%-success proxy reaches on a routine losing
+            # streak - found the budget already exhausted and exiled a proven
+            # proxy outright instead of granting it the delayed retries.
+            stat["trial_handout_count"] = 0
+            stat["retry_after_ts"] = 0.0
+        elif stat["trial_handout_count"] >= self.probation_attempts:
             stat["retry_after_ts"] = current_timestamp + self.retry_delay_s
         
         response_time_str = f"{latency_for_log:.0f}" if latency_for_log is not None else "N/A"
