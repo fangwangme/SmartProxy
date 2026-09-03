@@ -494,11 +494,11 @@ class TestProxyManager(ProxyManagerTestBase):
         """Test ELO score for a proxy with 80% success rate."""
         import time
         stat = self.manager._get_new_proxy_stat()
-        # Simulate 40 successes and 10 failures
-        for i in range(40):
-            stat["recent_results"].append([time.time() - i, True, 500])
+        # Simulate 40 successes and 10 failures chronologically (older failures first)
         for i in range(10):
             stat["recent_results"].append([time.time() - 40 - i, False, None])
+        for i in range(40):
+            stat["recent_results"].append([time.time() - i, True, 500])
         
         score = self.manager._calculate_elo_score(stat)
         # 80% success = 48pts, latency ~26pts, consistency varies
@@ -509,21 +509,17 @@ class TestProxyManager(ProxyManagerTestBase):
         """
         Lower latency scores higher, at latencies these proxies really have.
 
-        The two samples sit inside the observed free-proxy band (8-33s). The
-        200ms/1500ms pair this used to compare is below latency_full_score_ms
-        now, where both ends score full marks and the component says nothing -
-        which is the mirror image of the bug being fixed, where the calibration
-        was so tight that every real proxy scored zero.
+        The two samples sit inside the calibrated band (15-60s).
         """
         import time
 
         stat_low = self.manager._get_new_proxy_stat()
         for i in range(50):
-            stat_low["recent_results"].append([time.time() - i, True, 8000])
+            stat_low["recent_results"].append([time.time() - i, True, 15000])
 
         stat_high = self.manager._get_new_proxy_stat()
         for i in range(50):
-            stat_high["recent_results"].append([time.time() - i, True, 25000])
+            stat_high["recent_results"].append([time.time() - i, True, 45000])
 
         score_low = self.manager._calculate_elo_score(stat_low)
         score_high = self.manager._calculate_elo_score(stat_high)
@@ -757,7 +753,7 @@ class TestIssue13PoolQuality(ProxyManagerTestBase):
         """One failure lands well above 0, leaving a recovery path."""
         score = self.manager._calculate_elo_score(self.make_stat([(False, None)]))
 
-        self.assertGreater(score, 20.0)
+        self.assertGreater(score, 5.0)
         self.assertLess(score, 50.0)
 
     # ---------- Finding 5: an all-failure window got a neutral latency score ----------
@@ -1321,6 +1317,7 @@ class TestIssue13PoolQuality(ProxyManagerTestBase):
             ("source_pool", "exploration_ratio"),
             ("source_pool", "elo_prior_successes"),
             ("source_pool", "elo_prior_failures"),
+            ("source_pool", "elo_new_proxy_consistency_bonus"),
             ("source_pool", "rescore_on_sync_enabled"),
             ("source_pool", "max_feedback_latency_ms"),
             ("validator", "validation_new_proxy_ratio"),
@@ -2613,13 +2610,12 @@ class TestIssue17DynamicBaseline(ProxyManagerTestBase):
 
     def test_latency_component_discriminates_across_real_latencies(self):
         """
-        Calibrated at 300/2000ms, every proxy in this population sat past the
-        zero point, so the 30-point latency component scored a constant 0 and
-        ranked nothing.
+        Calibrated at 15000/60000ms, the latency component discriminates across
+        real free-proxy target response latencies.
         """
         scores = [
             self.manager._calculate_elo_score(self.make_stat([(True, lat)] * 20))
-            for lat in (8000, 15000, 25000, 33000)
+            for lat in (15000, 25000, 40000, 55000)
         ]
         self.assertEqual(scores, sorted(scores, reverse=True))
         self.assertGreater(scores[0] - scores[-1], 10)
@@ -2795,5 +2791,112 @@ class TestIssue17ReputationPersistence(ProxyManagerTestBase):
         self.assertAlmostEqual(stale["score"], 50.0, delta=1.0)
 
 
+class TestIssue21AdaptiveScoringAndSoftmax(ProxyManagerTestBase):
+    """
+    Issue #21: Restore adaptive feedback scoring, introduce sudden breakdown
+    circuit breaker, and switch default selection to Softmax.
+    """
+
+    def test_scoring_ladder_40pct_beats_untried_beats_two_consecutive_failures(self):
+        """
+        Scoring ladder constraint:
+        score(40% success rate) >> score(untried baseline) >> score(2 consecutive failures).
+        """
+        self.manager.baseline_scores["source1"] = 10.0
+        untried_stat = self.manager._get_new_proxy_stat("source1")
+        score_untried = self.manager._calculate_elo_score(untried_stat, "source1")
+
+        # 40% success rate: 20 successes at 20000ms, 30 failures (interleaved)
+        # 10 cycles of (True, False, False) = 10 wins, 20 losses; 10 cycles of (True, False) = 10 wins, 10 losses.
+        # Total: 20 wins, 30 losses (40% success rate).
+        results_40 = ([(True, 20000), (False, None), (False, None)] * 10) + (
+            [(True, 20000), (False, None)] * 10
+        )
+        stat_40 = self.make_stat(results_40)
+        score_40 = self.manager._calculate_elo_score(stat_40, "source1")
+
+        # 2 consecutive failures
+        results_2_fail = [(False, None)] * 2
+        stat_2_fail = self.make_stat(results_2_fail)
+        score_2_fail = self.manager._calculate_elo_score(stat_2_fail, "source1")
+
+        print(
+            f"\n[Scoring Ladder] 40% success: {score_40:.2f}, "
+            f"untried baseline: {score_untried:.2f}, "
+            f"2 consecutive failures: {score_2_fail:.2f}"
+        )
+
+        self.assertGreater(score_40, score_untried)
+        self.assertGreater(score_untried, score_2_fail)
+        self.assertGreaterEqual(score_40, 30.0)
+        self.assertAlmostEqual(score_untried, 10.0, places=1)
+        self.assertLessEqual(score_2_fail, 6.0)
+
+    def test_recency_circuit_breaker_plunges_score_below_untried_baseline(self):
+        """
+        Recency Circuit Breaker:
+        A previously high-scoring proxy (e.g. 30 wins, 10 losses) that experiences
+        10 consecutive failures is plunged below the untried baseline (< 10).
+        """
+        self.manager.baseline_scores["source1"] = 10.0
+        untried_score = self.manager._baseline_score("source1")
+
+        # Previously high-scoring proxy: 30 wins, 10 failures
+        now = time.time()
+        stat = self.manager._get_new_proxy_stat("source1")
+        # Older 40 results
+        for i in range(10):
+            stat["recent_results"].append([now - 50 + i, False, None])
+        for i in range(30):
+            stat["recent_results"].append([now - 40 + i, True, 20000])
+
+        score_before = self.manager._calculate_elo_score(stat, "source1")
+
+        # Append 10 consecutive failures
+        for i in range(10):
+            stat["recent_results"].append([now - 10 + i, False, None])
+
+        score_after = self.manager._calculate_elo_score(stat, "source1")
+
+        print(
+            f"\n[Circuit Breaker] score_before: {score_before:.2f}, "
+            f"score_after: {score_after:.2f}, "
+            f"untried baseline: {untried_score:.2f}"
+        )
+
+        self.assertGreater(score_before, 50.0)
+        self.assertLess(score_after, untried_score)
+        self.assertLess(score_after, 10.0)
+
+    def test_config_drift_check_returns_clean_for_shipped_config(self):
+        """
+        Calling check_config_drift against config.example.ini reports zero missing
+        and zero unknown keys when live config matches the example.
+        """
+        from src.core.proxy_manager import CONFIG_EXAMPLE_PATH
+        example_manager = ProxyManager(CONFIG_EXAMPLE_PATH)
+        drift = example_manager.check_config_drift(CONFIG_EXAMPLE_PATH)
+
+        self.assertEqual(drift["missing"], [])
+        self.assertEqual(drift["unknown"], [])
+        self.assertTrue(drift["checked"])
+
+    def test_default_config_values_align_with_issue_21(self):
+        """
+        Verify default selection strategy and scoring configuration fallbacks.
+        """
+        from src.core.proxy_manager import CONFIG_EXAMPLE_PATH
+        example_manager = ProxyManager(CONFIG_EXAMPLE_PATH)
+        self.assertEqual(example_manager.selection_strategy, "softmax")
+        self.assertEqual(example_manager.softmax_temperature, 14.0)
+        self.assertEqual(example_manager.exploration_ratio, 0.15)
+        self.assertEqual(example_manager.latency_full_score_ms, 15000)
+        self.assertEqual(example_manager.latency_zero_score_ms, 60000)
+        self.assertEqual(example_manager.elo_prior_successes, 0.25)
+        self.assertEqual(example_manager.elo_prior_failures, 0.75)
+        self.assertEqual(example_manager.elo_new_proxy_consistency_bonus, 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()
+

@@ -84,6 +84,13 @@ mean *mid-pack* whatever the absolute numbers are: half the proven proxies rank
 above an unknown one, half below, and the ordering survives any recalibration of
 the components.
 
+*(Empirical note from Issue #21)*: In an environment with low baseline success (~10%),
+untried proxies (4.2% forward value) actually sit toward the lower-middle of the
+distribution rather than symmetric mid-pack. But the median baseline (~10-12 points)
+places untried proxies in a sound position: strictly below proven proxies (31.6-39.9%
+forward value, scoring ~35-65) and strictly above consecutive failures (0.1-1.9%
+forward value, scoring 2-5).
+
 ### Which proxies vote
 
 Only proxies that are **live** and **measured**.
@@ -106,7 +113,7 @@ the baseline falls back to the `DEFAULT_NEUTRAL_SCORE` constant of 50.0.
 ### What this changes about §3 below
 
 The head start a lucky new proxy gets is now *relative*. A single success scores
-~52; whether that is above the baseline depends on the pool. In a pool whose
+~55; whether that is above the baseline depends on the pool. In a pool whose
 median is 60, one success does not vault a proxy to the front - and it should
 not. The guarantee that untried proxies keep collecting evidence is
 `exploration_ratio`, exactly as §1's corollary says; it was never the starting
@@ -130,28 +137,33 @@ filled up with one-hit wonders.
 
 ### The constraint
 
-The observed success rate is shrunk toward the 0.5 baseline by a Beta prior
-(`elo_prior_successes` / `elo_prior_failures`, both 2.0 by default):
+The observed success rate is smoothed by a Beta prior
+(`elo_prior_successes` = 0.25 / `elo_prior_failures` = 0.75 by default):
 
 ```
 smoothed_rate = (successes_weight + a) / (total_weight + a + b)
 ```
 
-Calibration targets, at the defaults, with fresh results and successes at
-15000ms - the middle of the band these proxies actually run at:
+*(Revision from Issue #21)*: The earlier spec assumed a symmetric prior `a=b=2.0`
+centering at 0.5. In populations where the real base success rate is ~10%, shrinking
+toward 0.5 inappropriately inflated failing proxies: a proxy with multiple consecutive
+failures still scored 17-25 points, ranking above untried proxies (~11.6). Weakening
+the prior to `a=0.25, b=0.75` (strength 1.0, center 0.25) allows evidence to govern
+quickly while maintaining smooth regularization. Furthermore, new proxies (<10 results)
+default to `elo_new_proxy_consistency_bonus = 0.0` rather than receiving an unconditional
+5-point bonus.
+
+Calibration targets, at the defaults, with fresh results and target response latencies:
 
 | Evidence | Score | Requirement |
 | --- | --- | --- |
-| no observations | the pool median | see §2 |
-| 1 success | ~52 | **above** a proxy with a failing record |
-| 48 of 50 successes | ~79 | **well above** any small sample |
-| 1 failure | ~29 | punished, but recoverable |
-| 50 of 50 failures | ~2 | effectively out |
-| 35% success rate | ~29 | below a 50%-success proxy (~44) |
-
-The rule that ties these together: a small sample must land strictly between a
-proven proxy and a proven-bad one. Never at the bottom (that removes the
-incentive to try anything new), never at the top (that hands the pool to noise).
+| no observations | the pool median (~10-12) | see §2 |
+| 1 success | ~55 | **above** untried and failing proxies |
+| 48 of 50 successes | ~90+ | **well above** any small sample |
+| 40% success rate (20 of 50) | ~38-45 | **substantially above** untried baseline |
+| 1 failure | ~7.5 | recoverable, but below untried baseline |
+| 2 consecutive failures | ~5.0 | strictly below untried baseline |
+| 50 of 50 failures | ~0.04 | effectively out |
 
 ### The latency component has to be calibrated on the real population
 
@@ -162,67 +174,35 @@ proxy at 0 and silently delete the whole 30-point component - the ranking then
 runs on success rate and consistency alone and nobody notices, because no error
 is raised and the scores still look like scores.
 
-The shipped 5000/30000 covers the observed free-proxy `avg_latency_ms` range of
-8-33 seconds. The 300/2000 they started at is a datacenter figure; against this
-population it scored a constant 0. **When the proxy population changes, re-check
-these two numbers against the real latency distribution.**
+*(Revision from Issue #21)*: Feedback latency measures the **target website's response time
+via the proxy**, not bare proxy connect latency. For slow target sites (e.g. 15s-30s),
+the earlier 5000/30000 thresholds compressed the best proxies' 30-point latency component
+by ~80%. The recalibrated defaults `latency_full_score_ms = 15000` and `latency_zero_score_ms = 60000`
+provide proper discrimination across real target response times.
 
-### Recovery from a single failure
+### Recovery from a single failure and ranking order
 
-The mirror image of "one success must not crown" is "one failure must not
-exile". A single fresh failure scores ~29, climbs slowly as the result decays,
-and returns to the untried baseline once the result passes
-`elo_max_result_age_hours`.
+A single fresh failure scores ~7.5, climbs slowly as the result decays,
+and returns to the untried baseline once the result passes `elo_max_result_age_hours` (48 hours).
+Crucially, proxies that suffer 2+ consecutive failures score 2-5 points, ensuring that
+proven failures are not promoted over untried proxies.
 
-That threshold is therefore the real knob for how long one bad result costs a
-proxy its traffic — while it sits below the baseline it is outside the top pool,
-so it collects no feedback and has nothing to recover *with*, apart from the
-`exploration_ratio` budget. The shipped default is 48 hours rather than the
-7 days it started at, because a week below baseline for a single failure is
-punitive enough to recreate the exile this system exists to prevent.
+### Recency Circuit Breaker
 
-Two things have to hold for that sentence to be true, and both are easy to break
-by accident:
+To prevent sudden outages or target bans from slowly bleeding client requests over a 50-item
+window, scoring incorporates a **Recency Circuit Breaker**:
+When a proxy has at least 10 observations (`len(recent) >= 10`) and its most recent 10 results
+are all failures (`sum(recent_10_successes) == 0`), a steep penalty multiplier (`0.15`) is
+applied to its raw score. This plunges even a previously high-scoring (~70 point) proxy to
+<8 points, dropping it below the untried baseline (<10) and evicting it from the top pool on
+the next sync cycle (within 120s).
 
-- **The cumulative counters are not a fallback for an expired window.**
-  `success_count` / `failure_count` never expire. Reading them when the window
-  has emptied re-applies the very result `elo_max_result_age_hours` just forgave,
-  and a single failure then decays asymptotically toward 50 without ever
-  arriving — 40.3 at 49 hours with the shipped half-life. So the scorer
-  distinguishes *never observed* (fall back to the counters; a stat restored
-  from an old backup or from the proxies table has nothing else) from
-  *observed, then aged out* (return the baseline outright).
-- **Expiry and exploration eligibility use one definition.** The exploration
-  budget is the only way back for a proxy scoring below the baseline, so if it
-  asks "does this proxy have a result?" while the scorer asks "does it have a
-  result that still counts?", a proxy is exiled by evidence the scorer has
-  already discarded. `_unexpired_results()` is that single definition, and both
-  call it. Among eligible proxies, selection prefers one that has never been
-  handed out; after every candidate has been tried, it rotates to the one handed
-  out least recently so a client that omits feedback cannot monopolize the
-  exploration budget.
+### Softmax Selection Strategy
 
-Note the recovery curve has a discontinuity at that threshold (the result is
-dropped outright rather than fading out). Smoothing it would mean blending the
-whole score toward 50 by evidence weight, which measurably pushes a 48-of-50
-proxy below the 90-point target above — i.e. it requires re-tuning the
-component weights, not just adding a blend. Deliberately not done.
-
-The measured curve for one failure at the shipped defaults: 29.0 fresh, 31.7 at
-24h, 33.2 at 47h, and the untried baseline from 48h on.
-
-### What this forbids
-
-Making new proxies start low, or start at zero, or serve a probationary sentence
-before they can be selected. If one-hit wonders crowd the pool, raise the prior
-(`elo_prior_successes` / `elo_prior_failures`) so small samples shrink harder
-toward 0.5 — do not push the starting point down.
-
-The median baseline of §2 is not an exception to this. Mid-pack is not low: it
-is the definition of "we do not know yet", and it moves with the pool instead of
-having to be re-tuned every time the components are. What is forbidden is a
-starting point *below* the measured distribution, or one a proxy has to serve
-time to escape.
+To avoid the collapse of selection discrimination under linear weighting (`max(floor, score)`),
+the default selection strategy is `softmax` with `softmax_temperature = 14.0`. This provides
+an exponential advantage (~30:1 or more) for high-performing nodes over mediocre ones while
+avoiding the catastrophic hard-cutoff hazards of small fixed pool sizes.
 
 ---
 
