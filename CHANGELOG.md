@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased — PR #22: Restore adaptive feedback scoring, add circuit breaker, switch to softmax
+
+This change closes [Issue #21](https://github.com/fangwangme/SmartProxy/issues/21).
+
+### Scoring and Selection
+
+- **Softmax selection strategy**: Defaults to `selection_strategy = softmax` with `softmax_temperature = 14.0`, providing smooth exponential discrimination (~30:1 for high-performing nodes vs mediocre ones) without hard cutoff truncation risks.
+- **Calibrated Beta prior**: Weakened to `elo_prior_successes = 0.25` and `elo_prior_failures = 0.75` (strength 1.0, center 0.25) to align with actual baseline success rate (~10%–25%).
+- **Calibrated latency band**: Updated to `latency_full_score_ms = 15000` and `latency_zero_score_ms = 60000` to reflect real target website response times via free proxies.
+- **Recency Circuit Breaker**: Introduced `elo_circuit_breaker_multiplier = 0.15` and dynamic cap below the baseline (`min(penalized, baseline - 1.0)`) when the last 10 requests all fail, guaranteeing immediate ejection on the next sync cycle.
+- **Pure-failure suppression**: Proxies with 0 successes and >= 2 failures are capped at `baseline * 0.5`, guaranteeing `40% success >> untried baseline >> 2+ consecutive failures` under any pool median.
+- **Historical counter cold-start fix**: All-failure historical counter records from DB reseeding are scaled below baseline instead of receiving a legacy 10.0 floor.
+- **Exploration ratio**: Recommended default raised to `exploration_ratio = 0.15` to ensure steady traffic for newly discovered proxies.
+
+### Upgrade and Migration Guide
+
+Existing deployments upgrading should update `config/config.ini` under `[source_pool]`:
+```ini
+[source_pool]
+selection_strategy = softmax
+softmax_temperature = 14.0
+exploration_ratio = 0.15
+latency_full_score_ms = 15000
+latency_zero_score_ms = 60000
+elo_prior_successes = 0.25
+elo_prior_failures = 0.75
+elo_new_proxy_consistency_bonus = 0.0
+elo_circuit_breaker_multiplier = 0.15
+```
+After modifying configuration, restart the service or call `POST /reload-sources` to apply tunables immediately.
+
 ## 3.3.3 — 2026-09-02 — PR #20: Dashboard interval K-line alignment, Today quick jump, and time window selection
 
 This change closes [Issue #19](https://github.com/fangwangme/SmartProxy/issues/19).

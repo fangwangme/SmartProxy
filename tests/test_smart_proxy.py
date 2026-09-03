@@ -1318,6 +1318,7 @@ class TestIssue13PoolQuality(ProxyManagerTestBase):
             ("source_pool", "elo_prior_successes"),
             ("source_pool", "elo_prior_failures"),
             ("source_pool", "elo_new_proxy_consistency_bonus"),
+            ("source_pool", "elo_circuit_breaker_multiplier"),
             ("source_pool", "rescore_on_sync_enabled"),
             ("source_pool", "max_feedback_latency_ms"),
             ("validator", "validation_new_proxy_ratio"),
@@ -2473,7 +2474,17 @@ class TestIssue17DynamicBaseline(ProxyManagerTestBase):
     """
 
     def _measured_stat(self, successes, failures, latency_ms=15000):
-        results = [(True, latency_ms)] * successes + [(False, None)] * failures
+        # Interleave successes and failures to represent a sustained rate rather than a tail outage
+        results = []
+        total = successes + failures
+        s_left, f_left = successes, failures
+        for i in range(total):
+            if s_left > 0 and (f_left == 0 or (i * successes) % total < successes):
+                results.append((True, latency_ms))
+                s_left -= 1
+            else:
+                results.append((False, None))
+                f_left -= 1
         return self.make_stat(results)
 
     def _population(self, count=9, trials=20, top_rate=0.4):
@@ -2801,14 +2812,43 @@ class TestIssue21AdaptiveScoringAndSoftmax(ProxyManagerTestBase):
         """
         Scoring ladder constraint:
         score(40% success rate) >> score(untried baseline) >> score(2 consecutive failures).
+        The baseline is derived through a realistic pool distribution with broken/failing proxies,
+        verifying that elo_baseline_floor prevents inversion under production-like conditions.
         """
-        self.manager.baseline_scores["source1"] = 10.0
+        # Populate pool with a realistic distribution of active measured proxies:
+        # 1 high performer, 2 mediocre, and 10 failing/broken proxies (where raw median < 3.0)
+        now = time.time()
+        measured = []
+        for i in range(10):
+            url = f"http://failing-proxy-{i}:8080"
+            stat = self.manager._get_new_proxy_stat("source1")
+            stat["recent_results"] = [[now - j, False, None] for j in range(15)]
+            stat["score"] = self.manager._calculate_elo_score(stat, "source1")
+            self.manager.active_proxies.add(url)
+            self.manager.source_stats["source1"][url] = stat
+            measured.append((url, stat))
+
+        # Add 2 mid-tier proxies
+        for i in range(2):
+            url = f"http://mid-proxy-{i}:8080"
+            stat = self.manager._get_new_proxy_stat("source1")
+            stat["recent_results"] = [
+                [now - j, (j % 3 == 0), 20000 if (j % 3 == 0) else None]
+                for j in range(15)
+            ]
+            stat["score"] = self.manager._calculate_elo_score(stat, "source1")
+            self.manager.active_proxies.add(url)
+            self.manager.source_stats["source1"][url] = stat
+            measured.append((url, stat))
+
+        # Derive baseline dynamically through pool sync logic
+        derived_baseline = self.manager._compute_baseline_score(measured)
+        self.manager.baseline_scores["source1"] = derived_baseline
+
         untried_stat = self.manager._get_new_proxy_stat("source1")
         score_untried = self.manager._calculate_elo_score(untried_stat, "source1")
 
         # 40% success rate: 20 successes at 20000ms, 30 failures (interleaved)
-        # 10 cycles of (True, False, False) = 10 wins, 20 losses; 10 cycles of (True, False) = 10 wins, 10 losses.
-        # Total: 20 wins, 30 losses (40% success rate).
         results_40 = ([(True, 20000), (False, None), (False, None)] * 10) + (
             [(True, 20000), (False, None)] * 10
         )
@@ -2821,52 +2861,69 @@ class TestIssue21AdaptiveScoringAndSoftmax(ProxyManagerTestBase):
         score_2_fail = self.manager._calculate_elo_score(stat_2_fail, "source1")
 
         print(
-            f"\n[Scoring Ladder] 40% success: {score_40:.2f}, "
-            f"untried baseline: {score_untried:.2f}, "
+            f"\n[Scoring Ladder (Realistic Derived Baseline)] 40% success: {score_40:.2f}, "
+            f"untried baseline: {score_untried:.2f} (derived: {derived_baseline:.2f}), "
             f"2 consecutive failures: {score_2_fail:.2f}"
         )
 
         self.assertGreater(score_40, score_untried)
         self.assertGreater(score_untried, score_2_fail)
         self.assertGreaterEqual(score_40, 30.0)
-        self.assertAlmostEqual(score_untried, 10.0, places=1)
-        self.assertLessEqual(score_2_fail, 6.0)
+        self.assertAlmostEqual(score_untried, derived_baseline, places=2)
+        self.assertLessEqual(score_2_fail, score_untried * 0.51)
 
     def test_recency_circuit_breaker_plunges_score_below_untried_baseline(self):
         """
         Recency Circuit Breaker:
-        A previously high-scoring proxy (e.g. 30 wins, 10 losses) that experiences
-        10 consecutive failures is plunged below the untried baseline (< 10).
+        A top performer with 40 successes (15s latency) that experiences 10 consecutive
+        failures is dynamically capped below the untried baseline (score < baseline).
         """
         self.manager.baseline_scores["source1"] = 10.0
         untried_score = self.manager._baseline_score("source1")
 
-        # Previously high-scoring proxy: 30 wins, 10 failures
         now = time.time()
+        # Top-tier veteran proxy: 40 consecutive successes at 15000ms latency
         stat = self.manager._get_new_proxy_stat("source1")
-        # Older 40 results
-        for i in range(10):
-            stat["recent_results"].append([now - 50 + i, False, None])
-        for i in range(30):
-            stat["recent_results"].append([now - 40 + i, True, 20000])
+        for i in range(40):
+            stat["recent_results"].append([now - 50 + i, True, 15000])
 
         score_before = self.manager._calculate_elo_score(stat, "source1")
 
-        # Append 10 consecutive failures
+        # Sudden outage: 10 consecutive failures at tail of window
         for i in range(10):
             stat["recent_results"].append([now - 10 + i, False, None])
 
         score_after = self.manager._calculate_elo_score(stat, "source1")
 
         print(
-            f"\n[Circuit Breaker] score_before: {score_before:.2f}, "
+            f"\n[Circuit Breaker (40-win Veteran Outage)] score_before: {score_before:.2f}, "
             f"score_after: {score_after:.2f}, "
             f"untried baseline: {untried_score:.2f}"
         )
 
-        self.assertGreater(score_before, 50.0)
+        self.assertGreater(score_before, 70.0)
         self.assertLess(score_after, untried_score)
-        self.assertLess(score_after, 10.0)
+        self.assertLessEqual(score_after, untried_score - 1.0)
+
+    def test_historical_all_failure_record_does_not_bypass_baseline(self):
+        """
+        When restoring from DB counters without a recent window, an all-failure
+        historical record (e.g. 0 successes, 10 failures) must not receive a 10.0 floor
+        and must score strictly below the baseline.
+        """
+        self.manager.baseline_scores["source1"] = 10.0
+        stat = self.manager._get_new_proxy_stat("source1")
+        stat.update({
+            "success_count": 0,
+            "failure_count": 10,
+            "recent_results": [],
+            "last_feedback_ts": time.time(),
+        })
+
+        score = self.manager._calculate_elo_score(stat, "source1")
+        print(f"\n[Historical All-Failure Counter] score: {score:.2f} vs baseline: 10.0")
+        self.assertLess(score, 5.0)
+        self.assertLess(score, self.manager._baseline_score("source1"))
 
     def test_config_drift_check_returns_clean_for_shipped_config(self):
         """
@@ -2895,6 +2952,7 @@ class TestIssue21AdaptiveScoringAndSoftmax(ProxyManagerTestBase):
         self.assertEqual(example_manager.elo_prior_successes, 0.25)
         self.assertEqual(example_manager.elo_prior_failures, 0.75)
         self.assertEqual(example_manager.elo_new_proxy_consistency_bonus, 0.0)
+        self.assertEqual(example_manager.elo_circuit_breaker_multiplier, 0.15)
 
 
 if __name__ == "__main__":

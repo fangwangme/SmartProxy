@@ -397,6 +397,15 @@ class ProxyManager:
                 "source_pool", "elo_new_proxy_consistency_bonus", fallback=0.0
             ),
         )
+        self.elo_circuit_breaker_multiplier = max(
+            0.01,
+            min(
+                1.0,
+                self.config.getfloat(
+                    "source_pool", "elo_circuit_breaker_multiplier", fallback=0.15
+                ),
+            ),
+        )
         # Recompute every stat's score during pool sync so time decay actually
         # applies to idle proxies instead of freezing their last score.
         self.rescore_on_sync_enabled = self.config.getboolean(
@@ -2350,8 +2359,13 @@ class ProxyManager:
             # trimmed away) rather than to the neutral baseline.
             total = stat.get("success_count", 0) + stat.get("failure_count", 0)
             if total > 0:
-                success_rate = stat.get("success_count", 0) / total
-                historical_score = min(100, max(0, success_rate * 80 + 10))
+                success_count = stat.get("success_count", 0)
+                if success_count == 0:
+                    # An all-failure historical record must not receive an arbitrary floor
+                    historical_score = max(0.0, min(baseline - 1.0, 10.0 / total))
+                else:
+                    success_rate = success_count / total
+                    historical_score = min(100.0, max(0.0, success_rate * 80.0 + 10.0))
 
                 if self.elo_time_decay_enabled:
                     last_feedback_ts = self._coerce_timestamp(
@@ -2468,17 +2482,24 @@ class ProxyManager:
 
         raw_score = min(100.0, max(0.0, success_score + latency_score + consistency_score))
 
+        # Pure failure suppression:
+        # A proxy with zero successes and 2 or more failures must never outrank
+        # the untried baseline, regardless of where the pool's median sits.
+        if successes_weight == 0 and len(recent) >= 2:
+            raw_score = min(raw_score, max(0.0, baseline * 0.5))
+
         # Recency Circuit Breaker:
         # If a proxy has at least 10 observations and all recent 10 requests failed,
-        # apply a steep penalty (0.15 multiplier) to plunge its score below the untried
-        # baseline (< 10), immediately ejecting it from the top pool.
+        # apply penalty multiplier and dynamically cap strictly below untried baseline
+        # (at least 1.0 point lower) so that it is guaranteed to be ejected on the next sync.
         if len(recent) >= 10:
             recent_10 = recent[-10:]
             recent_10_successes = sum(
                 1 for r in recent_10 if len(r) >= 2 and bool(r[1])
             )
             if recent_10_successes == 0:
-                raw_score *= 0.15
+                penalized = raw_score * self.elo_circuit_breaker_multiplier
+                raw_score = min(penalized, max(0.0, baseline - 1.0))
 
         return raw_score
 

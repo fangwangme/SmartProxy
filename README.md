@@ -175,11 +175,13 @@ The service is configured via the config.ini file.
   * predefined\_sources: A comma-separated list of logical names for your proxy pools (e.g., google\_search, web\_scraping).  
   * default\_source: The pool to use if a requested source doesn't exist.  
 * **\[source\_pool\]**: Parameters for the scoring and selection algorithm.
-  * selection\_strategy: `uniform`, `tiered`, `weighted`, or `softmax`. Note that `uniform` draws every proxy in the pool with equal probability, so the score only decides pool membership and the ranking is otherwise discarded; `weighted` is recommended.
+  * selection\_strategy: `uniform`, `tiered`, `weighted`, or `softmax`. Note that `uniform` draws every proxy in the pool with equal probability, so the score only decides pool membership and the ranking is otherwise discarded; `softmax` is recommended.
+  * softmax\_temperature: Controls temperature scaling for softmax selection (default `14.0`).
   * proxy\_cooldown\_ms: Minimum delay before the same proxy is handed out again for the same source.
-  * exploration\_ratio: Share of requests spent on proxies without unexpired feedback. Never-handed candidates are preferred; after all candidates have been tried, the least-recently-handed-out one is explored next. Set to `0` to disable.
-  * elo\_prior\_successes / elo\_prior\_failures: Beta prior that shrinks small samples toward the neutral score.
-  * latency\_full\_score\_ms / latency\_zero\_score\_ms: The latency band the 30-point latency component is scaled over. These must bracket the latencies the proxies really have (free proxies here run 8-33s); set below the population, every proxy scores 0 and the component silently stops ranking anything. Re-check them if the proxy population changes.
+  * exploration\_ratio: Share of requests spent on proxies without unexpired feedback (default `0.15`). Never-handed candidates are preferred; after all candidates have been tried, the least-recently-handed-out one is explored next. Set to `0` to disable.
+  * elo\_prior\_successes / elo\_prior\_failures: Beta prior (default `0.25` / `0.75`) providing weak regularization aligned with baseline proxy success rates.
+  * latency\_full\_score\_ms / latency\_zero\_score\_ms: The latency band the 30-point latency component is scaled over (default `15000` / `60000` ms). These bracket target response times via proxy. Re-check them if the proxy population changes.
+  * elo\_circuit\_breaker\_multiplier: Penalty multiplier for sudden 10-consecutive failure outages (default `0.15`), dynamically capping score below untried baseline.
   * rescore\_on\_sync\_enabled: Recompute every score during pool sync so time decay applies to idle proxies.
   * ELO window/decay settings and latency thresholds (`elo_max_window`, `elo_scoring_window`, `elo_decay_half_life_hours`, `elo_max_result_age_hours`, `latency_full_score_ms`, `latency_zero_score_ms`, `max_feedback_latency_ms`).
   * elo\_max\_result\_age\_hours: How long one bad result costs a proxy its traffic. Past this age the result stops counting entirely and the proxy returns to the neutral baseline, so this is the real knob for failure recovery. Defaults to 48.
