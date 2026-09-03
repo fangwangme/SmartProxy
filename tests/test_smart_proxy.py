@@ -108,6 +108,11 @@ class ProxyManagerTestBase(unittest.TestCase):
         self.MockDatabaseManager = patcher_db.start()
 
         self.manager = ProxyManager(self.config_path)
+        # Rebuild the serving plan on every draw. Production refreshes it on a
+        # timer and tolerates the staleness; tests mutate proxy state directly
+        # and then assert on the very next call, so they need the control plane
+        # to be current. Plan staleness itself is covered explicitly below.
+        self.manager.serving_plan_max_age_s = 0.0
         self.mock_db_instance = self.MockDatabaseManager.return_value
         # Default to "no persisted history"; tests about reputation
         # persistence override this with real rows.
@@ -251,7 +256,9 @@ class TestProxyManager(ProxyManagerTestBase):
             proxy = self.manager.get_proxy("source1")
 
         self.assertEqual(proxy, "http://2.2.2.2:80")
-        self.assertEqual(choices.call_args.kwargs["weights"], [10.0, 90.0])
+        # Weights are cumulative because the plan precomputes them, which is
+        # what turns the draw into a bisect instead of a pass over the pool.
+        self.assertEqual(choices.call_args.kwargs["cum_weights"], [10.0, 100.0])
 
     def test_get_premium_proxy_returns_proxy_when_available(self):
         """Test get_premium_proxy returns a proxy when premium pool is available."""
@@ -3074,7 +3081,7 @@ class TestIssue23AdaptiveExplorationAndProbation(ProxyManagerTestBase):
             patch("src.core.proxy_manager.random.random", side_effect=rolls),
             patch.object(
                 self.manager,
-                "_select_exploration_candidate",
+                "_take_trial_candidate",
                 return_value="exploration",
             ),
             patch.object(self.manager, "_mark_proxy_handed_out"),
@@ -3091,25 +3098,39 @@ class TestIssue23AdaptiveExplorationAndProbation(ProxyManagerTestBase):
         self.assertLessEqual(exploration_count / 100, ratio + 0.01)
 
     def test_discovery_gets_two_thirds_of_exploration_when_both_sides_exist(self):
-        groups = {
-            "discovery": ["discovery"],
-            "probation": ["probation"],
-            "retry": ["retry"],
-        }
-        with (
-            patch("src.core.proxy_manager.random.random", return_value=0.65),
-            patch("src.core.proxy_manager.random.choice", side_effect=lambda seq: seq[0]),
-        ):
+        def plan():
+            return {
+                "discovery": ["discovery"],
+                "fallback": ["probation", "retry"],
+                "members": {"discovery", "probation", "retry"},
+            }
+
+        with patch("src.core.proxy_manager.random.random", return_value=0.65):
             self.assertEqual(
-                self.manager._select_exploration_candidate(groups), "discovery"
+                self.manager._take_trial_candidate(plan()), "discovery"
             )
         with (
             patch("src.core.proxy_manager.random.random", return_value=0.70),
-            patch("src.core.proxy_manager.random.choice", side_effect=lambda seq: seq[0]),
+            patch("src.core.proxy_manager.random.randrange", return_value=0),
         ):
             self.assertEqual(
-                self.manager._select_exploration_candidate(groups), "probation"
+                self.manager._take_trial_candidate(plan()), "probation"
             )
+
+    def test_taking_a_trial_candidate_removes_it_from_the_plan(self):
+        plan = {
+            "discovery": ["a", "b"],
+            "fallback": [],
+            "members": {"a", "b"},
+        }
+        first = self.manager._take_trial_candidate(plan)
+        second = self.manager._take_trial_candidate(plan)
+
+        # Removal is the in-flight lease for trial traffic: no third draw, and
+        # no proxy handed out twice before its result comes back.
+        self.assertEqual({first, second}, {"a", "b"})
+        self.assertEqual(plan["members"], set())
+        self.assertIsNone(self.manager._take_trial_candidate(plan))
 
     def test_three_probation_attempts_then_two_delayed_retries(self):
         proxy = "http://probation:80"
@@ -3144,7 +3165,7 @@ class TestIssue23AdaptiveExplorationAndProbation(ProxyManagerTestBase):
         self.assertEqual(stat["trial_handout_count"], 5)
         self.assertIsNone(self.manager.get_proxy("source1"))
 
-    def test_inflight_blocks_concurrent_handout_and_timeout_recovers(self):
+    def test_inflight_blocks_concurrent_trial_handout_and_timeout_recovers(self):
         proxy = "http://single:80"
         self.manager.active_proxies = {proxy}
         self.manager.source_stats["source1"] = {
@@ -3155,11 +3176,12 @@ class TestIssue23AdaptiveExplorationAndProbation(ProxyManagerTestBase):
             "bottom_tier": [],
         }
 
+        # An untried proxy is a trial candidate, so it is held to one in-flight
+        # handout however high proxy_max_inflight is.
+        self.manager.proxy_max_inflight = 8
         self.assertEqual(self.manager.get_proxy("source1"), proxy)
         self.assertIsNone(self.manager.get_proxy("source1"))
-        self.manager.source_stats["source1"][proxy]["outstanding_until"] = (
-            time.time() - 1
-        )
+        self.manager.source_stats["source1"][proxy]["inflight"] = [time.time() - 1]
         self.assertEqual(self.manager.get_proxy("source1"), proxy)
 
     def test_time_forgiveness_opens_a_new_trial_epoch_without_erasing_history(self):
@@ -3639,12 +3661,71 @@ class TestIssue23ReviewFixes(ProxyManagerTestBase):
         }
 
         # No feedback comes back, so every handout holds its in-flight lease.
-        served = [self.manager.get_proxy("source1") for _ in range(120)]
+        self.manager.proxy_max_inflight = 2
+        served = [self.manager.get_proxy("source1") for _ in range(240)]
 
         self.assertNotIn(None, served)
         self.assertEqual(len(set(served)), 120)
         self.assertTrue(set(urls[40:]) & set(served), "bottom tier never served")
+        # Capacity is qualified proxies x per-proxy concurrency, not the top
+        # tier and not one request per proxy.
         self.assertIsNone(self.manager.get_proxy("source1"))
+
+    def test_per_proxy_concurrency_is_the_capacity_knob(self):
+        now = time.time()
+        proxy = "http://busy:80"
+        pool = self._pool([proxy])
+        pool[proxy] |= {
+            "recent_results": [[now - 5 + tick, True, 900] for tick in range(5)],
+            "quality_slow": 0.6,
+            "quality_fast": 0.6,
+            "quality_updated_ts": now,
+            "score": 60.0,
+            "last_feedback_ts": now - 5,
+        }
+        self.assertTrue(self.manager._is_qualified(pool[proxy]))
+
+        self.manager.proxy_max_inflight = 4
+        self.assertEqual(
+            [self.manager.get_proxy("source1") for _ in range(4)], [proxy] * 4
+        )
+        self.assertIsNone(self.manager.get_proxy("source1"))
+
+        # Feedback closes one outstanding handout, freeing exactly one slot.
+        self.manager.process_feedback("source1", proxy, 200)
+        self.assertEqual(self.manager.get_proxy("source1"), proxy)
+        self.assertIsNone(self.manager.get_proxy("source1"))
+
+    def test_zero_max_inflight_means_unlimited_for_qualified_proxies(self):
+        now = time.time()
+        proxy = "http://unbounded:80"
+        pool = self._pool([proxy])
+        pool[proxy] |= {
+            "recent_results": [[now - 5 + tick, True, 900] for tick in range(5)],
+            "quality_slow": 0.6,
+            "quality_fast": 0.6,
+            "quality_updated_ts": now,
+            "score": 60.0,
+            "last_feedback_ts": now - 5,
+        }
+        self.manager.proxy_max_inflight = 0
+
+        served = [self.manager.get_proxy("source1") for _ in range(50)]
+
+        self.assertEqual(served, [proxy] * 50)
+
+    def test_legacy_single_slot_lease_migrates_into_the_inflight_list(self):
+        now = time.time()
+        stat = self.manager._migrate_legacy_stat(
+            {"success_count": 1, "outstanding_until": now + 60}
+        )
+        self.assertEqual(len(stat["inflight"]), 1)
+        self.assertNotIn("outstanding_until", stat)
+
+        expired = self.manager._migrate_legacy_stat(
+            {"success_count": 1, "outstanding_until": now - 60}
+        )
+        self.assertEqual(expired["inflight"], [])
 
     # --- the outage guard has to work at this deployment's success rate -----
 
@@ -3711,7 +3792,7 @@ class TestIssue23ReviewFixes(ProxyManagerTestBase):
             selected = self.manager.get_proxy("source1")
             if selected is None:
                 break
-            self.manager.source_stats["source1"][selected]["outstanding_until"] = 0.0
+            self.manager.source_stats["source1"][selected]["inflight"] = []
             self.manager.process_feedback("source1", selected, 500)
 
         spent_after = {

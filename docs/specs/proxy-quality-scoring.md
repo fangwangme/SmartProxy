@@ -112,10 +112,18 @@ strategy; it is not the eligibility set. Restricting eligibility to the top
 tier caps in-flight concurrency at `top_tier_size` and returns "no proxy
 available" while the rest of the ranked, qualified pool sits idle.
 
-Every handout creates an in-flight lease. That proxy is ineligible until its
-feedback arrives or `proxy_inflight_timeout_seconds` expires, preventing one
-candidate from absorbing a burst before its result is known. Cooldown is an
-additional optional constraint.
+A trial candidate is claimed out of the serving plan when it is handed out and
+returned when its feedback arrives, so one candidate cannot absorb a burst
+before its result is known. Removal *is* the lease, which is why it costs
+nothing on the request path; `proxy_inflight_timeout_seconds` bounds how long a
+claim survives if feedback never comes.
+
+Qualified proxies are not serialised. Their success rate is already known, so
+holding each to one outstanding request would cap the service at (qualified
+proxies / round-trip time) - single-digit requests per second for a pool of a
+hundred against a slow target. `proxy_max_inflight` is available as a per-proxy
+capacity guard and defaults to 0, meaning unlimited. Cooldown is an additional
+optional constraint, applied when the plan is built.
 
 ## 5. Source-wide outage guard
 
@@ -151,6 +159,27 @@ charged. A completed recovery window reaching
 `outage_recovery_baseline_ratio` of the baseline, with enough distinct
 proxies, resumes learning. Transitions are logged, and
 Prometheus metrics expose active state and paused-update totals per source.
+
+## 5a. Serving plan
+
+Routing is split into a control plane and a data plane.
+
+`_build_serving_plan()` decides everything: which proxies are live, qualified
+and eligible, which are trial candidates and in which group, what the
+exploration budget is, and what the selection weights are. It runs inside the
+pool sync - reusing the pass that already refreshes every score and ranks the
+pool, rather than sweeping it a second time - and on `serving_plan_max_age_seconds`
+between syncs.
+
+`get_proxy()` holds no pool logic. It reads the plan, spends one random draw on
+the exploration budget, and takes either a trial candidate (O(1), removed from
+the plan) or a weighted exploit pick (O(log n), against cumulative weights the
+plan precomputed). Nothing in it scales with the size of the pool.
+
+The plan is therefore allowed to be slightly stale, and that staleness is
+bounded by its refresh interval. What must not be stale - whether a trial
+candidate is currently out - is maintained by claim and return, not by
+rescanning.
 
 ## 6. Persistence and migration
 

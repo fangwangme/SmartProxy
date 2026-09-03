@@ -131,6 +131,8 @@ class ProxyManager:
         self.premium_proxies: List[str] = []  # High-quality proxies for Playwright
         self.proxy_last_handed_out_ts: Dict[str, Dict[str, float]] = defaultdict(dict)
         self.outage_states: Dict[str, Dict] = {}
+        # source -> ready-to-serve plan; see _build_serving_plan().
+        self.serving_plans: Dict[str, Dict] = {}
         self.cold_start_fallback_logged: Set[str] = set()
 
         # Serialises the whole snapshot -> dump -> fsync -> replace sequence.
@@ -372,6 +374,25 @@ class ProxyManager:
         )
         self.proxy_inflight_timeout_s = self._cfg_float(
             "source_pool", "proxy_inflight_timeout_seconds", 120.0, low=0.1
+        )
+        # How many requests one *qualified* proxy may carry at once. This is a
+        # per-proxy capacity limit, not a learning limit: a proxy whose success
+        # rate is already known does not need its results serialised, and
+        # holding it to one in-flight request caps the whole service at
+        # (qualified proxies / round-trip time) - about 6 req/s for a pool of
+        # 115 at a 20s round trip. 0 means unlimited. Trial candidates are
+        # always held to one, because that is where a burst really would spend
+        # the probation budget before returning a single bit of information.
+        self.proxy_max_inflight = self._cfg_int(
+            "source_pool", "proxy_max_inflight", 0, low=0
+        )
+        # The serving plan is the control plane: eligibility, ranking and
+        # weights are computed on this interval, off the request path, and
+        # get_proxy() then does one weighted draw from the result. Staleness
+        # costs at most this many seconds of routing to a proxy that has since
+        # changed state - which validation and feedback correct anyway.
+        self.serving_plan_max_age_s = self._cfg_float(
+            "source_pool", "serving_plan_max_age_seconds", 2.0, low=0.0
         )
         self.selection_weight_floor = self._cfg_float(
             "source_pool", "selection_weight_floor", 1.0, low=0.01
@@ -1351,11 +1372,35 @@ class ProxyManager:
                             source, feedback_history.get(proxy_url)
                         )
 
-                # Age every estimator toward the fixed prior before ranking.
-                # This is the recovery path for idle proxies; it does not use
-                # validator measurements or the measured population median.
-                for stat in stats_pool.values():
+                # One pass: age every estimator toward the fixed prior, and
+                # classify the live ones while their score is in hand. This is
+                # also the recovery path for idle proxies; it uses neither
+                # validator measurements nor the population median.
+                now_ts = time.time()
+                groups = {"discovery": [], "probation": [], "retry": []}
+                qualified_count = 0
+                live_count = 0
+                max_trials = self.probation_attempts + self.retry_attempts
+                for proxy_url, stat in stats_pool.items():
                     self._refresh_score(stat, source)
+                    if proxy_url not in self.active_proxies:
+                        continue
+                    live_count += 1
+                    self._refresh_trial_epoch(stat, now_ts)
+                    if self._is_qualified(stat, now_ts):
+                        qualified_count += 1
+                        continue
+                    trial_handouts = int(stat.get("trial_handout_count", 0) or 0)
+                    if trial_handouts >= max_trials:
+                        continue
+                    if trial_handouts == 0 and not self._has_unexpired_results(
+                        stat, now_ts
+                    ):
+                        groups["discovery"].append(proxy_url)
+                    elif trial_handouts < self.probation_attempts:
+                        groups["probation"].append(proxy_url)
+                    else:
+                        groups["retry"].append(proxy_url)
 
                 stats_pool = self._truncate_stats_pool(source, stats_pool)
                 self.source_stats[source] = stats_pool
@@ -1384,6 +1429,17 @@ class ProxyManager:
 
                 self.available_proxies[source]["top_tier"] = top_tier
                 self.available_proxies[source]["bottom_tier"] = bottom_tier
+
+                # The ranking this loop just produced is exactly what the
+                # serving plan needs, so it is assembled here rather than by a
+                # second sweep over the same pool.
+                self._build_serving_plan(
+                    source,
+                    now_ts=now_ts,
+                    groups=groups,
+                    qualified_count=qualified_count,
+                    live_count=live_count,
+                )
 
                 logger.info(
                     f"Source '{source}' synced. "
@@ -1634,7 +1690,11 @@ class ProxyManager:
             return 0
         now_ts = time.time() if now_ts is None else now_ts
         cutoff = now_ts - self.probation_forgiveness_hours * 3600
-        window = results[-self.reliability_recent_results_limit :]
+        # The feedback path already caps this list at the limit, so slicing it
+        # would copy up to 100 entries per proxy per request to produce the
+        # same list back. Only pay for the copy when there is really an excess.
+        limit = self.reliability_recent_results_limit
+        window = results if len(results) <= limit else results[-limit:]
         return len(window) - bisect_right(window, cutoff, key=lambda result: result[0])
 
     @staticmethod
@@ -1778,6 +1838,8 @@ class ProxyManager:
                     last_backup_time = now
                     threading.Thread(target=self.backup_stats, daemon=True).start()
 
+                self.refresh_serving_plans()
+
                 self.stop_scheduler_event.wait(5)
             except Exception as e:
                 logger.error(f"Error in scheduler loop: {e}", exc_info=True)
@@ -1830,7 +1892,7 @@ class ProxyManager:
             "handout_count": 0,
             "trial_handout_count": 0,
             "last_handed_out_ts": None,
-            "outstanding_until": 0.0,
+            "inflight": [],
             "retry_after_ts": 0.0,
         }
         if not history:
@@ -2076,93 +2138,252 @@ class ProxyManager:
         return source if is_defined else self.default_source
 
     def get_proxy(self, source: str) -> Optional[str]:
-        """Route one request through a shared adaptive exploration budget."""
+        """
+        Draw one proxy from the current serving plan.
+
+        The request path deliberately holds no pool logic: eligibility,
+        qualification, ranking and weights are all decided by
+        _build_serving_plan() on a timer. What is left here is one coin flip
+        for the exploration budget and one draw - O(1) for a trial candidate,
+        O(log n) for a weighted exploit pick - so throughput is bounded by the
+        draw, not by the size of the pool.
+        """
         source = self._get_source_or_default(source)
 
         with self.lock:
-            proxy_pools = self.available_proxies.get(source)
-            if not proxy_pools:
+            plan = self._serving_plan(source)
+            if plan is None:
                 logger.warning(f"No proxy pools defined for source '{source}'.")
                 return None
 
-            top_tier = proxy_pools.get("top_tier", [])
-            bottom_tier = proxy_pools.get("bottom_tier", [])
-            stats_pool = self.source_stats.get(source, {})
             now_ts = time.time()
+            exploit = plan["exploit"]
+            trial_available = len(plan["discovery"]) + len(plan["fallback"])
 
-            # The whole ranked pool exploits, not just the top tier. Tiering is
-            # a weighting device for the `tiered` strategy; treating it as the
-            # eligibility set caps concurrency at top_tier_size and leaves the
-            # rest of the ranked, qualified pool idle while requests 404.
-            exploit_pool = top_tier + bottom_tier
-            exploit_candidates = [
-                proxy_url
-                for proxy_url in exploit_pool
-                if self._is_eligible(source, proxy_url, now_ts)
-                # Ranked-pool membership implies servability: a URL the sync put
-                # in the pool without a stat entry is still a live proxy.
-                and (
-                    proxy_url not in stats_pool
-                    or self._is_qualified(stats_pool[proxy_url], now_ts)
-                )
-            ]
-            # One pass over the live pool answers both questions: which proxies
-            # are trial candidates, and how much of the pool is already
-            # qualified. Scanning separately for each - and revalidating every
-            # stored result on the way - is what put this call in the hundreds
-            # of milliseconds.
-            exploration_groups, qualified_count, live_count = self._scan_trial_pool(
-                source, now_ts
-            )
-            has_exploration = any(exploration_groups.values())
-            exploration_ratio = self._exploration_ratio_for(
-                live_count, qualified_count
-            )
-            if exploit_candidates:
-                self.cold_start_fallback_logged.discard(source)
+            if trial_available and (
+                not exploit or random.random() < plan["exploration_ratio"]
+            ):
+                selected = self._take_trial_candidate(plan)
+                if selected is not None:
+                    if not exploit and source not in self.cold_start_fallback_logged:
+                        logger.warning(
+                            "Source '{}' has no qualified exploit candidate; serving "
+                            "trial traffic through the explicit cold-start fallback "
+                            "above the {:.1f}% budget.",
+                            source,
+                            plan["exploration_ratio"] * 100,
+                        )
+                        self.cold_start_fallback_logged.add(source)
+                    self._mark_proxy_handed_out(source, selected, now_ts)
+                    return selected
 
-            explore = has_exploration and (
-                not exploit_candidates or random.random() < exploration_ratio
-            )
-            if explore:
-                selected = self._select_exploration_candidate(exploration_groups)
-                if (
-                    not exploit_candidates
-                    and source not in self.cold_start_fallback_logged
-                ):
-                    logger.warning(
-                        "Source '{}' has no qualified exploit candidate; serving trial "
-                        "traffic through the explicit cold-start fallback above the {:.1f}% budget.",
-                        source,
-                        exploration_ratio * 100,
-                    )
-                    self.cold_start_fallback_logged.add(source)
-                self._mark_proxy_handed_out(source, selected, now_ts)
-                return selected
-
-            if not exploit_candidates:
+            if not exploit:
                 logger.warning(
-                    "No eligible proxy for source '{}' after qualification, retry, "
-                    "cooldown, and in-flight filtering.",
+                    "No eligible proxy for source '{}' in the current serving plan.",
                     source,
                 )
                 return None
 
-            if self.selection_strategy == "uniform":
-                selected = random.choice(exploit_candidates)
-            elif self.selection_strategy == "tiered":
-                selected = self._select_from_tiers(
-                    source, top_tier, bottom_tier, exploit_candidates
-                )
-            elif self.selection_strategy == "softmax":
-                selected = self._select_weighted_by_score(
-                    source, exploit_candidates, softmax=True
-                )
-            else:
-                selected = self._select_weighted_by_score(source, exploit_candidates)
-
+            self.cold_start_fallback_logged.discard(source)
+            selected = self._draw_exploit(plan)
             self._mark_proxy_handed_out(source, selected, now_ts)
             return selected
+
+    @staticmethod
+    def _pop_random(pool: List[str]) -> str:
+        """Remove and return a uniformly random member in O(1)."""
+        index = random.randrange(len(pool))
+        selected = pool[index]
+        pool[index] = pool[-1]
+        pool.pop()
+        return selected
+
+    def _take_trial_candidate(self, plan: Dict) -> Optional[str]:
+        """
+        Claim a trial candidate, removing it from the plan.
+
+        Removal *is* the in-flight lease for trial traffic: a proxy on probation
+        cannot be handed out twice before its result comes back, and enforcing
+        that by deletion costs nothing on the request path. Feedback puts it
+        back, and so does the next plan rebuild once the lease has expired.
+        """
+        discovery, fallback = plan["discovery"], plan["fallback"]
+        if discovery and fallback:
+            pool = (
+                discovery
+                if random.random() < self.exploration_discovery_share
+                else fallback
+            )
+        else:
+            pool = discovery or fallback
+        if not pool:
+            return None
+        selected = self._pop_random(pool)
+        plan["members"].discard(selected)
+        return selected
+
+    def _return_trial_candidate(self, source: str, proxy_url: str, stat: Dict):
+        """Feedback arrived: the candidate is claimable again."""
+        plan = self.serving_plans.get(source)
+        if plan is None or proxy_url in plan["members"]:
+            return
+        if self._is_qualified(stat):
+            return
+        trial_handouts = int(stat.get("trial_handout_count", 0) or 0)
+        if trial_handouts >= self.probation_attempts + self.retry_attempts:
+            return
+        if trial_handouts >= self.probation_attempts:
+            if (stat.get("retry_after_ts") or 0.0) > time.time():
+                return
+            plan["fallback"].append(proxy_url)
+        elif trial_handouts == 0 and not self._has_unexpired_results(stat, time.time()):
+            plan["discovery"].append(proxy_url)
+        else:
+            plan["fallback"].append(proxy_url)
+        plan["members"].add(proxy_url)
+
+    def _draw_exploit(self, plan: Dict) -> str:
+        exploit = plan["exploit"]
+        cum_weights = plan["cum_weights"]
+        if cum_weights is None:
+            return random.choice(exploit)
+        # cum_weights are precomputed, so this is a bisect, not a pass over the
+        # population the way random.choices(weights=...) would be.
+        return random.choices(exploit, cum_weights=cum_weights, k=1)[0]
+
+    def _serving_plan(self, source: str) -> Optional[Dict]:
+        plan = self.serving_plans.get(source)
+        if (
+            plan is not None
+            and time.time() - plan["built_at"] <= self.serving_plan_max_age_s
+        ):
+            return plan
+        return self._build_serving_plan(source)
+
+    def refresh_serving_plans(self):
+        """Rebuild every source's plan; called by the scheduler, off-path."""
+        with self.lock:
+            for source in list(self.predefined_sources):
+                self._build_serving_plan(source)
+
+    def _build_serving_plan(
+        self,
+        source: str,
+        now_ts: Optional[float] = None,
+        groups: Optional[Dict[str, List[str]]] = None,
+        qualified_count: Optional[int] = None,
+        live_count: Optional[int] = None,
+    ) -> Optional[Dict]:
+        """
+        Assemble what this source is willing to serve, and how it is weighted.
+
+        This is the only place proxy state is examined for routing. The pool
+        sync passes in the classification it already computed while ranking;
+        a standalone refresh recomputes it. Caller must hold self.lock.
+        """
+        pools = self.available_proxies.get(source)
+        if pools is None:
+            return None
+        now_ts = time.time() if now_ts is None else now_ts
+        stats_pool = self.source_stats.get(source, {})
+        if groups is None or qualified_count is None or live_count is None:
+            groups, qualified_count, live_count = self._scan_trial_pool(
+                source, now_ts
+            )
+
+        # The whole ranked pool exploits; tiering only weights the `tiered`
+        # strategy. Membership in the ranked pool implies servability, so a URL
+        # the sync placed there without a stat is still a live proxy.
+        ranked = list(pools.get("top_tier", [])) + list(pools.get("bottom_tier", []))
+        exploit = [
+            proxy_url
+            for proxy_url in ranked
+            if self._is_eligible(source, proxy_url, now_ts)
+            and (
+                proxy_url not in stats_pool
+                or self._is_qualified(stats_pool[proxy_url], now_ts)
+            )
+        ]
+
+        discovery = [
+            proxy_url
+            for proxy_url in groups["discovery"]
+            if self._is_eligible(source, proxy_url, now_ts)
+        ]
+        fallback = [
+            proxy_url
+            for proxy_url in groups["probation"]
+            if self._is_eligible(source, proxy_url, now_ts)
+        ] + [
+            proxy_url
+            for proxy_url in groups["retry"]
+            if self._is_eligible(source, proxy_url, now_ts)
+            and (stats_pool[proxy_url].get("retry_after_ts") or 0.0) <= now_ts
+        ]
+
+        plan = {
+            "built_at": now_ts,
+            "exploit": exploit,
+            "cum_weights": self._exploit_cum_weights(source, exploit),
+            "discovery": discovery,
+            "fallback": fallback,
+            "members": set(discovery) | set(fallback),
+            "exploration_ratio": self._exploration_ratio_for(
+                live_count, qualified_count
+            ),
+            "qualified": qualified_count,
+            "live": live_count,
+        }
+        self.serving_plans[source] = plan
+        return plan
+
+    def _exploit_cum_weights(
+        self, source: str, candidates: List[str]
+    ) -> Optional[List[float]]:
+        """
+        Cumulative selection weights, or None when the draw is uniform.
+
+        Computed once per plan rather than once per request: softmax over a
+        200-proxy pool is a couple of hundred exp() calls, which is nothing on
+        a timer and everything on a hot path.
+        """
+        if not candidates or self.selection_strategy == "uniform":
+            return None
+        stats = self.source_stats.get(source, {})
+        default_score = self._baseline_score(source)
+        scores = [
+            float(stats.get(proxy_url, {}).get("score", default_score))
+            for proxy_url in candidates
+        ]
+        if self.selection_strategy == "softmax":
+            top = max(scores)
+            weights = [
+                math.exp((score - top) / self.softmax_temperature) for score in scores
+            ]
+        elif self.selection_strategy == "tiered":
+            # Keep the tier split as a two-level weighting rather than a
+            # separate code path: the top tier collectively receives
+            # top_tier_load_percentage of the traffic.
+            top_tier = set(self.available_proxies.get(source, {}).get("top_tier", []))
+            in_top = [url for url in candidates if url in top_tier]
+            share = self.top_tier_load_percentage / 100
+            if not in_top or len(in_top) == len(candidates):
+                weights = [1.0] * len(candidates)
+            else:
+                top_weight = share / len(in_top)
+                bottom_weight = (1 - share) / (len(candidates) - len(in_top))
+                weights = [
+                    top_weight if url in top_tier else bottom_weight
+                    for url in candidates
+                ]
+        else:
+            weights = [max(self.selection_weight_floor, score) for score in scores]
+
+        cumulative, running = [], 0.0
+        for weight in weights:
+            running += weight
+            cumulative.append(running)
+        return cumulative if running > 0 else None
 
     def _exploration_ratio_for(self, live_count: int, qualified_count: int) -> float:
         """
@@ -2181,19 +2402,73 @@ class ProxyManager:
             self.exploration_max_ratio - self.exploration_min_ratio
         ) * progress
 
+    def _has_unexpired_results(self, stat: Dict, now_ts: float) -> bool:
+        """Whether any stored result still counts. O(1): the list is sorted."""
+        results = stat.get("recent_results")
+        return bool(results) and (
+            results[-1][0] > now_ts - self.probation_forgiveness_hours * 3600
+        )
+
     def _is_qualified(self, stat: Dict, now_ts: Optional[float] = None) -> bool:
+        """
+        Live, evidenced and scoring above the prior.
+
+        Qualification asks whether the count reaches a threshold, never what
+        the count is, and recent_results is sorted - so the k-th newest entry
+        answers it outright. Counting the window instead put a binary search
+        plus a comparison callback on the busiest path in the service: this is
+        evaluated for every ranked candidate on every single request.
+        """
+        results = stat.get("recent_results")
+        needed = self.qualification_min_results
+        if not results or len(results) < needed:
+            return False
+        now_ts = time.time() if now_ts is None else now_ts
+        if results[-needed][0] <= now_ts - self.probation_forgiveness_hours * 3600:
+            return False
         baseline = self._baseline_score()
+        return float(stat.get("score", baseline)) > baseline
+
+    def _lease_count(self, stat: Dict, now_ts: float) -> int:
+        """
+        In-flight handouts for this proxy, expiring the ones nobody reported.
+
+        Every lease is granted with the same timeout, so the list is appended
+        in expiry order and the expired ones are always a prefix.
+        """
+        leases = stat.get("inflight")
+        if not leases:
+            return 0
+        expired = bisect_right(leases, now_ts)
+        if expired:
+            del leases[:expired]
+        return len(leases)
+
+    def _grant_lease(self, stat: Dict, now_ts: float):
+        leases = stat.get("inflight")
+        if not isinstance(leases, list):
+            leases = stat["inflight"] = []
+        leases.append(now_ts + self.proxy_inflight_timeout_s)
+
+    @staticmethod
+    def _release_lease(stat: Dict):
+        """Feedback closes the oldest outstanding handout for this proxy."""
+        leases = stat.get("inflight")
+        if leases:
+            del leases[0]
+
+    def _inflight_limit(self, stat: Dict, now_ts: Optional[float] = None) -> int:
         return (
-            self._unexpired_count(stat, now_ts) >= self.qualification_min_results
-            and float(stat.get("score", baseline)) > baseline
+            self.proxy_max_inflight
+            if self._is_qualified(stat, now_ts)
+            else 1
         )
 
     def _refresh_trial_epoch(self, stat: Dict, now_ts: float):
         # Reads only fields this class writes as floats, and _migrate_legacy_stat
         # has already coerced anything that arrived from a file. Re-validating
         # them per proxy per request is the kind of defence that only costs.
-        if (stat.get("outstanding_until") or 0.0) <= now_ts:
-            stat["outstanding_until"] = 0.0
+        self._lease_count(stat, now_ts)
 
         anchor = max(
             stat.get("last_feedback_ts") or 0.0,
@@ -2202,13 +2477,18 @@ class ProxyManager:
         if anchor and now_ts - anchor > self.probation_forgiveness_hours * 3600:
             stat["trial_handout_count"] = 0
             stat["retry_after_ts"] = 0.0
-            stat["outstanding_until"] = 0.0
 
     def _scan_trial_pool(
         self, source: str, now_ts: Optional[float] = None
     ) -> Tuple[Dict[str, List[str]], int, int]:
         """
         One pass over the live pool: trial candidates plus the qualified count.
+
+        Membership only. The transient gates - in-flight lease, cooldown, retry
+        delay - are deliberately *not* applied here: they change on every
+        handout, and folding them into an index that is reused across requests
+        would make a proxy invisible for as long as the index lived. They are
+        applied to the one candidate actually picked, by _is_trial_candidate().
 
         Iterates active_proxies rather than the stats pool, which also holds
         the retained history of every proxy that has died - typically an order
@@ -2220,8 +2500,6 @@ class ProxyManager:
         max_trials = self.probation_attempts + self.retry_attempts
         qualified_count = 0
         live_count = 0
-        cooldown_s = self.proxy_cooldown_ms / 1000
-        last_handed_out = self.proxy_last_handed_out_ts.get(source, {})
         for proxy_url in self.active_proxies:
             stat = stats_pool.get(proxy_url)
             if stat is None:
@@ -2231,34 +2509,16 @@ class ProxyManager:
             if self._is_qualified(stat, now_ts):
                 qualified_count += 1
                 continue
-            # _is_eligible() inlined: this loop runs once per live proxy per
-            # request, and the call plus its two dict re-lookups showed up.
-            if (stat.get("outstanding_until") or 0.0) > now_ts:
-                continue
-            if now_ts - last_handed_out.get(proxy_url, 0.0) < cooldown_s:
-                continue
             trial_handouts = int(stat.get("trial_handout_count", 0) or 0)
-            if trial_handouts == 0 and self._unexpired_count(stat, now_ts) == 0:
+            if trial_handouts >= max_trials:
+                continue
+            if trial_handouts == 0 and not self._has_unexpired_results(stat, now_ts):
                 groups["discovery"].append(proxy_url)
             elif trial_handouts < self.probation_attempts:
                 groups["probation"].append(proxy_url)
-            elif trial_handouts < max_trials:
-                if (stat.get("retry_after_ts") or 0.0) <= now_ts:
-                    groups["retry"].append(proxy_url)
+            else:
+                groups["retry"].append(proxy_url)
         return groups, qualified_count, live_count
-
-    def _select_exploration_candidate(self, groups: Dict[str, List[str]]) -> str:
-        discovery = groups["discovery"]
-        probation_retry = groups["probation"] + groups["retry"]
-        if discovery and probation_retry:
-            candidates = (
-                discovery
-                if random.random() < self.exploration_discovery_share
-                else probation_retry
-            )
-        else:
-            candidates = discovery or probation_retry
-        return random.choice(candidates)
 
     def _mark_proxy_handed_out(self, source: str, proxy_url: str, now_ts: float):
         self.proxy_last_handed_out_ts[source][proxy_url] = now_ts
@@ -2267,14 +2527,21 @@ class ProxyManager:
             return
         stat["handout_count"] = int(stat.get("handout_count", 0) or 0) + 1
         stat["last_handed_out_ts"] = now_ts
-        stat["outstanding_until"] = now_ts + self.proxy_inflight_timeout_s
+        qualified = self._is_qualified(stat, now_ts)
+        # Track the outstanding handout only where something reads it back: a
+        # trial candidate, whose one-at-a-time rule the plan enforces, or a
+        # deployment that has opted into a per-proxy concurrency cap. With the
+        # cap off there is nothing to compare against, and appending to a list
+        # nobody consults just grows it between syncs.
+        if not qualified or self.proxy_max_inflight > 0:
+            self._grant_lease(stat, now_ts)
         # A paused source produces no usable evidence, so a handout made during
         # one must not spend the trial budget it would otherwise be judged on:
         # the guard exists to keep an outage from costing proxies their
         # reputation, and the trial budget is part of that reputation.
         if self.outage_states.get(source, {}).get("active"):
             return
-        if not self._is_qualified(stat, now_ts):
+        if not qualified:
             stat["trial_handout_count"] = int(
                 stat.get("trial_handout_count", 0) or 0
             ) + 1
@@ -2284,13 +2551,16 @@ class ProxyManager:
     def _is_eligible(
         self, source: str, proxy_url: str, now_ts: Optional[float] = None
     ) -> bool:
-        """Cooldown and in-flight lease, the two gates every handout must pass."""
+        """Cooldown and in-flight capacity, the gates every handout must pass."""
         now_ts = time.time() if now_ts is None else now_ts
         last_handed_out = self.proxy_last_handed_out_ts.get(source, {})
         if now_ts - last_handed_out.get(proxy_url, 0.0) < self.proxy_cooldown_ms / 1000:
             return False
         stat = self.source_stats.get(source, {}).get(proxy_url)
-        return not stat or (stat.get("outstanding_until") or 0.0) <= now_ts
+        if stat is None:
+            return True
+        limit = self._inflight_limit(stat, now_ts)
+        return limit <= 0 or self._lease_count(stat, now_ts) < limit
 
     def _select_from_tiers(
         self,
@@ -2510,9 +2780,20 @@ class ProxyManager:
         stat["last_handed_out_ts"] = self._coerce_timestamp(
             stat.get("last_handed_out_ts"), now_ts
         )
-        stat["outstanding_until"] = (
-            self._coerce_timestamp(stat.get("outstanding_until")) or 0.0
-        )
+        # Migrate the single-slot lease that scoring_version 2 persisted, and
+        # drop expired leases from either shape on the way in.
+        leases = stat.get("inflight")
+        if not isinstance(leases, list):
+            legacy = self._coerce_timestamp(stat.get("outstanding_until")) or 0.0
+            leases = [legacy] if legacy > now_ts else []
+        else:
+            leases = sorted(
+                expiry
+                for expiry in (self._coerce_timestamp(raw) for raw in leases)
+                if expiry is not None and expiry > now_ts
+            )
+        stat["inflight"] = leases
+        stat.pop("outstanding_until", None)
         stat["retry_after_ts"] = (
             self._coerce_timestamp(stat.get("retry_after_ts")) or 0.0
         )
@@ -2881,7 +3162,7 @@ class ProxyManager:
             if reported_stat is not None:
                 # Feedback completes the outstanding allocation even when an
                 # outage guard pauses the reputation mutation itself.
-                reported_stat["outstanding_until"] = 0.0
+                self._release_lease(reported_stat)
 
             source_reputation_paused = self._observe_source_outage_locked(
                 source, proxy_url, is_success, current_timestamp
@@ -2986,6 +3267,7 @@ class ProxyManager:
             stat["retry_after_ts"] = 0.0
         elif stat["trial_handout_count"] >= self.probation_attempts:
             stat["retry_after_ts"] = current_timestamp + self.retry_delay_s
+        self._return_trial_candidate(source, proxy_url, stat)
         
         response_time_str = f"{latency_for_log:.0f}" if latency_for_log is not None else "N/A"
         logger.debug(
