@@ -715,6 +715,11 @@ class ProxyManager:
 
             self.check_config_drift()
 
+            # Routing tunables - strategy, temperature, exploration ratios -
+            # are baked into the serving plan, so a reload that left the plans
+            # standing would not be authoritative until they aged out.
+            self.serving_plans.clear()
+
             self.fetcher_jobs = new_fetcher_jobs
             new_job_names = {job["name"] for job in self.fetcher_jobs}
             added_jobs = list(new_job_names - old_job_names)
@@ -769,6 +774,8 @@ class ProxyManager:
                     self.source_stats.pop(source, None)
                     self.available_proxies.pop(source, None)
                     self.outage_states.pop(source, None)
+                    self.serving_plans.pop(source, None)
+                    self.proxy_last_handed_out_ts.pop(source, None)
                     self.cold_start_fallback_logged.discard(source)
                     logger.info(
                         f"Cleaned up in-memory pool for removed source: {source}"
@@ -1413,6 +1420,16 @@ class ProxyManager:
 
                 stats_pool = self._truncate_stats_pool(source, stats_pool)
                 self.source_stats[source] = stats_pool
+
+                # Handout times outlive the pool entries they describe, so
+                # prune them alongside it rather than letting them accumulate
+                # one entry per proxy ever served.
+                handed_out = self.proxy_last_handed_out_ts.get(source)
+                if handed_out:
+                    for proxy_url in [
+                        url for url in handed_out if url not in stats_pool
+                    ]:
+                        del handed_out[proxy_url]
 
                 sorted_proxies = sorted(
                     stats_pool.items(),
@@ -2537,7 +2554,11 @@ class ProxyManager:
         return groups, qualified_count, live_count
 
     def _mark_proxy_handed_out(self, source: str, proxy_url: str, now_ts: float):
-        self.proxy_last_handed_out_ts[source][proxy_url] = now_ts
+        # Handout times exist only to answer the cooldown question. With
+        # cooldown off - the default - recording them is a write on the hot
+        # path feeding a map that is never read and never shrinks.
+        if self.proxy_cooldown_ms > 0:
+            self.proxy_last_handed_out_ts[source][proxy_url] = now_ts
         stat = self.source_stats.get(source, {}).get(proxy_url)
         if stat is None:
             return

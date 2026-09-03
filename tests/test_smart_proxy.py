@@ -3823,6 +3823,93 @@ class TestIssue23ReviewFixes(ProxyManagerTestBase):
             "nothing was promoted while the pool qualified",
         )
 
+    # --- routing state must not outlive what it describes ------------------
+
+    def test_reload_drops_routing_state_for_a_removed_source(self):
+        overrides = {"sources": {"predefined_sources": "source1,source2",
+                                 "default_source": "source1"}}
+        path = write_config_file(
+            self.tmp_dir,
+            {section: dict(options) for section, options in self.config_dict.items()}
+            | overrides,
+            name="reload-drop.ini",
+        )
+        manager = ProxyManager(path)
+        manager.serving_plan_max_age_s = 0.0
+        proxy = "http://shared:80"
+        for source in ("source1", "source2"):
+            manager.active_proxies.add(proxy)
+            manager.source_stats[source] = {
+                proxy: manager._get_new_proxy_stat(source)
+            }
+            manager.available_proxies[source] = {"top_tier": [], "bottom_tier": []}
+            manager.proxy_cooldown_ms = 500
+            self.assertEqual(manager.get_proxy(source), proxy)
+        self.assertIn("source2", manager.serving_plans)
+        self.assertIn("source2", manager.proxy_last_handed_out_ts)
+
+        import configparser as _cp
+        config = _cp.ConfigParser()
+        config.read(path, encoding="utf-8")
+        config["sources"]["predefined_sources"] = "source1"
+        with open(path, "w", encoding="utf-8") as handle:
+            config.write(handle)
+        manager.reload_sources()
+
+        # Everything else about source2 is cleaned up on reload; routing state
+        # has to go with it, or a re-added source would serve from the old pool.
+        self.assertNotIn("source2", manager.source_stats)
+        self.assertNotIn("source2", manager.serving_plans)
+        self.assertNotIn("source2", manager.proxy_last_handed_out_ts)
+
+    def test_reload_rebuilds_plans_so_new_tunables_take_effect(self):
+        self.manager.serving_plan_max_age_s = 600.0
+        self._pool(["http://a:80", "http://b:80"])
+        self.manager._build_serving_plan("source1")
+        self.assertIn("source1", self.manager.serving_plans)
+
+        self.manager.reload_sources()
+
+        # A reload that left the plans standing would not be authoritative
+        # until they aged out.
+        self.assertEqual(self.manager.serving_plans, {})
+
+    def test_handout_times_are_only_kept_while_cooldown_uses_them(self):
+        urls = [f"http://ht-{index}:80" for index in range(5)]
+        self._pool(urls)
+        self.manager.proxy_cooldown_ms = 0
+        for _ in range(20):
+            selected = self.manager.get_proxy("source1")
+            if selected is not None:
+                self.manager.process_feedback("source1", selected, 200)
+        # The map answers the cooldown question and nothing else, so with
+        # cooldown off it must not be written at all.
+        self.assertEqual(self.manager.proxy_last_handed_out_ts.get("source1", {}), {})
+
+        self.manager.proxy_cooldown_ms = 500
+        selected = self.manager.get_proxy("source1")
+        self.assertIsNotNone(selected)
+        self.assertEqual(
+            list(self.manager.proxy_last_handed_out_ts["source1"]), [selected]
+        )
+
+    def test_sync_prunes_handout_times_for_proxies_that_left_the_pool(self):
+        urls = [f"http://gone-{index}:80" for index in range(4)]
+        self._pool(urls)
+        self.manager.proxy_cooldown_ms = 500
+        for url in urls:
+            self.manager.proxy_last_handed_out_ts["source1"][url] = time.time()
+
+        self.mock_db_instance.get_active_proxies.return_value = {urls[0]}
+        self.manager.source_stats["source1"] = {
+            urls[0]: self.manager.source_stats["source1"][urls[0]]
+        }
+        self.manager._sync_and_select_top_proxies()
+
+        self.assertEqual(
+            set(self.manager.proxy_last_handed_out_ts["source1"]), {urls[0]}
+        )
+
     # --- the outage guard has to work at this deployment's success rate -----
 
     def _low_baseline_guard(self):
