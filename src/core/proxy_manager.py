@@ -248,7 +248,7 @@ class ProxyManager:
             "source_pool", "weighted_selection_enabled", fallback=False
         )
         self.selection_strategy = self.config.get(
-            "source_pool", "selection_strategy", fallback="uniform"
+            "source_pool", "selection_strategy", fallback="softmax"
         ).strip().lower()
         if self.weighted_selection_enabled and self.selection_strategy == "uniform":
             self.selection_strategy = "tiered"
@@ -275,7 +275,7 @@ class ProxyManager:
             max(
                 0.0,
                 self.config.getfloat(
-                    "source_pool", "exploration_ratio", fallback=0.05
+                    "source_pool", "exploration_ratio", fallback=0.15
                 ),
             ),
         )
@@ -285,22 +285,20 @@ class ProxyManager:
         )
         self.softmax_temperature = max(
             0.1,
-            self.config.getfloat("source_pool", "softmax_temperature", fallback=20.0),
+            self.config.getfloat("source_pool", "softmax_temperature", fallback=14.0),
         )
         self.avg_latency_alpha = min(
             1.0,
             max(0.01, self.config.getfloat("source_pool", "avg_latency_alpha", fallback=0.3)),
         )
         # Calibrated for free proxies, whose observed avg_latency_ms sits in
-        # the 8-33 second range. The datacenter-grade 300/2000 these defaults
-        # started at put every real proxy past the zero point, so the latency
-        # component scored a constant 0 and stopped ranking anything.
+        # the 8-33 second range and real target response times sit in 15-30s.
         self.latency_full_score_ms = max(
-            1, self.config.getint("source_pool", "latency_full_score_ms", fallback=5000)
+            1, self.config.getint("source_pool", "latency_full_score_ms", fallback=15000)
         )
         self.latency_zero_score_ms = max(
             self.latency_full_score_ms + 1,
-            self.config.getint("source_pool", "latency_zero_score_ms", fallback=30000),
+            self.config.getint("source_pool", "latency_zero_score_ms", fallback=60000),
         )
         self.max_feedback_latency_ms = max(
             1,
@@ -383,16 +381,30 @@ class ProxyManager:
                 "source_pool", "elo_max_result_age_hours", fallback=48.0
             ),
         )
-        # Beta prior on the observed success rate. It shrinks small samples
-        # toward the neutral 0.5 baseline so a single lucky observation cannot
-        # outrank a proxy with a full window of successes.
+        # Beta prior on the observed success rate. Weak prior aligned with
+        # the base success rate distribution.
         self.elo_prior_successes = max(
             0.0,
-            self.config.getfloat("source_pool", "elo_prior_successes", fallback=2.0),
+            self.config.getfloat("source_pool", "elo_prior_successes", fallback=0.25),
         )
         self.elo_prior_failures = max(
             0.0,
-            self.config.getfloat("source_pool", "elo_prior_failures", fallback=2.0),
+            self.config.getfloat("source_pool", "elo_prior_failures", fallback=0.75),
+        )
+        self.elo_new_proxy_consistency_bonus = max(
+            0.0,
+            self.config.getfloat(
+                "source_pool", "elo_new_proxy_consistency_bonus", fallback=0.0
+            ),
+        )
+        self.elo_circuit_breaker_multiplier = max(
+            0.01,
+            min(
+                1.0,
+                self.config.getfloat(
+                    "source_pool", "elo_circuit_breaker_multiplier", fallback=0.15
+                ),
+            ),
         )
         # Recompute every stat's score during pool sync so time decay actually
         # applies to idle proxies instead of freezing their last score.
@@ -2347,8 +2359,13 @@ class ProxyManager:
             # trimmed away) rather than to the neutral baseline.
             total = stat.get("success_count", 0) + stat.get("failure_count", 0)
             if total > 0:
-                success_rate = stat.get("success_count", 0) / total
-                historical_score = min(100, max(0, success_rate * 80 + 10))
+                success_count = stat.get("success_count", 0)
+                if success_count == 0:
+                    # An all-failure historical record must not receive an arbitrary floor
+                    historical_score = max(0.0, min(baseline - 1.0, 10.0 / total))
+                else:
+                    success_rate = success_count / total
+                    historical_score = min(100.0, max(0.0, success_rate * 80.0 + 10.0))
 
                 if self.elo_time_decay_enabled:
                     last_feedback_ts = self._coerce_timestamp(
@@ -2461,9 +2478,30 @@ class ProxyManager:
             else:
                 consistency_score = recent_success_rate * 10  # Proportional
         else:
-            consistency_score = 5  # Neutral for new proxies
+            consistency_score = self.elo_new_proxy_consistency_bonus
 
-        return min(100, max(0, success_score + latency_score + consistency_score))
+        raw_score = min(100.0, max(0.0, success_score + latency_score + consistency_score))
+
+        # Pure failure suppression:
+        # A proxy with zero successes and 2 or more failures must never outrank
+        # the untried baseline, regardless of where the pool's median sits.
+        if successes_weight == 0 and len(recent) >= 2:
+            raw_score = min(raw_score, max(0.0, baseline * 0.5))
+
+        # Recency Circuit Breaker:
+        # If a proxy has at least 10 observations and all recent 10 requests failed,
+        # apply penalty multiplier and dynamically cap strictly below untried baseline
+        # (at least 1.0 point lower) so that it is guaranteed to be ejected on the next sync.
+        if len(recent) >= 10:
+            recent_10 = recent[-10:]
+            recent_10_successes = sum(
+                1 for r in recent_10 if len(r) >= 2 and bool(r[1])
+            )
+            if recent_10_successes == 0:
+                penalized = raw_score * self.elo_circuit_breaker_multiplier
+                raw_score = min(penalized, max(0.0, baseline - 1.0))
+
+        return raw_score
 
     def process_feedback(
         self,
