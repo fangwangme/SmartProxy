@@ -23,10 +23,10 @@ def configure_logging_from_file(config_path: str, level: str):
     log_file_base_name = config.get("logging", "log_file_base_name", fallback="proxy")
     setup_logging(level, log_dir=log_dir, log_file_base_name=log_file_base_name)
 
-def load_proxy_manager(config_path: str) -> ProxyManager:
-    logger.info("Initializing ProxyManager...")
-    manager = ProxyManager(config_path)
-    manager.restore_stats()  # Restore from backup if available
+def load_proxy_manager(config_path: str, restore_mode: str = "normal") -> ProxyManager:
+    logger.info("Initializing ProxyManager in '{}' restore mode...", restore_mode)
+    manager = ProxyManager(config_path, restore_mode=restore_mode)
+    manager.restore_stats()
     manager._sync_and_select_top_proxies()
     manager._sync_premium_proxies()  # Sync premium proxies on startup
     manager._update_dashboard_sources()
@@ -76,6 +76,17 @@ def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="SmartProxy Service")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging for validation")
+    restore_group = parser.add_mutually_exclusive_group()
+    restore_group.add_argument(
+        "--no-restore",
+        action="store_true",
+        help="Skip JSON restore and write to isolated experiment state",
+    )
+    restore_group.add_argument(
+        "--fresh-scoring",
+        action="store_true",
+        help="Skip all reputation hydration/writes and use isolated scoring state",
+    )
     args = parser.parse_args()
     
     # Setup logging from config after CLI flags are known. The logger module has a
@@ -90,7 +101,15 @@ def main():
     logging.getLogger("werkzeug").setLevel(logging.WARNING)
     
     # Initialize ProxyManager
-    proxy_manager = load_proxy_manager(CONFIG_FILE_PATH)
+    restore_mode = (
+        "fresh-scoring"
+        if args.fresh_scoring
+        else "no-restore"
+        if args.no_restore
+        else "normal"
+    )
+    logger.info("Selected scoring restore mode: {}", restore_mode)
+    proxy_manager = load_proxy_manager(CONFIG_FILE_PATH, restore_mode=restore_mode)
     proxy_manager.debug_mode = args.debug
 
     # Create Flask App

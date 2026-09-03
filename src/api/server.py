@@ -152,9 +152,25 @@ def create_app(proxy_manager: ProxyManager):
                 for stat in source_stats.values():
                     total_success += stat.get("success_count", 0)
                     total_failure += stat.get("failure_count", 0)
+            outage_metrics = [
+                (
+                    str(source).replace("\\", "\\\\").replace('"', '\\"'),
+                    1 if state.get("active") else 0,
+                    int(state.get("paused_updates", 0)),
+                )
+                for source, state in proxy_manager.outage_states.items()
+            ]
         
         total_requests = total_success + total_failure
         success_rate = (total_success / total_requests * 100) if total_requests > 0 else 0
+        outage_active_lines = "\n".join(
+            f'smartproxy_source_outage_guard_active{{source="{source}"}} {active}'
+            for source, active, _ in outage_metrics
+        )
+        outage_paused_lines = "\n".join(
+            f'smartproxy_source_outage_guard_paused_updates_total{{source="{source}"}} {paused}'
+            for source, _, paused in outage_metrics
+        )
         
         # Prometheus text format
         metrics_text = f"""# HELP smartproxy_active_proxies Number of active proxies
@@ -181,6 +197,14 @@ smartproxy_success_rate_percent {success_rate:.2f}
 # HELP smartproxy_is_validating Whether validation is in progress
 # TYPE smartproxy_is_validating gauge
 smartproxy_is_validating {1 if proxy_manager.is_validating else 0}
+
+# HELP smartproxy_source_outage_guard_active Whether source reputation updates are paused
+# TYPE smartproxy_source_outage_guard_active gauge
+{outage_active_lines}
+
+# HELP smartproxy_source_outage_guard_paused_updates_total Reputation updates paused by source outage guard
+# TYPE smartproxy_source_outage_guard_paused_updates_total counter
+{outage_paused_lines}
 """
         return metrics_text, 200, {"Content-Type": "text/plain; charset=utf-8"}
 
@@ -232,8 +256,8 @@ smartproxy_is_validating {1 if proxy_manager.is_validating else 0}
         )
 
         # Validate strictly at the boundary. Anything that reaches
-        # process_feedback is written into the persistent scoring state and is
-        # later fed to _calculate_elo_score for the whole pool, so a single
+        # process_feedback is written into persistent scoring state and is
+        # later replayed by the reliability scorer, so a single
         # wrong-typed value would poison the stat and crash every later sync.
         # bool is a subclass of int, so `type(...) is int` is deliberate.
         if not isinstance(source, str) or not source.strip():

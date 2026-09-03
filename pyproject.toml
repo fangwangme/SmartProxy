@@ -1,6 +1,6 @@
 [project]
 name = "smartproxy"
-version = "3.3.4"
+version = "3.3.5"
 description = "An intelligent, self-adapting proxy pool service"
 requires-python = ">=3.14"
 dependencies = [
@@ -19,7 +19,7 @@ dev = [
 
 [tool.uv]
 # SmartProxy is an application, not a library: the import root is the repo root
-# (run.py does `from main import main`, scripts/start.sh runs `python -m
+# (run.py does `from main import main`, scripts/start_proxy.sh runs `python -m
 # src.main`). Nothing is built or installed for the project itself, so uv sync
 # resolves dependencies only.
 package = false

@@ -1,5 +1,155 @@
 # Changelog
 
+## 3.3.5 — 2026-09-03 — PR #24: Online proxy learning, control-plane routing
+
+This change closes [Issue #23](https://github.com/fangwangme/SmartProxy/issues/23).
+
+The composite ELO score over a sliding window is replaced by two online
+reliability estimators, and routing is split into a control plane and a data
+plane. Thresholds throughout are calibrated against the deployment's own
+feedback record rather than against a pool that mostly succeeds.
+
+### Scoring
+
+- **Two-speed online reliability**: each proxy carries independent per-source
+  `quality_slow` and `quality_fast` estimators, both starting at a fixed
+  `reliability_prior` (5%), with `score = 100 * min(slow, fast)`. The slow
+  estimator (`reliability_slow_alpha = 0.12`) limits one-hit promotion; the fast
+  one (`reliability_fast_alpha = 0.30`) makes deterioration visible immediately.
+- **Fixed prior, never a population median**: the old untried baseline was the
+  median of the measured pool, which collapsed toward zero exactly when most of
+  the pool was failing. The prior is now a constant, chosen from the observed
+  distribution — about 82% of live proxies here sit below a 5% success rate.
+- **Time-based forgiveness**: both estimators decay toward the prior on
+  `reliability_decay_half_life_hours`, so old good and old bad state converge on
+  the same untried score. Ageing cannot reverse the sign of evidence.
+- **Latency leaves the score entirely**: it stays observable as `avg_latency_ms`
+  and only breaks ties between equal scores.
+- **Undated history is not trusted as fresh**: a durable counter record whose
+  `feedback_last_ts` is missing is aged to the prior rather than seeded from its
+  lifetime rate. The raw counters survive, and the proxy re-enters as a
+  discovery candidate.
+
+### Selection and trial allocation
+
+- **Control plane / data plane split**: eligibility, qualification, ranking and
+  selection weights are computed by the serving plan, inside the pass the pool
+  sync already makes over the pool, and refreshed on
+  `serving_plan_max_age_seconds`. `get_proxy()` holds no pool logic — one draw
+  on the exploration budget, then O(1) for a trial candidate or O(log n) against
+  precomputed cumulative weights for an exploit pick. Per-request cost no longer
+  scales with pool size.
+- **One adaptive exploration budget**: falls from `exploration_max_ratio` to
+  `exploration_min_ratio` as the live pool becomes evaluated, measured against
+  the larger of `exploration_target_qualified` and
+  `exploration_target_qualified_ratio` of the live pool. Two thirds goes to
+  never-tried discovery by default.
+- **Probation and delayed retries**: `probation_attempts` immediate handouts,
+  then `retry_attempts` more, each after `retry_delay_seconds`. The budget is
+  spent by trial handouts only, and qualifying returns it, so a later dip below
+  the prior costs probation rather than the pool slot.
+- **Every live qualified proxy exploits**: `max_pool_size` and `top_tier_size`
+  bound the ranked tier lists, which weight the `tiered` strategy. They are not
+  eligibility gates — the tier lists are recomputed only on a pool sync, so
+  gating on them stranded any proxy that qualified in between.
+- **Trial claim and return**: a trial candidate is removed from the plan when
+  handed out and returned when its feedback arrives, which enforces one
+  outstanding request per untried proxy at no per-request cost.
+  `proxy_max_inflight` is an opt-in per-proxy concurrency cap for qualified
+  proxies, default 0 (unlimited); when set, it is enforced on the draw.
+- **`proxy_cooldown_ms` now spaces out trial handouts only.** Applying it to
+  exploitation would drop the busiest — and therefore highest-scoring — proxies
+  from every plan rebuild.
+
+### Source outage guard
+
+- A source-wide outage pauses per-proxy reputation mutation after a healthy
+  completed window, rolls back the triggering window's tentative changes, and
+  resumes on a completed recovery window. Aggregate per-minute feedback
+  continues in every state, and a paused source broadcasts nothing to other
+  sources.
+- **Thresholds are multiples of the source's own baseline**, never absolute
+  ratios, and the verdict window sizes itself so an all-failure run is less
+  likely than `outage_false_positive_budget` — about 66 observations at a 10%
+  baseline, three at 90%. Absolute gates could not work here: none of the
+  observed completed minutes reached a 50% success rate, while 90% failure is
+  normal operation.
+- Prometheus metrics expose active state and paused-update totals per source.
+
+### Persistence and runtime modes
+
+- JSON snapshots carry `scoring_version = 2`. A missing or mismatched version
+  never trusts stored derived scores: valid `recent_results` are replayed in
+  timestamp order. Raw feedback and database counters are preserved.
+- Durable database counters are written monotonically, serialized in-process,
+  and failed batches are re-queued.
+- `--no-restore` skips the JSON restore but keeps database hydration;
+  `--fresh-scoring` skips both and disables durable reputation writes. Each
+  writes to its own sibling snapshot path, so neither touches normal state. The
+  launcher is renamed to `scripts/start_proxy.sh` and forwards both flags.
+
+### Upgrade and Migration Guide
+
+`[source_pool]` is replaced wholesale. Remove these keys — they are no longer
+read, and `check_config_drift()` will report them at startup:
+
+```
+elo_max_window, elo_scoring_window, elo_time_decay_enabled,
+elo_decay_half_life_hours, elo_max_result_age_hours, elo_prior_successes,
+elo_prior_failures, elo_new_proxy_consistency_bonus,
+elo_circuit_breaker_multiplier, elo_baseline_floor, rescore_on_sync_enabled,
+exploration_ratio, latency_full_score_ms, latency_zero_score_ms
+```
+
+Add these (shown at their defaults):
+
+```ini
+[source_pool]
+# two-speed online reliability
+reliability_prior = 0.05
+reliability_slow_alpha = 0.12
+reliability_fast_alpha = 0.30
+reliability_decay_half_life_hours = 24
+reliability_recent_results_limit = 100
+reliability_history_prior_weight = 5
+
+# adaptive exploration, probation and trial claim/return
+exploration_min_ratio = 0.05
+exploration_max_ratio = 0.30
+exploration_target_qualified = 50
+exploration_target_qualified_ratio = 0.5
+exploration_discovery_share = 0.6666666667
+qualification_min_results = 3
+probation_attempts = 3
+retry_attempts = 2
+retry_delay_seconds = 3600
+probation_forgiveness_hours = 48
+proxy_inflight_timeout_seconds = 120
+proxy_max_inflight = 0
+exploit_draw_attempts = 4
+serving_plan_max_age_seconds = 2.0
+
+# source outage guard, relative to each source's own baseline
+outage_guard_enabled = true
+outage_window_size = 20
+outage_window_max_size = 200
+outage_min_distinct_proxies = 10
+outage_false_positive_budget = 0.001
+outage_baseline_alpha = 0.2
+outage_healthy_baseline_ratio = 0.5
+outage_failure_baseline_ratio = 0.1
+outage_recovery_baseline_ratio = 0.3
+```
+
+Also set `proxy_cooldown_ms = 0`: it now applies to trial handouts only, and a
+value below `serving_plan_max_age_seconds` would drop the busiest proxies from
+every plan rebuild. Use `proxy_max_inflight` if per-proxy protection is needed.
+
+Existing JSON snapshots are read without a `scoring_version` and their
+`recent_results` are replayed into the new estimators, so scoring history
+survives the upgrade. `scripts/start.sh` no longer exists; use
+`scripts/start_proxy.sh`.
+
 ## 3.3.4 — 2026-09-03 — PR #22: Restore adaptive feedback scoring, add circuit breaker, switch to softmax
 
 This change closes [Issue #21](https://github.com/fangwangme/SmartProxy/issues/21).

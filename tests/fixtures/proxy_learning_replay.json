@@ -1,0 +1,16 @@
+{
+  "events": [
+    ["proxy-good", true], ["proxy-mixed", false], ["proxy-bad", false],
+    ["proxy-good", true], ["proxy-mixed", true], ["proxy-bad", false],
+    ["proxy-good", true], ["proxy-mixed", false], ["proxy-bad", false],
+    ["proxy-good", true], ["proxy-mixed", true], ["proxy-bad", false],
+    ["proxy-good", true], ["proxy-mixed", false], ["proxy-bad", false],
+    ["proxy-good", true], ["proxy-mixed", true], ["proxy-bad", false],
+    ["proxy-good", true], ["proxy-mixed", false], ["proxy-bad", false],
+    ["proxy-good", true], ["proxy-mixed", true], ["proxy-bad", false],
+    ["proxy-good", true], ["proxy-mixed", false], ["proxy-bad", false],
+    ["proxy-good", true], ["proxy-mixed", true], ["proxy-bad", false],
+    ["proxy-good", true], ["proxy-mixed", false], ["proxy-bad", false],
+    ["proxy-good", true], ["proxy-mixed", true], ["proxy-bad", false]
+  ]
+}
