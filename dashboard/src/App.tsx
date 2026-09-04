@@ -13,7 +13,7 @@ import {
 import { useTheme } from './hooks/useTheme'
 import type { Interval, TimeWindow } from './types/api'
 import { todayLocal } from './utils/dateUtils'
-import { serverNowMinutes } from './utils/serverClock'
+import { serverNowMinutes, serverToday } from './utils/serverClock'
 
 const REFRESH_INTERVAL_MS = 30_000
 
@@ -49,6 +49,20 @@ const App = () => {
   const [isVisible, setIsVisible] = useState(
     () => document.visibilityState === 'visible',
   )
+
+  useEffect(() => {
+    const syncServerDate = () => {
+      const next = serverToday()
+      if (!next) return
+      setToday(next)
+      setSelectedDate((previous) => (previous === today ? next : previous))
+    }
+    window.addEventListener('smartproxy-server-clock', syncServerDate)
+    syncServerDate()
+    return () => {
+      window.removeEventListener('smartproxy-server-clock', syncServerDate)
+    }
+  }, [today])
 
   // Only ever render numbers that belong to the current selection. After a
   // failed reload the previous snapshot is still in state, but its key no
@@ -111,7 +125,7 @@ const App = () => {
   const tickRef = useRef<(silent: boolean) => void>(() => undefined)
   useEffect(() => {
     tickRef.current = (silent: boolean) => {
-      const now = todayLocal()
+      const now = serverToday() ?? todayLocal()
       if (now !== today) {
         setToday(now)
         if (selectedDate === today) {
