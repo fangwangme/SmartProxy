@@ -66,6 +66,14 @@ class LauncherSafetyTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0)
         self.assertFalse(pid_file.exists())
 
+    def test_status_reports_runtime_config_failure(self):
+        (self.project / ".venv" / "bin" / "python").chmod(0o644)
+
+        completed = self._run("status")
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("Could not read runtime configuration.", completed.stdout)
+
     def test_backup_uses_configured_port_and_cleans_unique_response_file(self):
         tools = self.project / "tools"
         tools.mkdir()

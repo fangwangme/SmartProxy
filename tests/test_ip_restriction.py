@@ -131,7 +131,7 @@ class TestIPRestriction(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
 
-    def test_malformed_forwarded_address_falls_back_to_direct_peer(self):
+    def test_malformed_forwarded_address_is_rejected(self):
         self.mock_proxy_manager.trust_proxy_headers = True
         self.mock_proxy_manager.trusted_proxy_ips = ["192.0.2.10"]
         self.mock_proxy_manager.allowed_ips = ["198.51.100.20"]
@@ -143,6 +143,34 @@ class TestIPRestriction(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 403)
+
+    def test_malformed_forwarded_chain_fails_closed_when_proxy_is_allowed(self):
+        self.mock_proxy_manager.trust_proxy_headers = True
+        self.mock_proxy_manager.trusted_proxy_ips = ["192.0.2.10"]
+        self.mock_proxy_manager.allowed_ips = ["192.0.2.10", "198.51.100.20"]
+        self.mock_proxy_manager.allocate_proxy.return_value = {
+            "proxy": "http://proxy:8080",
+            "source": "default",
+            "allocation_id": "test-allocation",
+        }
+
+        response = self.client.get(
+            "/get-proxy?source=default",
+            headers={"X-Forwarded-For": "198.51.100.20, malformed"},
+            environ_overrides={"REMOTE_ADDR": "192.0.2.10"},
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_ipv4_mapped_loopback_can_reach_internal_probe(self):
+        self.mock_proxy_manager.liveness_status.return_value = {"status": "alive"}
+
+        response = self.client.get(
+            "/live",
+            environ_overrides={"REMOTE_ADDR": "::ffff:127.0.0.1"},
+        )
+
+        self.assertEqual(response.status_code, 200)
 
     def test_multiple_trusted_forwarding_hops_resolve_first_untrusted_boundary(self):
         self.mock_proxy_manager.trust_proxy_headers = True

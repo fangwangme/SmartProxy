@@ -34,6 +34,17 @@ def _prometheus_label(value: object) -> str:
     return str(value).replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
 
 
+def _is_loopback_address(value: str) -> bool:
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    if address.is_loopback:
+        return True
+    mapped = getattr(address, "ipv4_mapped", None)
+    return bool(mapped and mapped.is_loopback)
+
+
 def _get_client_ip(proxy_manager: ProxyManager) -> str:
     """Resolve the client IP, trusting proxy headers only from configured proxies."""
     remote_addr = request.remote_addr or ""
@@ -54,7 +65,10 @@ def _get_client_ip(proxy_manager: ProxyManager) -> str:
                 for value in forwarded_for.split(",")
             ]
         except ValueError:
-            return remote_addr
+            # A malformed chain has no trustworthy boundary. Returning the
+            # trusted direct peer could accidentally authorize every client
+            # behind it when that peer is also in allowed_ips.
+            return ""
         # Walk from the trusted direct peer toward the client. The first
         # untrusted address at the boundary is authoritative; attacker-
         # prepended values farther left cannot override it.
@@ -75,7 +89,9 @@ def create_app(proxy_manager: ProxyManager):
         # (see get_timeseries_stats_route), so the dashboard can filter
         # "now"-relative windows against the server's clock instead of the
         # viewer's.
-        response.headers["X-Server-Time"] = datetime.now().astimezone().isoformat()
+        response.headers["X-Server-Time"] = datetime.now().astimezone().isoformat(
+            timespec="seconds"
+        )
         return response
 
     @app.before_request
@@ -91,7 +107,7 @@ def create_app(proxy_manager: ProxyManager):
         client_ip = _get_client_ip(proxy_manager)
 
         if path in INTERNAL_ONLY_ENDPOINTS:
-            if remote_addr not in LOCALHOST_IPS:
+            if not _is_loopback_address(remote_addr):
                 logger.warning(
                     "Unauthorized internal API access attempt: path={}",
                     request.path,
@@ -116,7 +132,7 @@ def create_app(proxy_manager: ProxyManager):
                 client_ip in allowed_ips,
             )
 
-        if client_ip not in allowed_ips:
+        if client_ip not in allowed_ips and not _is_loopback_address(client_ip):
             logger.warning(
                 "Unauthorized API access attempt: path={}",
                 request.path,
@@ -197,12 +213,12 @@ def create_app(proxy_manager: ProxyManager):
         )
         
         rejected_lines = "\n".join(
-            f'smartproxy_feedback_rejected_total{{reason="{str(reason)}"}} {count}'
+            f'smartproxy_feedback_rejected_total{{reason="{_prometheus_label(reason)}"}} {count}'
             for reason, count in sorted(rejected_metrics)
         )
         validation_failure_lines = "\n".join(
             'smartproxy_validation_target_failures_total'
-            f'{{target_index="{target_index}",kind="{kind}"}} {count}'
+            f'{{target_index="{target_index}",kind="{_prometheus_label(kind)}"}} {count}'
             for (target_index, kind), count in sorted(validation_failure_metrics)
         )
         metrics_text = f"""# HELP smartproxy_active_proxies Number of active proxies

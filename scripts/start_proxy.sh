@@ -182,7 +182,10 @@ stop_server() {
 }
 
 status_server() {
-    load_runtime_config || return 1
+    if ! load_runtime_config; then
+        echo "Could not read runtime configuration."
+        return 1
+    fi
     if [ -f "$PID_FILE" ]; then
         PID=$(cat "$PID_FILE")
     else
