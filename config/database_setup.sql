@@ -2,6 +2,9 @@
 -- It should be run once on your PostgreSQL database.
 
 -- Drop the tables if they exist to ensure a clean setup.
+DROP TABLE IF EXISTS feedback_flush_commits;
+DROP TABLE IF EXISTS proxy_source_fetch_state;
+DROP TABLE IF EXISTS proxy_source_reputation;
 DROP TABLE IF EXISTS source_stats_by_minute;
 DROP TABLE IF EXISTS proxies CASCADE;
 
@@ -66,6 +69,35 @@ COMMENT ON COLUMN proxies.feedback_success_count IS 'Durable copy of the in-memo
 COMMENT ON COLUMN proxies.feedback_failure_count IS 'Durable copy of the in-memory failure counter, restored when a proxy is re-seeded into the stats pool.';
 COMMENT ON COLUMN proxies.feedback_last_ts IS 'Timestamp of the newest feedback behind those counters; drives time decay on a restored record.';
 
+-- Source-specific durable reputation. The legacy counters on proxies remain
+-- intact for rollback; only rows without an entry here are seeded from them.
+CREATE TABLE proxy_source_reputation (
+    proxy_id INT NOT NULL REFERENCES proxies(id) ON DELETE CASCADE,
+    source_name VARCHAR(50) NOT NULL,
+    success_count INT NOT NULL DEFAULT 0,
+    failure_count INT NOT NULL DEFAULT 0,
+    last_feedback_ts TIMESTAMPTZ,
+    quality_slow DOUBLE PRECISION NOT NULL,
+    quality_fast DOUBLE PRECISION NOT NULL,
+    quality_updated_ts TIMESTAMPTZ,
+    recent_results JSONB NOT NULL DEFAULT '[]'::jsonb,
+    PRIMARY KEY (proxy_id, source_name)
+);
+
+CREATE INDEX idx_proxy_source_reputation_source
+    ON proxy_source_reputation (source_name, proxy_id);
+
+COMMENT ON TABLE proxy_source_reputation IS 'Durable online-learning state isolated by physical proxy and request source.';
+
+CREATE TABLE proxy_source_fetch_state (
+    source_name VARCHAR(100) PRIMARY KEY,
+    failure_count INT NOT NULL,
+    next_attempt_at TIMESTAMPTZ NOT NULL,
+    failure_class VARCHAR(20) NOT NULL
+);
+
+COMMENT ON TABLE proxy_source_fetch_state IS 'Bounded source-fetch backoff retained across process restarts.';
+
 
 -- =================================================================
 -- [NEW] Table to store aggregated minute-level feedback statistics.
@@ -99,6 +131,13 @@ CREATE INDEX idx_source_stats_by_minute_source_minute ON source_stats_by_minute 
 
 COMMENT ON TABLE source_stats_by_minute IS 'Stores aggregated success/failure counts for each source per minute.';
 COMMENT ON COLUMN source_stats_by_minute.minute IS 'Timestamp truncated to the minute, e.g., 2025-08-02 16:30:00';
+
+CREATE TABLE feedback_flush_commits (
+    flush_id UUID PRIMARY KEY,
+    committed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+COMMENT ON TABLE feedback_flush_commits IS 'Idempotency ledger for retryable aggregate flush transactions.';
 
 -- Grant permissions to your application's user if necessary.
 -- Example: GRANT ALL ON ALL TABLES IN SCHEMA public TO my_proxy_user;

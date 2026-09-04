@@ -10,6 +10,7 @@ dependencies = [
     "aiohttp==3.13.3",
     "aiohttp-socks==0.10.1",
     "loguru==0.7.3",
+    "waitress==3.0.2",
 ]
 
 [dependency-groups]

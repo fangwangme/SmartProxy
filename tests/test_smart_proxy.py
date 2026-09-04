@@ -61,7 +61,7 @@ class ProxyManagerTestBase(unittest.TestCase):
                 "validator": {
                     "validation_workers": "10",
                     "validation_timeout_s": "5",
-                    "validation_target": "http://mocktarget.com",
+                    "validation_target": "https://validation.invalid/echo",
                     "validation_supplement_threshold": "1000",  # Match default
                     "validation_window_minutes": "30",
                     "max_validations_per_window": "5",
@@ -175,14 +175,24 @@ class TestProxyManager(ProxyManagerTestBase):
     def test_get_proxy_returns_proxy_from_pool(self):
         """Test get_proxy returns a proxy when available."""
         self.manager.available_proxies["source1"] = {
-            "top_tier": ["http://1.1.1.1:80", "http://2.2.2.2:80"],
-            "bottom_tier": ["http://3.3.3.3:80"],
+            "top_tier": ["http://192.0.2.1:80", "http://192.0.2.2:80"],
+            "bottom_tier": ["http://192.0.2.3:80"],
         }
         self.manager.predefined_sources.add("source1")
+        self.manager.active_proxies = {
+            "http://192.0.2.1:80", "http://192.0.2.2:80", "http://192.0.2.3:80"
+        }
+        self.manager.source_stats["source1"] = {
+            url: self.manager._get_new_proxy_stat("source1")
+            for url in self.manager.active_proxies
+        }
         
         proxy = self.manager.get_proxy("source1")
         
-        self.assertIn(proxy, ["http://1.1.1.1:80", "http://2.2.2.2:80", "http://3.3.3.3:80"])
+        self.assertIn(
+            proxy,
+            ["http://192.0.2.1:80", "http://192.0.2.2:80", "http://192.0.2.3:80"],
+        )
 
     def test_get_proxy_returns_none_when_empty(self):
         """Test get_proxy returns None when no proxies available."""
@@ -198,15 +208,19 @@ class TestProxyManager(ProxyManagerTestBase):
     def test_get_proxy_uses_default_source_for_unknown(self):
         """Test get_proxy falls back to default source for unknown source."""
         self.manager.available_proxies["source1"] = {
-            "top_tier": ["http://1.1.1.1:80"],
+            "top_tier": ["http://192.0.2.1:80"],
             "bottom_tier": [],
         }
         self.manager.predefined_sources.add("source1")
         self.manager.default_source = "source1"
+        self.manager.active_proxies = {"http://192.0.2.1:80"}
+        self.manager.source_stats["source1"] = {
+            "http://192.0.2.1:80": self.manager._get_new_proxy_stat("source1")
+        }
         
         proxy = self.manager.get_proxy("unknown_source")
         
-        self.assertEqual(proxy, "http://1.1.1.1:80")
+        self.assertEqual(proxy, "http://192.0.2.1:80")
 
     def test_cooldown_spaces_out_trial_handouts(self):
         """A trial candidate handed out recently stays out of the plan."""
@@ -313,7 +327,22 @@ class TestProxyManager(ProxyManagerTestBase):
 
     def test_get_premium_proxy_returns_proxy_when_available(self):
         """Test get_premium_proxy returns a proxy when premium pool is available."""
-        self.manager.premium_proxies = ["http://premium1:80", "http://premium2:80"]
+        now = time.time()
+        proxies = ["http://premium1:80", "http://premium2:80"]
+        self.manager.active_proxies = set(proxies)
+        self.manager.source_stats["source1"] = {
+            proxy: self.manager._get_new_proxy_stat("source1")
+            | {
+                "score": 80.0,
+                "quality_slow": 0.8,
+                "quality_fast": 0.8,
+                "quality_updated_ts": now,
+                "success_count": 50,
+                "recent_results": [[now, True, None]] * 3,
+            }
+            for proxy in proxies
+        }
+        self.manager._sync_premium_proxies()
         
         proxy = self.manager.get_premium_proxy()
         
@@ -338,7 +367,6 @@ class TestProxyManager(ProxyManagerTestBase):
                 "score": 50.0,
                 "success_count": 5,
                 "failure_count": 1,
-                "consecutive_failures": 0,
                 "recent_results": [],
                 "avg_latency_ms": None,
             }
@@ -351,7 +379,6 @@ class TestProxyManager(ProxyManagerTestBase):
         self.assertGreaterEqual(stat["score"], 0)
         self.assertLessEqual(stat["score"], 100)
         self.assertEqual(stat["success_count"], 6)
-        self.assertEqual(stat["consecutive_failures"], 0)
         self.assertEqual(len(stat["recent_results"]), 1)
 
     def test_process_feedback_updates_score_on_failure(self):
@@ -363,7 +390,6 @@ class TestProxyManager(ProxyManagerTestBase):
                 "score": 50.0,
                 "success_count": 5,
                 "failure_count": 1,
-                "consecutive_failures": 0,
                 "recent_results": [],
                 "avg_latency_ms": None,
             }
@@ -377,7 +403,6 @@ class TestProxyManager(ProxyManagerTestBase):
         self.assertGreaterEqual(stat["score"], 0)
         self.assertLessEqual(stat["score"], 100)
         self.assertEqual(stat["failure_count"], 2)
-        self.assertEqual(stat["consecutive_failures"], 1)
         self.assertEqual(len(stat["recent_results"]), 1)
 
     def test_feedback_status_classification(self):
@@ -477,11 +502,12 @@ class TestProxyManager(ProxyManagerTestBase):
         self.manager._run_validation_cycle()
         
         # Should not have called DB methods
-        self.mock_db_instance.get_proxies_to_validate.assert_not_called()
+        self.mock_db_instance.get_new_proxies_to_validate.assert_not_called()
 
     def test_validation_cycle_skips_when_no_proxies(self):
         """Test that validation cycle is skipped when no proxies to validate."""
-        self.mock_db_instance.get_proxies_to_validate.return_value = []
+        self.mock_db_instance.get_new_proxies_to_validate.return_value = []
+        self.mock_db_instance.get_active_proxies_to_revalidate.return_value = []
         self.mock_db_instance.get_eligible_failed_proxies.return_value = []
         
         self.manager._run_validation_cycle()
@@ -494,7 +520,8 @@ class TestProxyManager(ProxyManagerTestBase):
         initial_proxies = [
             {"id": 1, "protocol": "http", "ip": "1.1.1.1", "port": 80},
         ]
-        self.mock_db_instance.get_proxies_to_validate.return_value = initial_proxies
+        self.mock_db_instance.get_new_proxies_to_validate.return_value = initial_proxies
+        self.mock_db_instance.get_active_proxies_to_revalidate.return_value = []
         self.mock_db_instance.get_eligible_failed_proxies.return_value = [
             {"id": 2, "protocol": "http", "ip": "2.2.2.2", "port": 80},
         ]
@@ -536,7 +563,6 @@ class TestProxyManager(ProxyManagerTestBase):
         self.assertEqual(stat["quality_fast"], 0.05)
         self.assertEqual(stat["success_count"], 0)
         self.assertEqual(stat["failure_count"], 0)
-        self.assertEqual(stat["consecutive_failures"], 0)
         self.assertEqual(stat["recent_results"], [])  # NEW: sliding window
         self.assertIsNone(stat["avg_latency_ms"])     # NEW: latency tracking
 
@@ -619,7 +645,6 @@ class TestProxyManager(ProxyManagerTestBase):
             "score": 150.0,  # Old unbounded score
             "success_count": 80,
             "failure_count": 20,
-            "consecutive_failures": 0,
             "last_feedback_ts": time.time(),
         }
         
@@ -1477,7 +1502,7 @@ class TestIssue13PoolQuality(ProxyManagerTestBase):
         self.assertEqual(self.manager.validation_workers, 10)      # default is 100
         self.assertEqual(self.manager.top_tier_size, 50)           # default is 100
         self.assertEqual(
-            self.manager.validation_target, "http://mocktarget.com"
+            self.manager.validation_targets, ["https://validation.invalid/echo"]
         )  # default is httpbin
 
 
@@ -1949,14 +1974,6 @@ class TestValidationQueueSQL(unittest.TestCase):
             )
         execute.assert_not_called()
 
-    def test_combined_queue_query_has_deterministic_ordering(self):
-        args = self._capture(
-            lambda: self.db.get_proxies_to_validate(interval_minutes=30, limit=10)
-        )
-        query = " ".join(args[0][0].split())
-
-        self.assertIn("ORDER BY last_validated_at ASC NULLS FIRST, id ASC", query)
-
     def test_insert_proxies_uses_a_large_page_size(self):
         """Finding: execute_values defaults to page_size=100."""
         conn = MagicMock()
@@ -2222,7 +2239,7 @@ class TestSecondReviewRegressions(ProxyManagerTestBase):
 
     def test_two_syncs_over_the_cap_do_not_reset_failure_history(self):
         manager = self.make_manager(
-            {"source_pool": {"max_pool_size": "1", "stats_pool_max_multiplier": "2"}},
+            {"source_pool": {"max_pool_size": "1", "top_tier_size": "1", "stats_pool_max_multiplier": "2"}},
             name="laundering.ini",
         )
         urls = ["http://punished:1", "http://a:1", "http://b:1"]
@@ -2782,13 +2799,14 @@ class TestIssue17ReputationPersistence(ProxyManagerTestBase):
 
         self.manager.process_feedback("source1", proxy, 500)
         self.manager.process_feedback("source1", proxy, 200, 900)
-        self.assertIn(proxy, self.manager.pending_feedback_persist)
+        self.assertIn(("source1", proxy), self.manager.pending_feedback_persist)
 
         self.manager._persist_feedback_history()
 
-        rows = self.mock_db_instance.upsert_proxy_feedback_history.call_args.args[0]
+        rows = self.mock_db_instance.upsert_proxy_source_reputation.call_args.args[0]
         self.assertEqual(len(rows), 1)
-        protocol, ip, port, successes, failures, last_ts = rows[0]
+        source, protocol, ip, port, successes, failures, last_ts, *_ = rows[0]
+        self.assertEqual(source, "source1")
         self.assertEqual((protocol, ip, port), ("http", "1.2.3.4", 8080))
         self.assertEqual((successes, failures), (1, 1))
         self.assertIsNotNone(last_ts)
@@ -2806,13 +2824,13 @@ class TestIssue17ReputationPersistence(ProxyManagerTestBase):
         stored_failure_counts = []
 
         def persist(rows):
-            failure_count = rows[0][4]
+            failure_count = rows[0][5]
             if not stored_failure_counts:
                 first_entered.set()
                 self.assertTrue(release_first.wait(2))
             stored_failure_counts.append(failure_count)
 
-        self.mock_db_instance.upsert_proxy_feedback_history.side_effect = persist
+        self.mock_db_instance.upsert_proxy_source_reputation.side_effect = persist
         first = threading.Thread(target=self.manager._persist_feedback_history)
         first.start()
         self.assertTrue(first_entered.wait(2))
@@ -2835,8 +2853,8 @@ class TestIssue17ReputationPersistence(ProxyManagerTestBase):
 
         self.manager._persist_feedback_history()
 
-        rows = self.mock_db_instance.upsert_proxy_feedback_history.call_args.args[0]
-        self.assertEqual(rows[0][:3], ("http", "[2001:db8::1]", 8080))
+        rows = self.mock_db_instance.upsert_proxy_source_reputation.call_args.args[0]
+        self.assertEqual(rows[0][:4], ("source1", "http", "[2001:db8::1]", 8080))
 
     def test_evicted_proxy_returns_with_its_failure_history(self):
         """
@@ -2855,18 +2873,20 @@ class TestIssue17ReputationPersistence(ProxyManagerTestBase):
                 "last_feedback_ts": time.time() - 2 * 3600,
             }
         }
-        self.manager.pending_feedback_persist.add(punished)
+        self.manager.pending_feedback_persist.add(("source1", punished))
         self.manager._persist_feedback_history()
 
         # Round-trip the row the manager just wrote back through the reader's
         # shape, so the test exercises the real serialisation both ways.
-        written = self.mock_db_instance.upsert_proxy_feedback_history.call_args.args[0]
-        protocol, ip, port, successes, failures, last_ts = written[0]
+        written = self.mock_db_instance.upsert_proxy_source_reputation.call_args.args[0]
+        source, protocol, ip, port, successes, failures, last_ts, *_ = written[0]
         self.mock_db_instance.get_active_feedback_history.return_value = {
-            f"{protocol}://{ip}:{port}": {
-                "success_count": successes,
-                "failure_count": failures,
-                "last_feedback_ts": last_ts,
+            source: {
+                f"{protocol}://{ip}:{port}": {
+                    "success_count": successes,
+                    "failure_count": failures,
+                    "last_feedback_ts": last_ts,
+                }
             }
         }
 
@@ -2942,7 +2962,7 @@ class TestIssue17ReputationPersistence(ProxyManagerTestBase):
 class TestIssue23OnlineReliability(ProxyManagerTestBase):
     """Issue #23 scoring regressions supersede issue #21 calibration."""
 
-    def test_scoring_ladder_40pct_beats_untried_beats_two_consecutive_failures(self):
+    def test_scoring_ladder_40pct_beats_untried_beats_two_failures(self):
         now = time.time()
 
         def replay(outcomes):
@@ -3089,7 +3109,6 @@ class TestIssue23AdaptiveExplorationAndProbation(ProxyManagerTestBase):
             "quality_updated_ts": now,
             "recent_results": [[now, True, None]] * 3,
             "success_count": 3,
-            "completed_feedback_count": 3,
             "trial_handout_count": 3,
         }
 
@@ -3158,19 +3177,19 @@ class TestIssue23AdaptiveExplorationAndProbation(ProxyManagerTestBase):
             patch.object(
                 self.manager,
                 "_take_trial_candidate",
-                return_value="exploration",
+                return_value=probation,
             ),
             patch.object(self.manager, "_mark_proxy_handed_out"),
         ):
             picks = [self.manager.get_proxy("source1") for _ in range(100)]
 
-        exploration_count = picks.count("exploration")
+        exploration_count = picks.count(probation)
         print(
             f"\n[Exploration budget] ratio={ratio:.4f}, "
             f"exploration={exploration_count}/100"
         )
         self.assertEqual(exploration_count, 30)
-        self.assertEqual(set(picks) - {"exploration"}, {qualified})
+        self.assertEqual(set(picks) - {probation}, {qualified})
         self.assertLessEqual(exploration_count / 100, ratio + 0.01)
 
     def test_discovery_gets_two_thirds_of_exploration_when_both_sides_exist(self):
@@ -3270,7 +3289,6 @@ class TestIssue23AdaptiveExplorationAndProbation(ProxyManagerTestBase):
             "quality_updated_ts": old,
             "success_count": 0,
             "failure_count": 5,
-            "completed_feedback_count": 5,
             "recent_results": [[old, False, None]] * 5,
             "handout_count": 5,
             "trial_handout_count": 5,
@@ -3370,38 +3388,39 @@ class TestIssue23PersistenceAndRuntimeModes(ProxyManagerTestBase):
             self.manager._get_new_proxy_stat("source1")
         )
         self.manager.process_feedback("source1", proxy, 500)
-        self.mock_db_instance.upsert_proxy_feedback_history.return_value = False
+        self.mock_db_instance.upsert_proxy_source_reputation.return_value = False
 
         self.manager._persist_feedback_history()
-        self.assertEqual(self.manager.pending_feedback_persist, {proxy})
+        self.assertEqual(self.manager.pending_feedback_persist, {("source1", proxy)})
 
-        self.mock_db_instance.upsert_proxy_feedback_history.return_value = True
+        self.mock_db_instance.upsert_proxy_source_reputation.return_value = True
         self.manager._persist_feedback_history()
         self.assertEqual(self.manager.pending_feedback_persist, set())
         self.assertEqual(
-            self.mock_db_instance.upsert_proxy_feedback_history.call_count, 2
+            self.mock_db_instance.upsert_proxy_source_reputation.call_count, 2
         )
 
-    def test_absolute_counter_sql_is_monotonic_and_non_incremental(self):
+    def test_source_snapshot_sql_updates_all_fields_together(self):
         db = object.__new__(DatabaseManager)
         db.pool = MagicMock()
         connection = MagicMock()
         db.pool.getconn.return_value = connection
-        rows = [("http", "1.2.3.4", 8080, 7, 3, time.time())]
+        now = time.time()
+        rows = [("source1", "http", "192.0.2.44", 8080, 7, 3, now, 0.7, 0.6, now, [])]
 
         with patch("src.database.db.psycopg2.extras.execute_values") as execute:
-            self.assertTrue(db.upsert_proxy_feedback_history(rows))
-            self.assertTrue(db.upsert_proxy_feedback_history(rows))
+            self.assertTrue(db.upsert_proxy_source_reputation(rows))
+            self.assertTrue(db.upsert_proxy_source_reputation(rows))
 
         self.assertEqual(execute.call_count, 2)
         first_query = execute.call_args_list[0].args[1]
         first_values = execute.call_args_list[0].args[2]
         second_values = execute.call_args_list[1].args[2]
-        self.assertIn("GREATEST", first_query)
-        self.assertNotIn("feedback_success_count +", first_query)
-        self.assertNotIn("feedback_failure_count +", first_query)
-        self.assertEqual(first_values, second_values)
-        self.assertEqual(first_values[0][3:5], (7, 3))
+        self.assertIn("ON CONFLICT (proxy_id, source_name)", first_query)
+        self.assertNotIn("GREATEST", first_query)
+        self.assertEqual(first_values[0][:-1], second_values[0][:-1])
+        self.assertEqual(first_values[0][-1].adapted, second_values[0][-1].adapted)
+        self.assertEqual(first_values[0][4:6], (7, 3))
 
     def _mode_manager(self, mode):
         normal_path = Path(self.tmp_dir) / f"{mode}.normal.json"
@@ -3468,7 +3487,7 @@ class TestIssue23PersistenceAndRuntimeModes(ProxyManagerTestBase):
         backup = manager.backup_stats()
 
         manager.db.get_active_feedback_history.assert_not_called()
-        manager.db.upsert_proxy_feedback_history.assert_not_called()
+        manager.db.upsert_proxy_source_reputation.assert_not_called()
         self.assertEqual(manager.pending_feedback_persist, set())
         self.assertTrue(manager.feedback_buffer)
         self.assertEqual(normal_path.read_text(encoding="utf-8"), "normal-state")
@@ -3528,12 +3547,14 @@ class TestIssue23OutageGuard(ProxyManagerTestBase):
             self.manager._outage_state("source1")["previous_window_healthy"]
         )
         self.manager._persist_feedback_history()
-        self.mock_db_instance.upsert_proxy_feedback_history.reset_mock()
+        self.mock_db_instance.upsert_proxy_source_reputation.reset_mock()
 
         self.manager.process_feedback("source1", self.urls[0], 500)
         self.manager._persist_feedback_history()
-        self.mock_db_instance.upsert_proxy_feedback_history.assert_not_called()
-        self.assertIn(self.urls[0], self.manager.pending_feedback_persist)
+        self.mock_db_instance.upsert_proxy_source_reputation.assert_not_called()
+        self.assertIn(
+            ("source1", self.urls[0]), self.manager.pending_feedback_persist
+        )
         candidate_backup = Path(self.tmp_dir) / "outage-candidate.json"
         self.manager.stats_backup_path = candidate_backup
         self.assertEqual(self.manager.backup_stats()["status"], "success")
@@ -3560,9 +3581,9 @@ class TestIssue23OutageGuard(ProxyManagerTestBase):
         )
         self.manager._persist_feedback_history()
         durable_rows = (
-            self.mock_db_instance.upsert_proxy_feedback_history.call_args.args[0]
+            self.mock_db_instance.upsert_proxy_source_reputation.call_args.args[0]
         )
-        self.assertEqual({row[4] for row in durable_rows}, {0})
+        self.assertEqual({row[5] for row in durable_rows}, {0})
         current_minute = datetime.now().replace(second=0, microsecond=0)
         aggregate = self.manager.feedback_buffer[current_minute]["source1"]
         self.assertEqual((aggregate["success"], aggregate["failure"]), (4, 4))
@@ -4135,20 +4156,22 @@ class TestIssue23ReviewFixes(ProxyManagerTestBase):
 
     def test_rollback_restores_tentative_fields_and_truncates_new_results(self):
         urls = self._low_baseline_guard()
+        self.manager.reliability_recent_results_limit = 3
+        now = time.time()
+        for url in urls:
+            self.manager.source_stats["source1"][url]["recent_results"] = [
+                [now - 3 + index, True, None] for index in range(3)
+            ]
         self._window(urls, successes=1)
-        committed = {
-            url: dict(self.manager.source_stats["source1"][url]) for url in urls
-        }
+        committed = copy.deepcopy(self.manager.source_stats["source1"])
+        self.assertTrue(
+            all(len(stat["recent_results"]) == 3 for stat in committed.values())
+        )
         self._window(urls, successes=0)
 
         self.assertTrue(self.manager._outage_state("source1")["active"])
         for url in urls:
-            stat = self.manager.source_stats["source1"][url]
-            self.assertEqual(stat["score"], committed[url]["score"])
-            self.assertEqual(stat["failure_count"], committed[url]["failure_count"])
-            self.assertEqual(
-                len(stat["recent_results"]), len(committed[url]["recent_results"])
-            )
+            self.assertEqual(self.manager.source_stats["source1"][url], committed[url])
 
     # --- exploration budget follows the unevaluated share of the pool -------
 
@@ -4247,7 +4270,13 @@ class TestIssue23LauncherAndReplay(ProxyManagerTestBase):
         capture = project / "argv.txt"
         fake_python = project / ".venv" / "bin" / "python"
         fake_python.write_text(
-            "#!/bin/bash\nprintf '%s\\n' \"$@\" > \"$CAPTURE_FILE\"\nsleep 10\n",
+            "#!/bin/bash\n"
+            "if [ \"$1\" = \"-c\" ]; then\n"
+            "  case \"$2\" in *shutdown_deadline*) echo 22 ;; *) echo 6942 ;; esac\n"
+            "  exit 0\n"
+            "fi\n"
+            "printf '%s\\n' \"$@\" > \"$CAPTURE_FILE\"\n"
+            "sleep 10\n",
             encoding="utf-8",
         )
         fake_python.chmod(0o755)

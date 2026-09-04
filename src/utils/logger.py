@@ -11,7 +11,6 @@ daily rotating file with compression and retention policies.
 """
 
 import sys
-import os
 from pathlib import Path
 from loguru import logger
 
@@ -72,8 +71,8 @@ def setup_logging(level="INFO", log_dir=None, log_file_base_name=None):
             compression="zip",  # Compress old log files into .zip format
             encoding="utf-8",  # File encoding
             enqueue=True,  # Make logging asynchronous to prevent blocking the main thread
-            backtrace=True,  # Include full stack trace in exception logs
-            diagnose=True,  # Add extended diagnostic information for exceptions
+            backtrace=True,
+            diagnose=False,
         )
     except OSError as exc:
         logger.warning(
@@ -83,18 +82,3 @@ def setup_logging(level="INFO", log_dir=None, log_file_base_name=None):
         )
     
     logger.info(f"Logger configured with level: {level}")
-
-# Initialize with default level
-setup_logging()
-
-logger.info("Logger initialized successfully.")
-
-# --- How to use in other modules ---
-# from logger import logger
-#
-# logger.info("This is an info message.")
-# logger.warning("This is a warning message.")
-# try:
-#     x = 1 / 0
-# except ZeroDivisionError:
-#     logger.exception("An error occurred!")

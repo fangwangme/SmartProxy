@@ -12,7 +12,8 @@ PID_FILE="$PROJECT_DIR/.smart_proxy.pid"
 # calling shell has activated - or to the system interpreter, which has none of
 # the dependencies installed.
 PYTHON="$PROJECT_DIR/.venv/bin/python"
-PORT=6942
+PORT=""
+SHUTDOWN_GRACE_SECONDS=""
 SERVICE_FLAGS=()
 DEBUG_ENABLED=false
 RESTORE_MODE="normal"
@@ -20,29 +21,60 @@ RESTORE_MODE="normal"
 # 确保日志目录存在
 mkdir -p "$LOG_DIR" 2>/dev/null
 
+load_runtime_config() {
+    if [ ! -x "$PYTHON" ]; then
+        return 1
+    fi
+    PORT=$("$PYTHON" -c 'import configparser,sys; c=configparser.ConfigParser(); c.read(sys.argv[1]); print(c.getint("server", "port", fallback=6942))' "$PROJECT_DIR/config/config.ini") || return 1
+    SHUTDOWN_GRACE_SECONDS=$("$PYTHON" -c 'import configparser,math,sys; c=configparser.ConfigParser(); c.read(sys.argv[1]); print(math.ceil(c.getfloat("server", "shutdown_deadline_seconds", fallback=20)) + 2)' "$PROJECT_DIR/config/config.ini") || return 1
+}
+
+is_owned_process() {
+    local pid="$1"
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    local command_line
+    command_line=$(ps -p "$pid" -o command= 2>/dev/null) || return 1
+    [[ "$command_line" == *"$PYTHON"* && "$command_line" == *"-m src.main"* ]]
+}
+
 backup_stats() {
     # 备份代理统计数据
     echo "Triggering stats backup..."
-    if curl -s -X POST "http://localhost:$PORT/backup-stats" -o /tmp/backup_response.json 2>/dev/null; then
-        status=$("$PYTHON" -c "import json; d=json.load(open('/tmp/backup_response.json')); print(d.get('status', 'unknown'))" 2>/dev/null)
+    load_runtime_config || return 1
+    local response_file
+    response_file=$(mktemp "${TMPDIR:-/tmp}/smartproxy-backup.XXXXXX") || return 1
+    trap 'rm -f "$response_file"' RETURN
+    if curl -s -X POST "http://localhost:$PORT/backup-stats" -o "$response_file" 2>/dev/null; then
+        status=$("$PYTHON" -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("status", "unknown"))' "$response_file" 2>/dev/null)
         if [ "$status" = "success" ]; then
-            sources=$("$PYTHON" -c "import json; d=json.load(open('/tmp/backup_response.json')); print(d.get('sources', 'N/A'))" 2>/dev/null)
-            proxies=$("$PYTHON" -c "import json; d=json.load(open('/tmp/backup_response.json')); print(d.get('total_proxies', 'N/A'))" 2>/dev/null)
+            sources=$("$PYTHON" -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("sources", "N/A"))' "$response_file" 2>/dev/null)
+            proxies=$("$PYTHON" -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("total_proxies", "N/A"))' "$response_file" 2>/dev/null)
             echo "Backup successful: $sources sources, $proxies proxies"
         else
             echo "Backup failed or service not responding"
         fi
-        rm -f /tmp/backup_response.json
     else
         echo "Could not connect to SmartProxy service"
     fi
+    rm -f "$response_file"
+    trap - RETURN
 }
 
 start_server() {
     # 检查是否已经在运行
-    if [ -f "$PID_FILE" ] && kill -0 $(cat "$PID_FILE") 2>/dev/null; then
-        echo "SmartProxy is already running (PID: $(cat $PID_FILE))"
-        return 1
+    if [ -f "$PID_FILE" ]; then
+        local existing_pid
+        existing_pid=$(cat "$PID_FILE")
+        if is_owned_process "$existing_pid"; then
+            echo "SmartProxy is already running (PID: $existing_pid)"
+            return 1
+        fi
+        if kill -0 "$existing_pid" 2>/dev/null; then
+            echo "PID file refers to another process; refusing to signal or overwrite it."
+            return 1
+        fi
+        rm -f "$PID_FILE"
     fi
 
     # 进入项目目录
@@ -58,6 +90,10 @@ start_server() {
         echo "=================================================="
         return 1
     fi
+    load_runtime_config || {
+        echo "Could not read runtime configuration."
+        return 1
+    }
 
     echo "=================================================="
     echo " Starting SmartProxy Server..."
@@ -75,8 +111,10 @@ start_server() {
     sleep 1
 
     # 验证进程是否启动成功
-    if kill -0 $(cat "$PID_FILE") 2>/dev/null; then
-        echo "SmartProxy started with PID: $(cat $PID_FILE)"
+    local started_pid
+    started_pid=$(cat "$PID_FILE")
+    if is_owned_process "$started_pid"; then
+        echo "SmartProxy started with PID: $started_pid"
     else
         echo "Failed to start SmartProxy. Check log: $LOG_FILE"
         rm -f "$PID_FILE"
@@ -87,32 +125,55 @@ start_server() {
 stop_server() {
     if [ -f "$PID_FILE" ]; then
         PID=$(cat "$PID_FILE")
-        if kill -0 $PID 2>/dev/null; then
+        if is_owned_process "$PID"; then
+            load_runtime_config || return 1
             # 先备份再停止
             backup_stats
+
+            # The backup request may take long enough for the original process
+            # to exit and its PID to be reused. Resolve ownership again at the
+            # actual signalling boundary.
+            if ! is_owned_process "$PID"; then
+                if kill -0 "$PID" 2>/dev/null; then
+                    echo "PID was reused by another process; refusing to signal it."
+                    return 1
+                fi
+                rm -f "$PID_FILE"
+                echo "SmartProxy stopped before the signal was sent."
+                return 0
+            fi
             
             echo "Stopping SmartProxy (PID: $PID)..."
-            kill $PID
+            kill "$PID"
             
             # 等待进程结束。SIGTERM 处理里要先 flush feedback 再写 stats 备份，
             # 5s 宽限不够，会在备份写完前被 kill -9。
-            for i in {1..30}; do
-                if ! kill -0 $PID 2>/dev/null; then
+            for ((i=0; i<SHUTDOWN_GRACE_SECONDS * 2; i++)); do
+                if ! kill -0 "$PID" 2>/dev/null; then
                     break
                 fi
                 sleep 0.5
             done
             
             # 强制终止
-            if kill -0 $PID 2>/dev/null; then
-                echo "Force killing..."
-                kill -9 $PID
+            if kill -0 "$PID" 2>/dev/null; then
+                if is_owned_process "$PID"; then
+                    echo "Force killing..."
+                    kill -9 "$PID"
+                else
+                    echo "PID was reused by another process; refusing to signal it."
+                    return 1
+                fi
             fi
             
             rm -f "$PID_FILE"
             echo "SmartProxy stopped."
         else
-            echo "SmartProxy process not found. Cleaning up PID file."
+            if kill -0 "$PID" 2>/dev/null; then
+                echo "PID file refers to another process; refusing to signal it."
+                return 1
+            fi
+            echo "SmartProxy process not found. Cleaning up stale PID file."
             rm -f "$PID_FILE"
         fi
     else
@@ -121,8 +182,13 @@ stop_server() {
 }
 
 status_server() {
-    if [ -f "$PID_FILE" ] && kill -0 $(cat "$PID_FILE") 2>/dev/null; then
+    load_runtime_config || return 1
+    if [ -f "$PID_FILE" ]; then
         PID=$(cat "$PID_FILE")
+    else
+        PID=""
+    fi
+    if [ -n "$PID" ] && is_owned_process "$PID"; then
         echo "SmartProxy is running (PID: $PID)"
         echo "URL: http://localhost:$PORT"
         echo "Log: $LOG_FILE"
@@ -133,6 +199,9 @@ status_server() {
         else
             ps -p $PID -o etime= --no-headers | xargs echo "Uptime:"
         fi
+    elif [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+        echo "PID file refers to another process; refusing to modify it."
+        return 1
     else
         echo "SmartProxy is not running."
         [ -f "$PID_FILE" ] && rm -f "$PID_FILE"

@@ -64,6 +64,8 @@ pygments==2.21.0
 pytest==9.1.1
 python-socks==2.8.2
     # via aiohttp-socks
+waitress==3.0.2
+    # via smartproxy
 werkzeug==3.1.8
     # via
     #   flask

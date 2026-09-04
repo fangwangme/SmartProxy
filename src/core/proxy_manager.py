@@ -6,21 +6,25 @@ import ipaddress
 import json
 import math
 import random
+import secrets
+import socket
 import tempfile
 import threading
 import time
+import uuid
 from bisect import bisect_right
 import asyncio
 import subprocess
 import aiohttp
 from typing import Dict, List, Optional, Set, Tuple
-from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import defaultdict, OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 from src.utils.logger import logger
-from src.database.db import DatabaseManager
+from src.database.db import DatabaseManager, DatabaseWriteError
 
 try:
     from aiohttp_socks import ProxyConnector
@@ -57,6 +61,25 @@ REQUIRED_STAT_KEYS = frozenset(
         "failure_count",
         "recent_results",
         "trial_handout_count",
+    }
+)
+MIGRATABLE_STAT_KEYS = frozenset(
+    {
+        "score",
+        "quality_slow",
+        "quality_fast",
+        "quality_updated_ts",
+        "success_count",
+        "failure_count",
+        "recent_results",
+        "avg_latency_ms",
+        "last_feedback_ts",
+        "handout_count",
+        "trial_handout_count",
+        "last_handed_out_ts",
+        "inflight",
+        "outstanding_until",
+        "retry_after_ts",
     }
 )
 RESTORE_MODES = frozenset({"normal", "no-restore", "fresh-scoring"})
@@ -119,7 +142,6 @@ class ProxyManager:
         self.config = configparser.ConfigParser()
         self.config.read(config_path, encoding="utf-8")
 
-        self.db = DatabaseManager(self.config)
         # Use RLock for reentrant locking (allows same thread to acquire lock multiple times)
         self.lock = threading.RLock()
 
@@ -129,11 +151,27 @@ class ProxyManager:
             {}
         )  # MODIFIED: Structure for tiers
         self.premium_proxies: List[str] = []  # High-quality proxies for Playwright
+        self.premium_sources: Dict[str, str] = {}
         self.proxy_last_handed_out_ts: Dict[str, Dict[str, float]] = defaultdict(dict)
         self.outage_states: Dict[str, Dict] = {}
         # source -> ready-to-serve plan; see _build_serving_plan().
         self.serving_plans: Dict[str, Dict] = {}
         self.cold_start_fallback_logged: Set[str] = set()
+        self.plan_refreshing: Set[str] = set()
+        self.allocations: Dict[str, Dict] = {}
+        self.completed_allocations: OrderedDict[str, Dict] = OrderedDict()
+        self.accepted_feedback_success_total = 0
+        self.accepted_feedback_failure_total = 0
+        self.legacy_feedback_total = 0
+        self.rejected_feedback_total = defaultdict(int)
+        self.validation_target_failures = defaultdict(int)
+        self.last_validation_success_ts: Optional[float] = None
+        self.last_flush_success_ts: Optional[float] = None
+        self.last_validation_quorum_healthy = False
+        self.last_validation_target_health: List[bool] = []
+        self.last_backup_duration_s = 0.0
+        self.last_manager_lock_hold_s = 0.0
+        self.last_plan_refresh_duration_s = 0.0
 
         # Serialises the whole snapshot -> dump -> fsync -> replace sequence.
         # self.lock only guards the snapshot, so two concurrent backups could
@@ -143,19 +181,24 @@ class ProxyManager:
         # totals ordered so an older snapshot cannot land after a newer one and
         # make durable reputation move backwards.
         self.feedback_persist_lock = threading.Lock()
+        self.feedback_flush_lock = threading.Lock()
 
         self.feedback_buffer = defaultdict(
             lambda: defaultdict(lambda: defaultdict(int))
         )
+        self.feedback_flush_pending: Optional[Tuple[str, List[Tuple]]] = None
 
         self.dashboard_sources: Set[str] = set()
         self.last_source_refresh_time = 0
 
         # Proxy URLs whose feedback counters have moved since the last time
         # they were written back to the proxies table.
-        self.pending_feedback_persist: Set[str] = set()
+        self.pending_feedback_persist: Set[Tuple[str, str]] = set()
 
         self._load_config()
+        # Configuration is fully parsed and semantically validated before a
+        # database pool is opened or any active manager state is published.
+        self.db = DatabaseManager(self.config)
         self.check_config_drift()
         logger.info(
             "Stats backup path resolved to {} (exists: {}).",
@@ -170,6 +213,11 @@ class ProxyManager:
         self.fetch_executor = ThreadPoolExecutor(
             max_workers=10, thread_name_prefix="Fetcher"
         )
+        self.background_executor = ThreadPoolExecutor(
+            max_workers=self.background_workers, thread_name_prefix="SmartProxyTask"
+        )
+        self.background_futures: Set = set()
+        self.accepting_background_tasks = True
         self.is_validating = False
         self.debug_mode = False  # Set via command line --debug flag
 
@@ -181,12 +229,14 @@ class ProxyManager:
         low: float = None,
         high: float = None,
     ) -> float:
-        """Read a float tunable and clamp it into [low, high]."""
+        """Read a float tunable and reject values outside [low, high]."""
         value = self.config.getfloat(section, option, fallback=fallback)
-        if low is not None:
-            value = max(low, value)
-        if high is not None:
-            value = min(high, value)
+        if not math.isfinite(value):
+            raise ValueError(f"[{section}] {option} must be finite")
+        if low is not None and value < low:
+            raise ValueError(f"[{section}] {option} must be >= {low}")
+        if high is not None and value > high:
+            raise ValueError(f"[{section}] {option} must be <= {high}")
         return value
 
     def _cfg_int(
@@ -197,16 +247,34 @@ class ProxyManager:
         low: int = None,
         high: int = None,
     ) -> int:
-        """Read an int tunable and clamp it into [low, high]."""
+        """Read an int tunable and reject values outside [low, high]."""
         value = self.config.getint(section, option, fallback=fallback)
-        if low is not None:
-            value = max(low, value)
-        if high is not None:
-            value = min(high, value)
+        if low is not None and value < low:
+            raise ValueError(f"[{section}] {option} must be >= {low}")
+        if high is not None and value > high:
+            raise ValueError(f"[{section}] {option} must be <= {high}")
         return value
 
     def _load_config(self):
-        self.server_port = self.config.getint("server", "port", fallback=6942)
+        self.server_port = self._cfg_int("server", "port", 6942, low=1, high=65535)
+        self.production_threads = self._cfg_int(
+            "server", "production_threads", 8, low=1, high=256
+        )
+        self.shutdown_deadline_s = self._cfg_float(
+            "server", "shutdown_deadline_seconds", 20.0, low=1.0, high=300.0
+        )
+        self.readiness_min_usable_pool = self._cfg_int(
+            "server", "readiness_min_usable_pool", 1, low=0
+        )
+        self.readiness_validation_max_age_s = self._cfg_float(
+            "server", "readiness_validation_max_age_seconds", 600.0, low=1.0
+        )
+        self.readiness_flush_max_age_s = self._cfg_float(
+            "server", "readiness_flush_max_age_seconds", 180.0, low=1.0
+        )
+        self.background_workers = self._cfg_int(
+            "server", "background_workers", 8, low=1, high=128
+        )
         allowed_ips_str = self.config.get("server", "allowed_ips", fallback="")
         if not allowed_ips_str:
             legacy_allowed_ips = self.config.get(
@@ -225,63 +293,99 @@ class ProxyManager:
         self.trusted_proxy_ips = [
             ip.strip() for ip in trusted_proxy_ips_str.split(",") if ip.strip()
         ]
+        for configured_ip in self.allowed_ips + self.trusted_proxy_ips:
+            try:
+                ipaddress.ip_address(configured_ip)
+            except ValueError as error:
+                raise ValueError(
+                    f"Configured client/trusted proxy address is invalid: {configured_ip!r}"
+                ) from error
+        self.allowed_ips = [str(ipaddress.ip_address(ip)) for ip in self.allowed_ips]
+        self.trusted_proxy_ips = [
+            str(ipaddress.ip_address(ip)) for ip in self.trusted_proxy_ips
+        ]
 
-        self.validation_workers = self.config.getint(
-            "validator", "validation_workers", fallback=100
+        database_min = self._cfg_int("database", "min_connections", 2, low=1)
+        database_max = self._cfg_int("database", "max_connections", 50, low=1)
+        if database_min > database_max:
+            raise ValueError(
+                "[database] min_connections must not exceed max_connections"
+            )
+        self._cfg_int("database", "write_max_retries", 3, low=0, high=20)
+        self._cfg_int("database", "write_retry_base_ms", 25, low=0, high=60000)
+
+        self.validation_workers = self._cfg_int(
+            "validator", "validation_workers", 100, low=1, high=10000
         )
-        self.validation_timeout_s = self.config.getint(
-            "validator", "validation_timeout_s", fallback=10
+        self.validation_timeout_s = self._cfg_float(
+            "validator", "validation_timeout_s", 10.0, low=0.001
         )
-        self.validation_target = self.config.get(
+        legacy_validation_target = self.config.get(
             "validator", "validation_target", fallback="http://httpbin.org/get"
         )
         targets_str = self.config.get("validator", "validation_targets", fallback="")
         self.validation_targets = [
             target.strip() for target in targets_str.split(",") if target.strip()
-        ] or [self.validation_target]
-        self.validation_success_threshold = max(
-            1,
-            self.config.getint(
-                "validator",
-                "validation_success_threshold",
-                fallback=len(self.validation_targets),
-            ),
+        ] or [legacy_validation_target]
+        if len(set(self.validation_targets)) != len(self.validation_targets):
+            raise ValueError("[validator] validation_targets must be independent and unique")
+        for target in self.validation_targets:
+            parsed_target = urlparse(target)
+            if parsed_target.scheme not in {"http", "https"} or not parsed_target.netloc:
+                raise ValueError(
+                    "[validator] validation targets must be absolute HTTP(S) URLs"
+                )
+        self.validation_success_threshold = self._cfg_int(
+            "validator",
+            "validation_success_threshold",
+            len(self.validation_targets),
+            low=1,
         )
-        self.validation_success_threshold = min(
-            self.validation_success_threshold, len(self.validation_targets)
-        )
-        self.validation_batch_limit = self.config.getint(
-            "validator", "validation_batch_limit", fallback=2000
+        if self.validation_success_threshold > len(self.validation_targets):
+            raise ValueError(
+                "[validator] validation_success_threshold must not exceed validation target count"
+            )
+        self.validation_batch_limit = self._cfg_int(
+            "validator", "validation_batch_limit", 2000, low=1
         )
         # Share of validation_batch_limit reserved for never-validated proxies.
         # The rest goes to re-validating proxies that are currently alive, so a
         # flood of freshly fetched proxies cannot starve the liveness re-checks.
-        self.validation_new_proxy_ratio = min(
-            1.0,
-            max(
-                0.0,
-                self.config.getfloat(
-                    "validator", "validation_new_proxy_ratio", fallback=0.5
-                ),
-            ),
+        self.validation_new_proxy_ratio = self._cfg_float(
+            "validator",
+            "validation_new_proxy_ratio",
+            0.5,
+            low=0.0,
+            high=1.0,
         )
-        self.validation_supplement_threshold = self.config.getint(
-            "validator", "validation_supplement_threshold", fallback=1000
+        self.validation_supplement_threshold = self._cfg_int(
+            "validator", "validation_supplement_threshold", 1000, low=0
         )
-        self.validation_window_minutes = self.config.getint(
-            "validator", "validation_window_minutes", fallback=30
+        if self.validation_supplement_threshold > self.validation_batch_limit:
+            raise ValueError(
+                "[validator] validation_supplement_threshold must not exceed validation_batch_limit"
+            )
+        self.validation_window_minutes = self._cfg_int(
+            "validator", "validation_window_minutes", 30, low=1
         )
-        self.max_validations_per_window = self.config.getint(
-            "validator", "max_validations_per_window", fallback=5
+        self.max_validations_per_window = self._cfg_int(
+            "validator", "max_validations_per_window", 5, low=1
         )
-        self.validation_interval_s = self.config.getint(
-            "scheduler", "validation_interval_seconds", fallback=60
+        self.validation_target_min_samples = self._cfg_int(
+            "validator", "validation_target_min_samples", 1, low=1
         )
-        self.stats_flush_interval_s = self.config.getint(
-            "scheduler", "stats_flush_interval_seconds", fallback=60
+        if self.validation_target_min_samples > self.validation_batch_limit:
+            raise ValueError(
+                "[validator] validation_target_min_samples must not exceed validation_batch_limit"
+            )
+        self.validation_interval_s = self._cfg_float(
+            "scheduler", "validation_interval_seconds", 60.0, low=0.001
         )
-        self.source_refresh_interval_s = self.config.getint(
-            "scheduler", "source_refresh_interval_seconds", fallback=300
+        self.stats_flush_interval_s = self._cfg_float(
+            "scheduler", "stats_flush_interval_seconds", 60.0, low=0.001
+        )
+        self.source_refresh_interval_s = self._cfg_float(
+            "scheduler", "source_refresh_interval_seconds", 300.0, low=0.001
         )
         sources_str = self.config.get(
             "sources", "predefined_sources", fallback="default"
@@ -289,38 +393,42 @@ class ProxyManager:
         self.predefined_sources = {
             s.strip() for s in sources_str.split(",") if s.strip()
         }
+        if not self.predefined_sources:
+            raise ValueError("[sources] predefined_sources must not be empty")
+        if any(len(source) > 50 for source in self.predefined_sources):
+            raise ValueError("[sources] source names must be at most 50 characters")
         self.default_source = self.config.get(
             "sources", "default_source", fallback="default"
-        )
+        ).strip()
+        if not self.default_source or len(self.default_source) > 50:
+            raise ValueError("[sources] default_source must contain 1-50 characters")
         if self.default_source not in self.predefined_sources:
             self.predefined_sources.add(self.default_source)
-        self.max_pool_size = self.config.getint(
-            "source_pool", "max_pool_size", fallback=500
+        self.max_pool_size = self._cfg_int(
+            "source_pool", "max_pool_size", 500, low=1
         )
-        self.stats_pool_max_multiplier = self.config.getint(
-            "source_pool", "stats_pool_max_multiplier", fallback=20
+        self.stats_pool_max_multiplier = self._cfg_int(
+            "source_pool", "stats_pool_max_multiplier", 20, low=1
         )
 
         # Proxy selection configuration.
-        self.weighted_selection_enabled = self.config.getboolean(
+        legacy_weighted_selection_enabled = self.config.getboolean(
             "source_pool", "weighted_selection_enabled", fallback=False
         )
         self.selection_strategy = self.config.get(
             "source_pool", "selection_strategy", fallback="softmax"
         ).strip().lower()
-        if self.weighted_selection_enabled and self.selection_strategy == "uniform":
+        if legacy_weighted_selection_enabled and self.selection_strategy == "uniform":
             self.selection_strategy = "tiered"
         if self.selection_strategy not in {"uniform", "tiered", "weighted", "softmax"}:
-            logger.warning(
-                "Unknown selection_strategy '{}'; falling back to uniform.",
-                self.selection_strategy,
-            )
-            self.selection_strategy = "uniform"
-        self.top_tier_size = self.config.getint(
-            "source_pool", "top_tier_size", fallback=100
+            raise ValueError(f"Unknown selection_strategy: {self.selection_strategy!r}")
+        self.top_tier_size = self._cfg_int(
+            "source_pool", "top_tier_size", 100, low=0
         )
-        self.top_tier_load_percentage = self.config.getint(
-            "source_pool", "top_tier_load_percentage", fallback=70
+        if self.top_tier_size > self.max_pool_size:
+            raise ValueError("[source_pool] top_tier_size must not exceed max_pool_size")
+        self.top_tier_load_percentage = self._cfg_int(
+            "source_pool", "top_tier_load_percentage", 70, low=0, high=100
         )
         self.proxy_cooldown_ms = self._cfg_int(
             "source_pool", "proxy_cooldown_ms", 0, low=0
@@ -341,9 +449,13 @@ class ProxyManager:
             "source_pool",
             "exploration_max_ratio",
             0.30,
-            low=self.exploration_min_ratio,
+            low=0.0,
             high=1.0,
         )
+        if self.exploration_min_ratio > self.exploration_max_ratio:
+            raise ValueError(
+                "[source_pool] exploration_min_ratio must not exceed exploration_max_ratio"
+            )
         # The exploration ramp has to track how much of the *live* pool is still
         # unevaluated, not an absolute count of winners. A deployment with 1200
         # live proxies and 110 qualified ones is 9% evaluated, but an absolute
@@ -370,8 +482,12 @@ class ProxyManager:
             "source_pool",
             "probation_attempts",
             3,
-            low=self.qualification_min_results,
+            low=1,
         )
+        if self.probation_attempts < self.qualification_min_results:
+            raise ValueError(
+                "[source_pool] probation_attempts must be >= qualification_min_results"
+            )
         self.retry_attempts = self._cfg_int(
             "source_pool", "retry_attempts", 2, low=0
         )
@@ -406,7 +522,7 @@ class ProxyManager:
         # costs at most this many seconds of routing to a proxy that has since
         # changed state - which validation and feedback correct anyway.
         self.serving_plan_max_age_s = self._cfg_float(
-            "source_pool", "serving_plan_max_age_seconds", 2.0, low=0.0
+            "source_pool", "serving_plan_max_age_seconds", 2.0, low=0.001
         )
         self.selection_weight_floor = self._cfg_float(
             "source_pool", "selection_weight_floor", 1.0, low=0.01
@@ -423,18 +539,35 @@ class ProxyManager:
             DEFAULT_MAX_FEEDBACK_LATENCY_MS,
             low=1,
         )
+        self.premium_pool_size = self._cfg_int(
+            "source_pool", "premium_pool_size", 20, low=0
+        )
+        self.premium_min_usage_count = self._cfg_int(
+            "source_pool", "premium_min_usage_count", 50, low=0
+        )
+        self.allow_legacy_feedback = self.config.getboolean(
+            "source_pool", "allow_legacy_feedback", fallback=True
+        )
+        self.completed_allocation_retention_s = self._cfg_float(
+            "source_pool", "completed_allocation_retention_seconds", 3600.0, low=1.0
+        )
+        self.completed_allocation_max = self._cfg_int(
+            "source_pool", "completed_allocation_max", 100000, low=1
+        )
 
         # Fetcher configuration.
-        # Proxy-list downloads always use curl. This host routes curl and Python
-        # traffic differently, and Python's direct egress to the source URLs is
-        # the path that failed. The validator remains aiohttp-based because it
-        # connects through the proxies and inspects response headers.
-        self.fetch_connect_timeout_s = self.config.getint(
-            "fetcher", "connect_timeout_s", fallback=30
+        # Proxy-list downloads use curl. The validator remains aiohttp-based
+        # because it connects through the proxies and inspects response headers.
+        self.fetch_connect_timeout_s = self._cfg_float(
+            "fetcher", "connect_timeout_s", 30.0, low=0.001
         )
-        self.fetch_total_timeout_s = self.config.getint(
-            "fetcher", "total_timeout_s", fallback=60
+        self.fetch_total_timeout_s = self._cfg_float(
+            "fetcher", "total_timeout_s", 60.0, low=0.001
         )
+        if self.fetch_connect_timeout_s > self.fetch_total_timeout_s:
+            raise ValueError(
+                "[fetcher] connect_timeout_s must not exceed total_timeout_s"
+            )
         self.fetch_curl_retries = self._cfg_int("fetcher", "curl_retries", 2, low=0)
         self.fetch_curl_retry_delay_s = self._cfg_int(
             "fetcher", "curl_retry_delay_s", 1, low=0
@@ -453,15 +586,20 @@ class ProxyManager:
             low=self.fetch_backoff_base_s,
             high=self.fetch_backoff_max_s,
         )
+        for section in self.config.sections():
+            if section.startswith("proxy_source_"):
+                self._cfg_float(
+                    section, "update_interval_minutes", 60.0, low=0.001
+                )
 
         # Backup configuration
         self.stats_backup_enabled = self.config.getboolean(
             "backup", "stats_backup_enabled", fallback=True
         )
-        self.stats_backup_interval_s = self.config.getint(
-            "backup", "stats_backup_interval_seconds", fallback=3600  # 1 hour
+        self.stats_backup_interval_s = self._cfg_float(
+            "backup", "stats_backup_interval_seconds", 3600.0, low=0.001
         )
-        self.normal_stats_backup_path = self._resolve_project_path(
+        normal_stats_backup_path = self._resolve_project_path(
             self.config.get(
                 "backup",
                 "stats_backup_path",
@@ -469,7 +607,7 @@ class ProxyManager:
             )
         )
         self.stats_backup_path = self._isolated_backup_path(
-            self.normal_stats_backup_path, self.restore_mode
+            normal_stats_backup_path, self.restore_mode
         )
 
         # Two-speed online reliability. Latency never enters this score.
@@ -487,9 +625,13 @@ class ProxyManager:
             "source_pool",
             "reliability_fast_alpha",
             0.30,
-            low=self.reliability_slow_alpha,
+            low=0.0001,
             high=1.0,
         )
+        if self.reliability_fast_alpha < self.reliability_slow_alpha:
+            raise ValueError(
+                "[source_pool] reliability_fast_alpha must be >= reliability_slow_alpha"
+            )
         self.reliability_decay_half_life_hours = self._cfg_float(
             "source_pool", "reliability_decay_half_life_hours", 24.0, low=0.1
         )
@@ -527,6 +669,14 @@ class ProxyManager:
         self.outage_recovery_baseline_ratio = self._cfg_float(
             "source_pool", "outage_recovery_baseline_ratio", 0.3, low=0.0, high=1.0
         )
+        if not (
+            self.outage_failure_baseline_ratio
+            <= self.outage_recovery_baseline_ratio
+            <= self.outage_healthy_baseline_ratio
+        ):
+            raise ValueError(
+                "[source_pool] outage ratios must satisfy failure <= recovery <= healthy"
+            )
         self.outage_baseline_alpha = self._cfg_float(
             "source_pool", "outage_baseline_alpha", 0.2, low=0.001, high=1.0
         )
@@ -640,18 +790,31 @@ class ProxyManager:
 
     def _load_fetcher_jobs(self) -> List[Dict]:
         jobs = []
+        try:
+            backoff_states = self.db.get_source_backoff_states()
+        except Exception:
+            backoff_states = None
+            logger.exception("Could not restore proxy-source backoff state.")
+        if not isinstance(backoff_states, dict):
+            backoff_states = {}
         for section in self.config.sections():
             if section.startswith("proxy_source_"):
+                state = backoff_states.get(section, {})
+                next_attempt_at = float(state.get("next_attempt_at", 0.0) or 0.0)
+                interval_minutes = self._cfg_float(
+                    section, "update_interval_minutes", 60.0, low=0.001
+                )
                 job = {
                     "name": section,
                     "url": self.config.get(section, "url", fallback=None),
-                    "interval_minutes": self.config.getint(
-                        section, "update_interval_minutes", fallback=60
-                    ),
+                    "interval_minutes": interval_minutes,
                     "default_protocol": self.config.get(
                         section, "default_protocol", fallback=None
                     ),
-                    "last_run": 0,
+                    "last_run": max(
+                        0.0, next_attempt_at - interval_minutes * 60
+                    ),
+                    "failure_count": int(state.get("failure_count", 0) or 0),
                 }
                 if job["url"]:
                     jobs.append(job)
@@ -663,6 +826,7 @@ class ProxyManager:
     RESTART_REQUIRED_CONFIG = (
         "[database] connection pool",
         "[server] port",
+        "[server] production_threads / background_workers",
         "[logging] log_dir / log_file_base_name",
     )
 
@@ -694,23 +858,26 @@ class ProxyManager:
             # the service running on half-new, half-old settings.
             old_config = self.config
             attribute_snapshot = dict(self.__dict__)
+            restart_only_values = {
+                "server_port": self.server_port,
+                "production_threads": self.production_threads,
+                "background_workers": self.background_workers,
+            }
             old_predefined_sources_before_reload = self.predefined_sources.copy()
             old_job_names = {job["name"] for job in self.fetcher_jobs}
 
             self.config = new_config
             try:
                 self._load_config()
-                # Parsed inside the protected block, assigned outside it.
-                # _load_fetcher_jobs() calls int() on update_interval_minutes,
-                # so a typo in one [proxy_source_*] section raises here - after
-                # _load_config() has already committed ~40 tunables. Leaving the
-                # assignment out here is what keeps a failure from producing the
-                # new-tunables / old-jobs hybrid that README rules out.
+                for attribute, value in restart_only_values.items():
+                    setattr(self, attribute, value)
+                # Parsed inside the protected block, assigned outside it. This
+                # keeps any job-building failure from producing a new-tunables /
+                # old-jobs hybrid.
                 new_fetcher_jobs = self._load_fetcher_jobs()
             except Exception as e:
                 self.__dict__.update(attribute_snapshot)
                 self.config = old_config
-                self._load_config()
                 logger.error(
                     "Config reload failed ({}); rolled back to the previous "
                     "configuration.",
@@ -803,7 +970,7 @@ class ProxyManager:
         Proxy-list downloads always use curl via _fetch_source_text.
         """
         url = job["url"]
-        logger.info(f"Fetching proxy source: {job['name']} from {url}")
+        logger.info("Fetching proxy source '{}'.", job["name"])
         proxies_to_insert = []
         rejected_count = 0
         try:
@@ -825,21 +992,41 @@ class ProxyManager:
                     rejected_count + len(proxies_to_insert),
                 )
         except Exception as e:
-            logger.error(f"Failed to fetch from {job['name']} ({url}): {e}")
+            logger.error(
+                "Proxy source '{}' fetch failed with {}.",
+                job["name"],
+                type(e).__name__,
+            )
             failures = job.get("failure_count", 0) + 1
             job["failure_count"] = failures
             backoff_seconds = self._fetch_backoff_seconds(e, failures)
-            job["last_run"] = time.time() + backoff_seconds - job["interval_minutes"] * 60
+            next_attempt_at = time.time() + backoff_seconds
+            job["last_run"] = next_attempt_at - job["interval_minutes"] * 60
+            failure_class = (
+                "transient" if self._is_transient_fetch_error(e) else "persistent"
+            )
+            try:
+                self.db.upsert_source_backoff(
+                    job["name"], failures, next_attempt_at, failure_class
+                )
+            except Exception:
+                logger.exception("Could not persist proxy-source backoff state.")
             logger.warning(
                 "Fetcher job '{}' backed off for {}s after {} consecutive "
                 "{} failure(s).",
                 job["name"],
                 backoff_seconds,
                 failures,
-                "transient" if self._is_transient_fetch_error(e) else "persistent",
+                failure_class,
             )
         else:
+            had_failures = bool(job.get("failure_count"))
             job["failure_count"] = 0
+            if had_failures:
+                try:
+                    self.db.clear_source_backoff(job["name"])
+                except Exception:
+                    logger.exception("Could not clear proxy-source backoff state.")
         return proxies_to_insert
 
     @staticmethod
@@ -1002,14 +1189,13 @@ class ProxyManager:
 
         if http_status is not None and http_status >= 400:
             raise FetchError(
-                f"HTTP {http_status} from {url}",
+                f"HTTP status {http_status}",
                 transient=http_status in TRANSIENT_HTTP_STATUS_CODES,
             )
 
         if result.returncode != 0:
             raise FetchError(
-                f"curl failed with return code {result.returncode}: "
-                f"{result.stderr.strip()}",
+                f"curl failed with return code {result.returncode}",
                 transient=result.returncode in TRANSIENT_CURL_EXIT_CODES,
             )
         if http_status is None:
@@ -1027,7 +1213,10 @@ class ProxyManager:
                 if proxies:
                     all_new_proxies.extend(proxies)
             except Exception as e:
-                logger.error(f"A fetcher job raised an exception: {e}")
+                logger.error(
+                    "A fetcher job raised {}.",
+                    type(e).__name__,
+                )
 
         if not all_new_proxies:
             logger.info("No new proxies were fetched in this cycle.")
@@ -1064,17 +1253,23 @@ class ProxyManager:
             except aiohttp.ClientProxyConnectionError as e:
                 # Proxy connection refused/unreachable
                 if self.debug_mode:
-                    logger.debug(f"Proxy {proxy_url} (ID: {proxy_id}) connection error: {type(e).__name__}")
+                    logger.debug(
+                        "Proxy ID {} connection error: {}", proxy_id, type(e).__name__
+                    )
                 return {"id": proxy_id, "success": False}
             except asyncio.TimeoutError:
                 # Request timed out
                 if self.debug_mode:
-                    logger.debug(f"Proxy {proxy_url} (ID: {proxy_id}) timeout after {self.validation_timeout_s}s")
+                    logger.debug(
+                        "Proxy ID {} timed out after {}s",
+                        proxy_id,
+                        self.validation_timeout_s,
+                    )
                 return {"id": proxy_id, "success": False}
             except Exception as e:
                 # Other errors
                 if self.debug_mode:
-                    logger.debug(f"Proxy {proxy_url} (ID: {proxy_id}) failed: {type(e).__name__}")
+                    logger.debug("Proxy ID {} failed: {}", proxy_id, type(e).__name__)
                 return {"id": proxy_id, "success": False}
 
     async def _validate_http_proxy_with_session(
@@ -1116,62 +1311,110 @@ class ProxyManager:
                     )
             except aiohttp.ClientProxyConnectionError as e:
                 if self.debug_mode:
-                    logger.debug(f"Proxy {proxy_url} (ID: {proxy_id}) connection error: {type(e).__name__}")
+                    logger.debug(
+                        "Proxy ID {} connection error: {}", proxy_id, type(e).__name__
+                    )
                 return {"id": proxy_id, "success": False}
             except asyncio.TimeoutError:
                 # Request timed out
                 if self.debug_mode:
-                    logger.debug(f"Proxy {proxy_url} (ID: {proxy_id}) timeout after {self.validation_timeout_s}s")
+                    logger.debug(
+                        "Proxy ID {} timed out after {}s",
+                        proxy_id,
+                        self.validation_timeout_s,
+                    )
                 return {"id": proxy_id, "success": False}
             except Exception as e:
                 # Other errors
                 if self.debug_mode:
-                    logger.debug(f"Proxy {proxy_url} (ID: {proxy_id}) failed: {type(e).__name__}")
+                    logger.debug("Proxy ID {} failed: {}", proxy_id, type(e).__name__)
                 return {"id": proxy_id, "success": False}
 
     async def _validate_against_targets(self, proxy_id: int, proxy_url: str, request_factory) -> Dict:
         successes = 0
         latencies = []
         anonymity_levels = []
+        target_results = []
 
-        for target in self.validation_targets:
+        for target_index, target in enumerate(self.validation_targets):
             start_time = time.time()
             try:
                 async with request_factory(target) as response:
                     response.raise_for_status()
                     latency_ms = int((time.time() - start_time) * 1000)
-                    anonymity = await self._detect_anonymity(response)
+                    anonymity = await self._detect_anonymity(response, strict=True)
                     successes += 1
                     latencies.append(latency_ms)
                     anonymity_levels.append(anonymity)
+                    target_results.append(
+                        {"target_index": target_index, "success": True}
+                    )
             except Exception as e:
+                failure_kind = self._validation_failure_kind(e)
+                target_results.append(
+                    {
+                        "target_index": target_index,
+                        "success": False,
+                        "failure_kind": failure_kind,
+                    }
+                )
+                self.validation_target_failures[(target_index, failure_kind)] += 1
                 if self.debug_mode:
                     logger.debug(
-                        "Proxy {} (ID: {}) failed target {}: {}",
-                        proxy_url,
+                        "Validation target index {} failed for proxy ID {}: {}",
+                        target_index,
                         proxy_id,
-                        target,
-                        type(e).__name__,
+                        failure_kind,
                     )
 
         if successes < self.validation_success_threshold:
-            return {"id": proxy_id, "success": False}
+            return {
+                "id": proxy_id,
+                "success": False,
+                "target_results": target_results,
+            }
 
         return {
             "id": proxy_id,
             "success": True,
             "latency": int(sum(latencies) / len(latencies)),
             "anonymity": self._combine_anonymity_levels(anonymity_levels),
+            "target_results": target_results,
         }
 
-    async def _detect_anonymity(self, response: aiohttp.ClientResponse) -> str:
+    @staticmethod
+    def _validation_failure_kind(error: Exception) -> str:
+        if isinstance(error, asyncio.TimeoutError):
+            return "timeout"
+        if isinstance(error, aiohttp.ClientResponseError):
+            return "http_status"
+        dns_error = getattr(aiohttp, "ClientConnectorDNSError", ())
+        if dns_error and isinstance(error, dns_error):
+            return "dns"
+        if isinstance(error, aiohttp.ClientConnectorError):
+            if isinstance(getattr(error, "os_error", None), socket.gaierror):
+                return "dns"
+            return "connection"
+        if isinstance(error, aiohttp.ClientConnectionError):
+            return "connection"
+        if isinstance(error, (ValueError, json.JSONDecodeError)):
+            return "malformed_response"
+        return "connection"
+
+    async def _detect_anonymity(
+        self, response: aiohttp.ClientResponse, strict: bool = False
+    ) -> str:
         try:
             data = await response.json(content_type=None)
-        except Exception:
+        except Exception as error:
+            if strict:
+                raise ValueError("validation response is not JSON") from error
             return "unknown"
 
         headers = data.get("headers") if isinstance(data, dict) else None
         if not isinstance(headers, dict):
+            if strict:
+                raise ValueError("validation response has no header mapping")
             return "unknown"
 
         normalized_headers = {str(key).lower() for key in headers}
@@ -1187,7 +1430,7 @@ class ProxyManager:
             return "elite"
         return "unknown"
 
-    async def _validate_proxies_batch_async(self, proxies_to_validate: List[Dict]) -> Tuple[List[Dict], List[int]]:
+    async def _validate_proxies_batch_async(self, proxies_to_validate: List[Dict]):
         """
         Validate a batch of proxies concurrently using aiohttp.
         Returns (success_proxies, failure_proxy_ids).
@@ -1199,7 +1442,6 @@ class ProxyManager:
         connector = aiohttp.TCPConnector(
             limit=0, # Unlimited at connector level, controlled by semaphore
             force_close=True,
-            enable_cleanup_closed=True,
         )
         
         semaphore = asyncio.Semaphore(self.validation_workers)
@@ -1216,18 +1458,43 @@ class ProxyManager:
             ]
             results = await asyncio.gather(*tasks, return_exceptions=True)
         
-        success_proxies = []
-        failure_proxy_ids = []
-        
+        normalized_results = []
         for i, result in enumerate(results):
             if isinstance(result, Exception):
-                failure_proxy_ids.append(proxies_to_validate[i]["id"])
-            elif result.get("success"):
-                success_proxies.append(result)
+                normalized_results.append(
+                    {"id": proxies_to_validate[i]["id"], "success": False, "target_results": []}
+                )
             else:
-                failure_proxy_ids.append(result["id"])
-        
-        return success_proxies, failure_proxy_ids
+                normalized_results.append(result)
+
+        successes_by_target = [0] * len(self.validation_targets)
+        for result in normalized_results:
+            for target_result in result.get("target_results", []):
+                if target_result.get("success"):
+                    successes_by_target[target_result["target_index"]] += 1
+        healthy_targets = [
+            count >= self.validation_target_min_samples
+            for count in successes_by_target
+        ]
+        quorum_healthy = (
+            sum(1 for healthy in healthy_targets if healthy)
+            >= self.validation_success_threshold
+        )
+        metadata = {
+            "quorum_healthy": quorum_healthy,
+            "healthy_targets": healthy_targets,
+            "successes_by_target": successes_by_target,
+        }
+        if not quorum_healthy:
+            return [], [], metadata
+
+        success_proxies = [
+            result for result in normalized_results if result.get("success")
+        ]
+        failure_proxy_ids = [
+            result["id"] for result in normalized_results if not result.get("success")
+        ]
+        return success_proxies, failure_proxy_ids, metadata
 
     def _collect_validation_batch(self) -> List[Dict]:
         """
@@ -1339,11 +1606,20 @@ class ProxyManager:
             try:
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
-                success_proxies, failure_proxy_ids = loop.run_until_complete(
+                batch_result = loop.run_until_complete(
                     self._validate_proxies_batch_async(proxies_to_validate)
                 )
             finally:
                 loop.close()
+
+            if len(batch_result) == 2:  # Backward-compatible test/plugin result.
+                success_proxies, failure_proxy_ids = batch_result
+                validation_metadata = {
+                    "quorum_healthy": True,
+                    "healthy_targets": [True] * len(self.validation_targets),
+                }
+            else:
+                success_proxies, failure_proxy_ids, validation_metadata = batch_result
             
             validation_duration = time.time() - validation_start_time
             proxies_per_second = total_to_validate / validation_duration if validation_duration > 0 else 0
@@ -1355,7 +1631,25 @@ class ProxyManager:
                 f"Throughput: {proxies_per_second:.1f} proxies/s"
             )
 
+            with self.lock:
+                self.last_validation_quorum_healthy = bool(
+                    validation_metadata["quorum_healthy"]
+                )
+                self.last_validation_target_health = list(
+                    validation_metadata["healthy_targets"]
+                )
+
+            if not validation_metadata["quorum_healthy"]:
+                logger.error(
+                    "Validation target quorum unavailable; preserving last-known-good "
+                    "liveness and leaving new proxies pending. target_health={}",
+                    validation_metadata["healthy_targets"],
+                )
+                return
+
             self.db.batch_update_proxy_results(success_proxies, failure_proxy_ids)
+            with self.lock:
+                self.last_validation_success_ts = time.time()
 
             self._sync_and_select_top_proxies()
         finally:
@@ -1390,7 +1684,12 @@ class ProxyManager:
                 for proxy_url in self.active_proxies:
                     if proxy_url not in stats_pool:
                         stats_pool[proxy_url] = self._get_new_proxy_stat(
-                            source, feedback_history.get(proxy_url)
+                            source,
+                            (
+                                feedback_history.get(source, {}).get(proxy_url)
+                                if isinstance(feedback_history.get(source), dict)
+                                else feedback_history.get(proxy_url)
+                            ),
                         )
 
                 # One pass: age every estimator toward the fixed prior, and
@@ -1525,7 +1824,7 @@ class ProxyManager:
         if not needs_seeding:
             return {}
 
-        history = self.db.get_active_feedback_history()
+        history = self.db.get_active_feedback_history(self.default_source)
         if not isinstance(history, dict):
             logger.warning(
                 "Feedback history unavailable this cycle; new stats are seeded "
@@ -1556,57 +1855,55 @@ class ProxyManager:
 
         with self.lock:
             outage_protected = {
-                proxy_url
-                for state in self.outage_states.values()
+                (source, proxy_url)
+                for source, state in self.outage_states.items()
                 for proxy_url in state.get("protected_stats", {})
             }
-            pending = self.pending_feedback_persist - outage_protected
+            normalized_pending = {
+                (self.default_source, item) if isinstance(item, str) else item
+                for item in self.pending_feedback_persist
+            }
+            pending = normalized_pending - outage_protected
             # Candidate-window mutations stay queued but cannot reach durable
             # monotonic counters until the outage decision commits or rolls
             # them back.
             self.pending_feedback_persist = (
-                self.pending_feedback_persist & outage_protected
+                normalized_pending & outage_protected
             )
 
             rows = []
-            for proxy_url in pending:
+            for source, proxy_url in sorted(pending):
                 key = self._split_proxy_url(proxy_url)
                 if key is None:
                     continue
-                # A proxy can be tracked under several sources with different
-                # counters. Persist the record of the source that has observed
-                # it most: that is the fullest history available, and the
-                # re-seed it feeds is per-source anyway.
-                best_stat, best_total = None, -1
-                for stats in self.source_stats.values():
-                    stat = stats.get(proxy_url)
-                    if not isinstance(stat, dict):
-                        continue
-                    total = int(stat.get("success_count", 0) or 0) + int(
-                        stat.get("failure_count", 0) or 0
-                    )
-                    if total > best_total:
-                        best_stat, best_total = stat, total
-                if best_stat is None:
+                stat = self.source_stats.get(source, {}).get(proxy_url)
+                if not isinstance(stat, dict):
                     continue
                 protocol, ip, port = key
                 rows.append(
                     (
+                        source,
                         protocol,
                         ip,
                         port,
-                        int(best_stat.get("success_count", 0) or 0),
-                        int(best_stat.get("failure_count", 0) or 0),
+                        int(stat.get("success_count", 0) or 0),
+                        int(stat.get("failure_count", 0) or 0),
                         self._coerce_timestamp(
-                            best_stat.get("last_feedback_ts"), time.time()
+                            stat.get("last_feedback_ts"), time.time()
                         ),
+                        float(stat.get("quality_slow", self.reliability_prior)),
+                        float(stat.get("quality_fast", self.reliability_prior)),
+                        self._coerce_timestamp(
+                            stat.get("quality_updated_ts"), time.time()
+                        ),
+                        copy.deepcopy(stat.get("recent_results", [])),
                     )
                 )
 
         if not rows:
             return
         try:
-            persisted = self.db.upsert_proxy_feedback_history(rows)
+            persisted = self.db.upsert_proxy_source_reputation(rows)
         except Exception:
             persisted = False
             logger.exception("Durable reputation write raised unexpectedly.")
@@ -1618,9 +1915,9 @@ class ProxyManager:
                 len(pending),
             )
 
-    def _flush_stats(self):
+    def _flush_stats(self, include_current: bool = False):
         """Periodic persistence: minute aggregates plus per-proxy reputation."""
-        self._flush_feedback_buffer()
+        self._flush_feedback_buffer(include_current=include_current)
         self._persist_feedback_history()
 
     def _baseline_score(self, source: Optional[str] = None) -> float:
@@ -1816,35 +2113,25 @@ class ProxyManager:
 
                 if fetch_futures:
                     logger.info(f"Submitted {len(fetch_futures)} fetcher jobs.")
-                    threading.Thread(
-                        target=self._handle_fetch_results,
-                        args=(fetch_futures,),
-                        daemon=True,
-                    ).start()
+                    self._submit_background(self._handle_fetch_results, fetch_futures)
 
                 if now - last_validation_run >= self.validation_interval_s:
                     last_validation_run = now
-                    threading.Thread(
-                        target=self._run_validation_cycle, daemon=True
-                    ).start()
+                    self._submit_background(self._run_validation_cycle)
                 if now - last_flush_time >= self.stats_flush_interval_s:
                     last_flush_time = now
-                    threading.Thread(
-                        target=self._flush_stats, daemon=True
-                    ).start()
+                    self._submit_background(self._flush_stats)
                 if (
                     now - self.last_source_refresh_time
                     >= self.source_refresh_interval_s
                 ):
                     self.last_source_refresh_time = now
-                    threading.Thread(
-                        target=self._update_dashboard_sources, daemon=True
-                    ).start()
+                    self._submit_background(self._update_dashboard_sources)
 
                 # Stats backup task
                 if self.stats_backup_enabled and now - last_backup_time >= self.stats_backup_interval_s:
                     last_backup_time = now
-                    threading.Thread(target=self.backup_stats, daemon=True).start()
+                    self._submit_background(self.backup_stats)
 
                 self.refresh_serving_plans()
 
@@ -1853,9 +2140,28 @@ class ProxyManager:
                 logger.error(f"Error in scheduler loop: {e}", exc_info=True)
                 self.stop_scheduler_event.wait(60)
 
+    def _submit_background(self, callback, *args):
+        with self.lock:
+            if not self.accepting_background_tasks:
+                return None
+            future = self.background_executor.submit(callback, *args)
+            self.background_futures.add(future)
+
+        def completed(done):
+            with self.lock:
+                self.background_futures.discard(done)
+            try:
+                done.result()
+            except Exception:
+                logger.exception("Tracked background task failed.")
+
+        future.add_done_callback(completed)
+        return future
+
     def start_scheduler(self):
         if not self.scheduler_thread or not self.scheduler_thread.is_alive():
             self.stop_scheduler_event.clear()
+            self.accepting_background_tasks = True
             self.scheduler_thread = threading.Thread(
                 target=self._scheduler_loop, daemon=True
             )
@@ -1863,15 +2169,42 @@ class ProxyManager:
             logger.info("Background scheduler started.")
 
     def stop_scheduler(self):
-        logger.info("Stopping scheduler and flushing final stats...")
-        self._flush_stats()
-        if self.stats_backup_enabled:
-            self.backup_stats()  # Backup before shutdown
-        if self.scheduler_thread and self.scheduler_thread.is_alive():
+        """Stop scheduling, drain/cancel work, then persist final state."""
+        started = time.monotonic()
+        deadline = started + self.shutdown_deadline_s
+        logger.info(
+            "Stopping scheduler with a {:.1f}s graceful deadline.",
+            self.shutdown_deadline_s,
+        )
+        with self.lock:
+            self.accepting_background_tasks = False
             self.stop_scheduler_event.set()
-            self.fetch_executor.shutdown(wait=True)
-            self.scheduler_thread.join(timeout=10)
-            logger.info("Background scheduler stopped.")
+
+        if self.scheduler_thread and self.scheduler_thread.is_alive():
+            self.scheduler_thread.join(timeout=max(0.0, deadline - time.monotonic()))
+
+        self.fetch_executor.shutdown(wait=False, cancel_futures=True)
+        with self.lock:
+            tracked = list(self.background_futures)
+        if tracked:
+            _, unfinished = wait(
+                tracked, timeout=max(0.0, deadline - time.monotonic())
+            )
+            for future in unfinished:
+                future.cancel()
+            if unfinished:
+                logger.warning(
+                    "Shutdown deadline left {} background task(s) unfinished.",
+                    len(unfinished),
+                )
+        self.background_executor.shutdown(wait=False, cancel_futures=True)
+
+        # The current partial minute follows the same acknowledge-after-commit
+        # path as periodic data, then source-specific reputation is persisted.
+        self._flush_stats(include_current=True)
+        if self.stats_backup_enabled:
+            self.backup_stats()
+        logger.info("Background scheduler stopped and final persistence completed.")
 
     def _get_new_proxy_stat(
         self, source: Optional[str] = None, history: Optional[Dict] = None
@@ -1892,11 +2225,9 @@ class ProxyManager:
             "quality_updated_ts": None,
             "success_count": 0,         # Total historical success
             "failure_count": 0,         # Total historical failure
-            "consecutive_failures": 0,  # Diagnostic only; selection is score-based
             "recent_results": [],       # List of [timestamp, success: bool, latency_ms: int|None]
             "avg_latency_ms": None,     # Exponential moving average of latency
             "last_feedback_ts": None,   # Unix timestamp of latest feedback
-            "completed_feedback_count": 0,
             "handout_count": 0,
             "trial_handout_count": 0,
             "last_handed_out_ts": None,
@@ -1908,13 +2239,18 @@ class ProxyManager:
 
         stat["success_count"] = nonnegative_int(history.get("success_count"))
         stat["failure_count"] = nonnegative_int(history.get("failure_count"))
-        stat["completed_feedback_count"] = (
-            stat["success_count"] + stat["failure_count"]
-        )
         now_ts = time.time()
         stat["last_feedback_ts"] = self._coerce_timestamp(
             history.get("last_feedback_ts"), now_ts
         )
+        for field in (
+            "quality_slow",
+            "quality_fast",
+            "quality_updated_ts",
+            "recent_results",
+        ):
+            if history.get(field) is not None:
+                stat[field] = copy.deepcopy(history[field])
         if stat["success_count"] or stat["failure_count"]:
             # The durable record seeds the *score*, never the trial budget. A
             # re-seeded proxy has an empty result window, so it cannot qualify
@@ -1922,7 +2258,7 @@ class ProxyManager:
             # previous life left it ineligible for exploitation *and* for every
             # exploration group - unreachable until the forgiveness epoch
             # expired. It re-enters as a discovery candidate holding its score.
-            self._seed_reliability_from_history(stat, now_ts)
+            return self._migrate_legacy_stat(stat, trust_derived=True)
         return stat
 
     def backup_stats(self) -> Dict:
@@ -1931,6 +2267,8 @@ class ProxyManager:
             return self._backup_stats_locked()
 
     def _backup_stats_locked(self) -> Dict:
+        backup_started = time.monotonic()
+        lock_started = time.monotonic()
         with self.lock:
             # Snapshot the destination together with the data, and before the
             # deep copy rather than after it - the copy is the slow part, and
@@ -1958,6 +2296,7 @@ class ProxyManager:
                 "timestamp": datetime.now().isoformat(),
                 "source_stats": source_stats_snapshot,
             }
+        self.last_manager_lock_hold_s = time.monotonic() - lock_started
 
         try:
             # Create directory if it doesn't exist
@@ -1986,6 +2325,7 @@ class ProxyManager:
                 f"Stats backup completed: {len(stats_snapshot['source_stats'])} sources, "
                 f"{total_proxies} proxy stats saved to {backup_path}"
             )
+            self.last_backup_duration_s = time.monotonic() - backup_started
             return {
                 "status": "success",
                 "path": str(backup_path),
@@ -1993,6 +2333,7 @@ class ProxyManager:
                 "total_proxies": total_proxies,
             }
         except Exception as e:
+            self.last_backup_duration_s = time.monotonic() - backup_started
             logger.error(f"Failed to backup stats: {e}")
             return {"status": "error", "message": str(e)}
 
@@ -2145,9 +2486,55 @@ class ProxyManager:
             is_defined = source in self.predefined_sources
         return source if is_defined else self.default_source
 
+    def liveness_status(self) -> Dict[str, object]:
+        return {"status": "live", "serving": True}
+
+    def readiness_status(self) -> Dict[str, object]:
+        now_ts = time.time()
+        try:
+            database_ready = bool(self.db.ping())
+        except Exception:
+            database_ready = False
+        with self.lock:
+            scheduler_ready = bool(
+                self.scheduler_thread
+                and self.scheduler_thread.is_alive()
+                and not self.stop_scheduler_event.is_set()
+            )
+            validation_ready = bool(
+                self.last_validation_quorum_healthy
+                and self.last_validation_success_ts is not None
+                and now_ts - self.last_validation_success_ts
+                <= self.readiness_validation_max_age_s
+            )
+            flush_ready = bool(
+                self.last_flush_success_ts is not None
+                and now_ts - self.last_flush_success_ts <= self.readiness_flush_max_age_s
+            )
+            usable_pool = len(self.active_proxies)
+            pool_ready = usable_pool >= self.readiness_min_usable_pool
+        dependencies = {
+            "database": database_ready,
+            "scheduler": scheduler_ready,
+            "validation": validation_ready,
+            "feedback_flush": flush_ready,
+            "usable_pool": pool_ready,
+        }
+        return {
+            "status": "ready" if all(dependencies.values()) else "not_ready",
+            "ready": all(dependencies.values()),
+            "dependencies": dependencies,
+            "usable_proxies": usable_pool,
+            "minimum_usable_proxies": self.readiness_min_usable_pool,
+        }
+
     def get_proxy(self, source: str) -> Optional[str]:
+        allocation = self.allocate_proxy(source)
+        return allocation["proxy"] if allocation else None
+
+    def allocate_proxy(self, source: str) -> Optional[Dict[str, str]]:
         """
-        Draw one proxy from the current serving plan.
+        Draw one proxy and create an opaque, source-bound allocation.
 
         The request path deliberately holds no pool logic: eligibility,
         qualification, ranking and weights are all decided by
@@ -2159,6 +2546,7 @@ class ProxyManager:
         source = self._get_source_or_default(source)
 
         with self.lock:
+            self._cleanup_allocations_locked(time.time())
             plan = self._serving_plan(source)
             if plan is None:
                 logger.warning(f"No proxy pools defined for source '{source}'.")
@@ -2173,6 +2561,15 @@ class ProxyManager:
             ):
                 selected = self._take_trial_candidate(plan)
                 if selected is not None:
+                    stat = self.source_stats.get(source, {}).get(selected)
+                    if (
+                        selected not in self.active_proxies
+                        or stat is None
+                        or self._is_qualified(stat, now_ts)
+                        or not self._is_eligible(source, selected, now_ts)
+                    ):
+                        selected = None
+                if selected is not None:
                     if not exploit and source not in self.cold_start_fallback_logged:
                         logger.warning(
                             "Source '{}' has no qualified exploit candidate; serving "
@@ -2182,8 +2579,14 @@ class ProxyManager:
                             plan["exploration_ratio"] * 100,
                         )
                         self.cold_start_fallback_logged.add(source)
-                    self._mark_proxy_handed_out(source, selected, now_ts)
-                    return selected
+                    allocation_id = self._mark_proxy_handed_out(
+                        source, selected, now_ts, premium=False
+                    )
+                    return {
+                        "proxy": selected,
+                        "source": source,
+                        "allocation_id": allocation_id,
+                    }
 
             if not exploit:
                 logger.warning(
@@ -2201,8 +2604,14 @@ class ProxyManager:
                     source,
                 )
                 return None
-            self._mark_proxy_handed_out(source, selected, now_ts)
-            return selected
+            allocation_id = self._mark_proxy_handed_out(
+                source, selected, now_ts, premium=False
+            )
+            return {
+                "proxy": selected,
+                "source": source,
+                "allocation_id": allocation_id,
+            }
 
     @staticmethod
     def _pop_random(pool: List[str]) -> str:
@@ -2247,6 +2656,12 @@ class ProxyManager:
         # ever handed out, and the plan is what hands them out.
         if proxy_url not in self.active_proxies or self._is_qualified(stat):
             return
+        if self.proxy_cooldown_ms > 0 and not self._is_eligible(
+            source, proxy_url, apply_cooldown=True
+        ):
+            # The next background plan refresh makes it ready after the
+            # configured cooldown; do not bypass the delay by reinserting now.
+            return
         trial_handouts = int(stat.get("trial_handout_count", 0) or 0)
         if trial_handouts >= self.probation_attempts + self.retry_attempts:
             return
@@ -2259,6 +2674,15 @@ class ProxyManager:
         else:
             plan["fallback"].append(proxy_url)
         plan["members"].add(proxy_url)
+
+    def _remove_from_exploit(self, source: str, proxy_url: str):
+        """Atomically tombstone a candidate that no longer qualifies."""
+        plan = self.serving_plans.get(source)
+        if plan is None or proxy_url not in plan["exploit_members"]:
+            return
+        plan["exploit"] = [url for url in plan["exploit"] if url != proxy_url]
+        plan["exploit_members"].discard(proxy_url)
+        plan["cum_weights"] = self._exploit_cum_weights(source, plan["exploit"])
 
     def _promote_to_exploit(self, source: str, proxy_url: str, stat: Dict):
         """
@@ -2313,31 +2737,64 @@ class ProxyManager:
             # the population the way random.choices(weights=...) would be.
             return random.choices(exploit, cum_weights=cum_weights, k=1)[0]
 
-        if self.proxy_max_inflight <= 0 or source is None:
-            return draw()
-
         now_ts = time.time() if now_ts is None else now_ts
         stats_pool = self.source_stats.get(source, {})
         for _ in range(self.exploit_draw_attempts):
             candidate = draw()
             stat = stats_pool.get(candidate)
-            if stat is None or self._lease_count(stat, now_ts) < self.proxy_max_inflight:
+            if stat is None and candidate in self.active_proxies:
                 return candidate
-        # Repeated draws all landed on saturated proxies. Rebuild once - the
-        # builder drops them - rather than guess again or breach the cap.
-        rebuilt = self._build_serving_plan(source, now_ts=now_ts)
-        if not rebuilt or not rebuilt["exploit"]:
-            return None
-        return self._draw_exploit(rebuilt, None, now_ts)
+            if (
+                candidate not in self.active_proxies
+                or stat is None
+                or not self._is_qualified(stat, now_ts)
+            ):
+                self._remove_from_exploit(source, candidate)
+                if not plan["exploit"]:
+                    return None
+                exploit = plan["exploit"]
+                cum_weights = plan["cum_weights"]
+                continue
+            if self.proxy_max_inflight <= 0 or self._lease_count(
+                stat, now_ts
+            ) < self.proxy_max_inflight:
+                return candidate
+        self._schedule_plan_refresh_locked(source)
+        return None
 
     def _serving_plan(self, source: str) -> Optional[Dict]:
         plan = self.serving_plans.get(source)
-        if (
-            plan is not None
-            and time.time() - plan["built_at"] < self.serving_plan_max_age_s
-        ):
-            return plan
-        return self._build_serving_plan(source)
+        if plan is None:
+            # The initial plan is built during startup pool sync. This fallback
+            # covers embedders that construct a manager without that lifecycle;
+            # expired plans below are never rebuilt on the request thread.
+            return self._build_serving_plan(source)
+        # Zero is reserved for deterministic unit fixtures that explicitly
+        # request an always-current control plane. Valid production config is
+        # strictly positive and never takes this branch.
+        if self.serving_plan_max_age_s <= 0:
+            return self._build_serving_plan(source)
+        if plan is None or time.time() - plan["built_at"] >= self.serving_plan_max_age_s:
+            self._schedule_plan_refresh_locked(source)
+        return plan
+
+    def _schedule_plan_refresh_locked(self, source: str):
+        if source in self.plan_refreshing or not self.accepting_background_tasks:
+            return
+        self.plan_refreshing.add(source)
+
+        def refresh():
+            started = time.monotonic()
+            try:
+                with self.lock:
+                    self._build_serving_plan(source)
+            finally:
+                duration = time.monotonic() - started
+                with self.lock:
+                    self.last_plan_refresh_duration_s = duration
+                    self.plan_refreshing.discard(source)
+
+        self._submit_background(refresh)
 
     def refresh_serving_plans(self):
         """Rebuild every source's plan; called by the scheduler, off-path."""
@@ -2376,7 +2833,6 @@ class ProxyManager:
         # still bounds the tier lists, which is what weights the `tiered`
         # strategy; it no longer decides who may be served.
         ranked = list(pools.get("top_tier", [])) + list(pools.get("bottom_tier", []))
-        ranked_set = set(ranked)
         # Ranked, not set-ordered. The draw is order-independent for every
         # strategy, but a plan whose order depends on set iteration is not
         # reproducible - in a log, in a test, or between two processes.
@@ -2415,7 +2871,6 @@ class ProxyManager:
 
         plan = {
             "built_at": now_ts,
-            "ranked": ranked_set,
             "exploit": exploit,
             "exploit_members": set(exploit),
             "cum_weights": self._exploit_cum_weights(source, exploit),
@@ -2425,8 +2880,6 @@ class ProxyManager:
             "exploration_ratio": self._exploration_ratio_for(
                 live_count, len(qualified)
             ),
-            "qualified": len(qualified),
-            "live": live_count,
         }
         self.serving_plans[source] = plan
         return plan
@@ -2545,11 +2998,127 @@ class ProxyManager:
         leases.append(now_ts + self.proxy_inflight_timeout_s)
 
     @staticmethod
+    def _release_lease_expiry(stat: Dict, expiry: Optional[float]):
+        leases = stat.get("inflight")
+        if not leases:
+            return
+        if expiry is None:
+            del leases[0]
+            return
+        try:
+            leases.remove(expiry)
+        except ValueError:
+            # Old backups did not associate IDs with lease slots. If that
+            # compatibility shape is encountered, closing the oldest slot is
+            # safer than leaking capacity indefinitely.
+            del leases[0]
+
+    @staticmethod
     def _release_lease(stat: Dict):
         """Feedback closes the oldest outstanding handout for this proxy."""
         leases = stat.get("inflight")
         if leases:
             del leases[0]
+
+    def _remember_completed_allocation_locked(
+        self, allocation_id: str, record: Dict, reason: str, now_ts: float
+    ):
+        self.completed_allocations[allocation_id] = {
+            "source": record["source"],
+            "proxy": record["proxy"],
+            "reason": reason,
+            "completed_at": now_ts,
+        }
+        self.completed_allocations.move_to_end(allocation_id)
+        cutoff = now_ts - self.completed_allocation_retention_s
+        while self.completed_allocations:
+            _, oldest = next(iter(self.completed_allocations.items()))
+            if (
+                len(self.completed_allocations) <= self.completed_allocation_max
+                and oldest["completed_at"] >= cutoff
+            ):
+                break
+            self.completed_allocations.popitem(last=False)
+
+    def _cleanup_allocations_locked(self, now_ts: float):
+        cutoff = now_ts - self.completed_allocation_retention_s
+        while self.completed_allocations:
+            _, oldest = next(iter(self.completed_allocations.items()))
+            if oldest["completed_at"] >= cutoff:
+                break
+            self.completed_allocations.popitem(last=False)
+        for allocation_id, record in list(self.allocations.items()):
+            if record["expires_at"] > now_ts:
+                continue
+            self.allocations.pop(allocation_id, None)
+            stat = self.source_stats.get(record["source"], {}).get(record["proxy"])
+            if stat is not None:
+                self._release_lease_expiry(stat, record["expires_at"])
+            self._remember_completed_allocation_locked(
+                allocation_id, record, "expired", now_ts
+            )
+
+    def _accept_feedback_allocation_locked(
+        self,
+        source: str,
+        proxy_url: str,
+        allocation_id: Optional[str],
+        now_ts: float,
+    ) -> Tuple[bool, str, str]:
+        """Validate feedback identity and close exactly one matching lease."""
+        self._cleanup_allocations_locked(now_ts)
+        if allocation_id is None:
+            if not self.allow_legacy_feedback:
+                return False, "allocation_id_required", source
+            normalized_source = self._get_source_or_default(source)
+            matching_id = next(
+                (
+                    candidate_id
+                    for candidate_id, record in self.allocations.items()
+                    if record["source"] == normalized_source
+                    and record["proxy"] == proxy_url
+                ),
+                None,
+            )
+            if matching_id is not None:
+                record = self.allocations.pop(matching_id)
+                stat = self.source_stats.get(normalized_source, {}).get(proxy_url)
+                if stat is not None:
+                    self._release_lease_expiry(stat, record["expires_at"])
+                self._remember_completed_allocation_locked(
+                    matching_id, record, "accepted_legacy", now_ts
+                )
+            self.legacy_feedback_total += 1
+            logger.warning(
+                "Accepted feedback without allocation_id in compatibility mode; "
+                "exact idempotency is unavailable."
+            )
+            return True, "accepted_legacy", normalized_source
+
+        if not isinstance(allocation_id, str) or not allocation_id.strip():
+            return False, "invalid_allocation_id", source
+        completed = self.completed_allocations.get(allocation_id)
+        if completed is not None:
+            reason = completed["reason"]
+            if reason in {"accepted", "accepted_legacy"}:
+                reason = "duplicate_allocation_id"
+            return False, reason, source
+        record = self.allocations.get(allocation_id)
+        if record is None:
+            return False, "unknown_allocation_id", source
+        if source != record["source"]:
+            return False, "allocation_source_mismatch", source
+        if proxy_url != record["proxy"]:
+            return False, "allocation_proxy_mismatch", source
+
+        self.allocations.pop(allocation_id)
+        stat = self.source_stats.get(source, {}).get(proxy_url)
+        if stat is not None:
+            self._release_lease_expiry(stat, record["expires_at"])
+        self._remember_completed_allocation_locked(
+            allocation_id, record, "accepted", now_ts
+        )
+        return True, "accepted", source
 
     def _inflight_limit(self, stat: Dict, now_ts: Optional[float] = None) -> int:
         return (
@@ -2614,15 +3183,25 @@ class ProxyManager:
                 groups["retry"].append(proxy_url)
         return groups, qualified, live_count
 
-    def _mark_proxy_handed_out(self, source: str, proxy_url: str, now_ts: float):
+    def _mark_proxy_handed_out(
+        self, source: str, proxy_url: str, now_ts: float, premium: bool = False
+    ) -> str:
         # Handout times exist only to answer the cooldown question. With
         # cooldown off - the default - recording them is a write on the hot
         # path feeding a map that is never read and never shrinks.
         if self.proxy_cooldown_ms > 0:
             self.proxy_last_handed_out_ts[source][proxy_url] = now_ts
         stat = self.source_stats.get(source, {}).get(proxy_url)
+        allocation_id = secrets.token_urlsafe(24)
+        expires_at = now_ts + self.proxy_inflight_timeout_s
+        self.allocations[allocation_id] = {
+            "source": source,
+            "proxy": proxy_url,
+            "expires_at": expires_at,
+            "premium": bool(premium),
+        }
         if stat is None:
-            return
+            return allocation_id
         stat["handout_count"] = int(stat.get("handout_count", 0) or 0) + 1
         stat["last_handed_out_ts"] = now_ts
         qualified = self._is_qualified(stat, now_ts)
@@ -2631,20 +3210,23 @@ class ProxyManager:
         # deployment that has opted into a per-proxy concurrency cap. With the
         # cap off there is nothing to compare against, and appending to a list
         # nobody consults just grows it between syncs.
-        if not qualified or self.proxy_max_inflight > 0:
-            self._grant_lease(stat, now_ts)
+        # Every handout owns a lease even when the configured capacity is
+        # unlimited; exact feedback must still be able to identify and close
+        # only this request's allocation.
+        self._grant_lease(stat, now_ts)
         # A paused source produces no usable evidence, so a handout made during
         # one must not spend the trial budget it would otherwise be judged on:
         # the guard exists to keep an outage from costing proxies their
         # reputation, and the trial budget is part of that reputation.
         if self.outage_states.get(source, {}).get("active"):
-            return
+            return allocation_id
         if not qualified:
             stat["trial_handout_count"] = int(
                 stat.get("trial_handout_count", 0) or 0
             ) + 1
             if stat["trial_handout_count"] >= self.probation_attempts:
                 stat["retry_after_ts"] = now_ts + self.retry_delay_s
+        return allocation_id
 
     def _is_eligible(
         self,
@@ -2682,21 +3264,58 @@ class ProxyManager:
         return limit <= 0 or self._lease_count(stat, now_ts) < limit
 
     def get_premium_proxy(self) -> Optional[str]:
+        allocation = self.allocate_premium_proxy()
+        return allocation["proxy"] if allocation else None
+
+    def allocate_premium_proxy(self) -> Optional[Dict[str, str]]:
         """
-        Get a premium (highest quality) proxy for Playwright and other high-reliability use cases.
-        Returns one of the lowest-latency proxies from the database.
+        Allocate a premium proxy through the normal source/capacity contract.
         """
         with self.lock:
-            if not self.premium_proxies:
+            self._cleanup_allocations_locked(time.time())
+            candidates = []
+            now_ts = time.time()
+            for proxy_url in list(self.premium_proxies):
+                source = self.premium_sources.get(proxy_url)
+                stat = self.source_stats.get(source, {}).get(proxy_url) if source else None
+                if (
+                    source is None
+                    or stat is None
+                    or proxy_url not in self.active_proxies
+                    or not self._is_qualified(stat, now_ts)
+                    or not self._is_eligible(
+                        source, proxy_url, now_ts, apply_cooldown=False
+                    )
+                ):
+                    continue
+                candidates.append((source, proxy_url))
+            if not candidates:
+                self._sync_premium_proxies_locked()
+                candidates = [
+                    (self.premium_sources[url], url)
+                    for url in self.premium_proxies
+                    if url in self.premium_sources
+                    and self._is_eligible(
+                        self.premium_sources[url], url, now_ts, apply_cooldown=False
+                    )
+                ]
+            if not candidates:
                 logger.warning("No premium proxies available.")
                 return None
 
-            selected = random.choice(self.premium_proxies)
+            source, selected = random.choice(candidates)
+            allocation_id = self._mark_proxy_handed_out(
+                source, selected, now_ts, premium=True
+            )
             logger.debug(
                 f"Premium proxy selected: {selected} "
-                f"(pool size: {len(self.premium_proxies)})"
+                f"(pool size: {len(candidates)})"
             )
-            return selected
+            return {
+                "proxy": selected,
+                "source": source,
+                "allocation_id": allocation_id,
+            }
 
     def _sync_premium_proxies(self):
         """
@@ -2733,87 +3352,99 @@ class ProxyManager:
             logger.warning("No premium proxies found: no active proxies available.")
 
     def _sync_premium_proxies_locked(self):
-        premium_pool_size = self.config.getint(
-            "source_pool", "premium_pool_size", fallback=20
-        )
-        min_usage_count = self.config.getint(
-            "source_pool", "premium_min_usage_count", fallback=50
-        )
-
         # Aggregate all proxies with their highest score across all sources.
-        battle_tested_scores: Dict[str, float] = {}
-        all_proxy_scores: Dict[str, float] = {}
+        battle_tested_scores: Dict[str, Tuple[float, str]] = {}
 
         for source, stats in self.source_stats.items():
             for proxy_url, stat in stats.items():
                 usage_count = stat.get("success_count", 0) + stat.get("failure_count", 0)
                 score = stat.get("score", 0)
 
-                if proxy_url not in all_proxy_scores or score > all_proxy_scores[proxy_url]:
-                    all_proxy_scores[proxy_url] = score
-
-                if usage_count >= min_usage_count:
+                if usage_count >= self.premium_min_usage_count and self._is_qualified(stat):
                     if (
                         proxy_url not in battle_tested_scores
-                        or score > battle_tested_scores[proxy_url]
+                        or score > battle_tested_scores[proxy_url][0]
                     ):
-                        battle_tested_scores[proxy_url] = score
+                        battle_tested_scores[proxy_url] = (score, source)
 
         active_battle_tested = {
             url: score
             for url, score in battle_tested_scores.items()
             if url in self.active_proxies
         }
-        active_all_proxies = {
-            url: score
-            for url, score in all_proxy_scores.items()
-            if url in self.active_proxies
-        }
-
-        score_pool = active_battle_tested or active_all_proxies
+        # Premium traffic requires qualified evidence; the old fallback routed
+        # unproven proxies around the normal probation contract.
+        score_pool = active_battle_tested
         if not score_pool:
             self.premium_proxies = []
+            self.premium_sources = {}
             return
 
-        sorted_proxies = sorted(score_pool.items(), key=lambda x: x[1], reverse=True)
-        self.premium_proxies = [url for url, _ in sorted_proxies[:premium_pool_size]]
+        sorted_proxies = sorted(
+            score_pool.items(), key=lambda item: (-item[1][0], item[0])
+        )
+        chosen = sorted_proxies[: self.premium_pool_size]
+        self.premium_proxies = [url for url, _ in chosen]
+        self.premium_sources = {url: score_source[1] for url, score_source in chosen}
 
-    def _flush_feedback_buffer(self):
-        """Flushes stats for all fully completed minutes to the database."""
+    def _flush_feedback_buffer(self, include_current: bool = False) -> bool:
+        """Flush minute aggregates, acknowledging them only after commit."""
         current_minute_start = datetime.now().replace(second=0, microsecond=0)
-
-        records_to_flush = []
-        minutes_to_clear = []
-
-        with self.lock:
-            buffer_keys = list(self.feedback_buffer.keys())
-            for minute_timestamp in buffer_keys:
-                if minute_timestamp < current_minute_start:
-                    logger.debug(
-                        f"Preparing to flush stats for completed minute: {minute_timestamp.strftime('%Y-%m-%d %H:%M')}"
-                    )
-                    for source, counts in self.feedback_buffer[
-                        minute_timestamp
-                    ].items():
-                        records_to_flush.append(
-                            (
-                                minute_timestamp,
-                                source,
-                                counts.get("success", 0),
-                                counts.get("failure", 0),
-                            )
+        with self.feedback_flush_lock:
+            with self.lock:
+                if self.feedback_flush_pending is not None:
+                    flush_id, records_to_flush = self.feedback_flush_pending
+                else:
+                    records_to_flush = []
+                    for minute_timestamp, by_source in self.feedback_buffer.items():
+                        if include_current or minute_timestamp < current_minute_start:
+                            for source, counts in by_source.items():
+                                success = int(counts.get("success", 0))
+                                failure = int(counts.get("failure", 0))
+                                if success or failure:
+                                    records_to_flush.append(
+                                        (minute_timestamp, source, success, failure)
+                                    )
+                    flush_id = str(uuid.uuid4())
+                    if records_to_flush:
+                        self.feedback_flush_pending = (
+                            flush_id,
+                            list(records_to_flush),
                         )
-                    minutes_to_clear.append(minute_timestamp)
 
-            for minute in minutes_to_clear:
-                del self.feedback_buffer[minute]
+            if not records_to_flush:
+                with self.lock:
+                    self.last_flush_success_ts = time.time()
+                logger.debug("Flush task found no eligible feedback aggregates.")
+                return True
 
-        if records_to_flush:
-            self.db.flush_feedback_stats(records_to_flush)
-        else:
-            logger.debug(
-                "Flush stats task ran, but no completed minutes were found in the buffer."
-            )
+            try:
+                committed = self.db.flush_feedback_stats(records_to_flush, flush_id)
+                if committed is False:
+                    raise DatabaseWriteError(
+                        "flush_feedback_stats", RuntimeError("write returned false")
+                    )
+            except Exception:
+                logger.exception(
+                    "Feedback aggregate flush failed; snapshot remains queued."
+                )
+                return False
+
+            # Feedback can arrive while the database transaction is in flight.
+            # Subtract the committed snapshot instead of deleting the bucket so
+            # those concurrent increments remain queued exactly once.
+            with self.lock:
+                for minute_timestamp, source, success, failure in records_to_flush:
+                    counts = self.feedback_buffer[minute_timestamp][source]
+                    counts["success"] -= success
+                    counts["failure"] -= failure
+                    if not counts["success"] and not counts["failure"]:
+                        del self.feedback_buffer[minute_timestamp][source]
+                    if not self.feedback_buffer[minute_timestamp]:
+                        del self.feedback_buffer[minute_timestamp]
+                self.feedback_flush_pending = None
+                self.last_flush_success_ts = time.time()
+            return True
 
     def _migrate_legacy_stat(
         self, stat: Dict, trust_derived: bool = True
@@ -2821,14 +3452,13 @@ class ProxyManager:
         """Normalize persisted input and install scoring-version-2 state."""
         if not isinstance(stat, dict):
             raise ValueError("Proxy stat must be a mapping")
+        for unknown_key in stat.keys() - MIGRATABLE_STAT_KEYS:
+            del stat[unknown_key]
 
         success_count = nonnegative_int(stat.get("success_count", 0))
         failure_count = nonnegative_int(stat.get("failure_count", 0))
         stat["success_count"] = success_count
         stat["failure_count"] = failure_count
-        stat["consecutive_failures"] = nonnegative_int(
-            stat.get("consecutive_failures", 0)
-        )
 
         now_ts = time.time()
         raw_results = stat.get("recent_results", [])
@@ -2853,7 +3483,6 @@ class ProxyManager:
         stat["last_feedback_ts"] = last_feedback_ts
 
         total = success_count + failure_count
-        stat["completed_feedback_count"] = total
         stat["handout_count"] = nonnegative_int(stat.get("handout_count", 0))
         stat["trial_handout_count"] = nonnegative_int(
             stat.get("trial_handout_count", 0)
@@ -3043,29 +3672,23 @@ class ProxyManager:
         "quality_updated_ts",
         "success_count",
         "failure_count",
-        "consecutive_failures",
         "avg_latency_ms",
         "last_feedback_ts",
-        "completed_feedback_count",
         "trial_handout_count",
         "retry_after_ts",
     )
 
     def _snapshot_stat(self, stat: Dict) -> Dict:
         snapshot = {field: stat.get(field) for field in self.TENTATIVE_STAT_FIELDS}
-        # recent_results only ever grows at the tail here, so its length is
-        # enough to undo the appends.
-        snapshot["_recent_results_len"] = len(stat.get("recent_results") or [])
+        # A bounded full window evicts its oldest row on append, so length alone
+        # cannot restore it. Copy the small bounded list exactly.
+        snapshot["recent_results"] = copy.deepcopy(stat.get("recent_results") or [])
         return snapshot
 
     def _apply_stat_snapshot(self, stat: Dict, snapshot: Dict) -> Dict:
         for field in self.TENTATIVE_STAT_FIELDS:
             stat[field] = snapshot.get(field)
-        results = stat.get("recent_results")
-        if isinstance(results, list):
-            kept = snapshot.get("_recent_results_len", len(results))
-            if 0 <= kept < len(results):
-                del results[kept:]
+        stat["recent_results"] = copy.deepcopy(snapshot.get("recent_results", []))
         return stat
 
     def _outage_state(self, source: str) -> Dict:
@@ -3220,7 +3843,8 @@ class ProxyManager:
         status_code: int,
         response_time_ms: Optional[int] = None,
         failure_kind: Optional[str] = None,
-    ):
+        allocation_id: Optional[str] = None,
+    ) -> Dict[str, object]:
         """
         Process feedback for a proxy request with online reliability scoring.
         
@@ -3230,7 +3854,6 @@ class ProxyManager:
         - Updates the slow and fast reliability estimators
         - Maintains historical counters for analytics
         """
-        source = self._get_source_or_default(source)
         is_success = self.classify_feedback_status(status_code)
         if failure_kind and failure_kind not in VALID_FAILURE_KINDS:
             logger.warning("Ignoring unknown failure_kind '{}'", failure_kind)
@@ -3240,17 +3863,21 @@ class ProxyManager:
         current_timestamp = time.time()
 
         with self.lock:
-            # Update feedback buffer for database flush
+            accepted, reason, source = self._accept_feedback_allocation_locked(
+                source, proxy_url, allocation_id, current_timestamp
+            )
+            if not accepted:
+                self.rejected_feedback_total[reason] += 1
+                return {"accepted": False, "reason": reason}
+
+            # Aggregates and process-lifetime counters advance only after the
+            # allocation contract has accepted this feedback.
             if is_success:
                 self.feedback_buffer[current_minute][source]["success"] += 1
+                self.accepted_feedback_success_total += 1
             else:
                 self.feedback_buffer[current_minute][source]["failure"] += 1
-
-            reported_stat = self.source_stats.get(source, {}).get(proxy_url)
-            if reported_stat is not None:
-                # Feedback completes the outstanding allocation even when an
-                # outage guard pauses the reputation mutation itself.
-                self._release_lease(reported_stat)
+                self.accepted_feedback_failure_total += 1
 
             source_reputation_paused = self._observe_source_outage_locked(
                 source, proxy_url, is_success, current_timestamp
@@ -3286,6 +3913,8 @@ class ProxyManager:
                     response_time_ms,
                     current_timestamp,
                 )
+            self._sync_premium_proxies_locked()
+            return {"accepted": True, "reason": reason, "source": source}
 
     def _apply_feedback_to_stat(
         self,
@@ -3306,7 +3935,6 @@ class ProxyManager:
         # Update historical counters
         if is_success:
             stat["success_count"] += 1
-            stat["consecutive_failures"] = 0
             
             # Update exponential moving average of latency for observability.
             latency = self._coerce_latency(
@@ -3323,7 +3951,6 @@ class ProxyManager:
                     stat["avg_latency_ms"] = alpha * latency + (1 - alpha) * previous
         else:
             stat["failure_count"] += 1
-            stat["consecutive_failures"] += 1
         
         # Add to the bounded raw replay window.
         latency_for_log = self._coerce_latency(
@@ -3343,13 +3970,10 @@ class ProxyManager:
                 -self.reliability_recent_results_limit:
             ]
         stat["last_feedback_ts"] = current_timestamp
-        stat["completed_feedback_count"] = (
-            stat["success_count"] + stat["failure_count"]
-        )
         # Queue the updated counters for write-back, so this proxy's record
         # outlives its entry in the in-memory pool.
         if self.durable_reputation_enabled:
-            self.pending_feedback_persist.add(proxy_url)
+            self.pending_feedback_persist.add((source, proxy_url))
 
         old_score = stat["score"]
         self._update_reliability_state(stat, is_success, current_timestamp)
@@ -3363,7 +3987,10 @@ class ProxyManager:
             stat["trial_handout_count"] = 0
             stat["retry_after_ts"] = 0.0
         elif stat["trial_handout_count"] >= self.probation_attempts:
+            self._remove_from_exploit(source, proxy_url)
             stat["retry_after_ts"] = current_timestamp + self.retry_delay_s
+        else:
+            self._remove_from_exploit(source, proxy_url)
         self._return_trial_candidate(source, proxy_url, stat)
         
         response_time_str = f"{latency_for_log:.0f}" if latency_for_log is not None else "N/A"
