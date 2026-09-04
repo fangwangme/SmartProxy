@@ -90,9 +90,11 @@ class DatabaseManager:
             if conn:
                 self.pool.putconn(conn)
 
-    def _run_transaction(self, operation, callback):
+    def _run_transaction(self, operation, callback, max_attempts=None):
         """Run one mutation with bounded retry for transaction-level conflicts."""
         attempts = max(1, getattr(self, "write_max_retries", 3) + 1)
+        if max_attempts is not None:
+            attempts = min(attempts, max(1, int(max_attempts)))
         base_ms = max(0, getattr(self, "write_retry_base_ms", 25))
         for attempt in range(attempts):
             conn = None
@@ -385,7 +387,7 @@ class DatabaseManager:
         self,
         stats_buffer: List[Tuple],
         flush_id: Optional[str] = None,
-        statement_timeout_ms: Optional[int] = None,
+        deadline: Optional[float] = None,
     ) -> bool:
         if not stats_buffer:
             return True
@@ -401,11 +403,20 @@ class DatabaseManager:
 
         def write(conn):
             with conn.cursor() as cur:
-                if statement_timeout_ms is not None:
+                def set_remaining_statement_timeout():
+                    if deadline is None:
+                        return
+                    remaining_ms = int((deadline - time.monotonic()) * 1000)
+                    if remaining_ms <= 0:
+                        raise TimeoutError(
+                            "feedback flush shutdown deadline exhausted"
+                        )
                     cur.execute(
                         "SET LOCAL statement_timeout = %s;",
-                        (max(1, int(statement_timeout_ms)),),
+                        (remaining_ms,),
                     )
+
+                set_remaining_statement_timeout()
                 cur.execute(
                     """
                     INSERT INTO feedback_flush_commits (flush_id)
@@ -417,7 +428,20 @@ class DatabaseManager:
                 )
                 if cur.fetchone() is None:
                     return
-                psycopg2.extras.execute_values(cur, query, ordered)
+                # execute_values may otherwise emit several SQL statements
+                # under one stale timeout. Bound each explicit page by the
+                # remaining shutdown budget instead.
+                page_size = 100
+                for offset in range(0, len(ordered), page_size):
+                    set_remaining_statement_timeout()
+                    page = ordered[offset : offset + page_size]
+                    psycopg2.extras.execute_values(
+                        cur,
+                        query,
+                        page,
+                        page_size=len(page),
+                    )
+                set_remaining_statement_timeout()
                 cur.execute(
                     "DELETE FROM feedback_flush_commits "
                     "WHERE committed_at < NOW() - INTERVAL '7 days';"
@@ -429,7 +453,11 @@ class DatabaseManager:
                 f"Flushed stats for {len(ordered)} source-minute combination(s). Minutes: {flushed_minutes}"
             )
 
-        return self._run_transaction("flush_feedback_stats", write)
+        return self._run_transaction(
+            "flush_feedback_stats",
+            write,
+            max_attempts=1 if deadline is not None else None,
+        )
 
     def get_daily_stats(self, source: str, date: str):
         # Range predicate rather than DATE(minute) = %s: the function call is

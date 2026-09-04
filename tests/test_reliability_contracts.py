@@ -659,7 +659,7 @@ class TestPersistenceAndTransactions(ProxyManagerTestBase):
         connection = MagicMock()
         connection.cursor.return_value.__enter__.return_value = cursor
 
-        def retry_once(_operation, callback):
+        def retry_once(_operation, callback, **_kwargs):
             callback(connection)
             callback(connection)
             return True
@@ -743,22 +743,54 @@ class TestPersistenceAndTransactions(ProxyManagerTestBase):
         self.assertFalse(flushed)
         self.assertLess(time.monotonic() - started, 0.5)
 
-    def test_shutdown_flush_bounds_the_database_statement(self):
+    def test_shutdown_flush_passes_the_absolute_database_deadline(self):
         minute = datetime.now().replace(second=0, microsecond=0)
         self.manager.feedback_buffer[minute]["source1"]["success"] = 1
+        deadline = time.monotonic() + 1.0
 
         self.assertTrue(
             self.manager._flush_feedback_buffer(
                 include_current=True,
-                deadline=time.monotonic() + 1.0,
+                deadline=deadline,
             )
         )
 
-        timeout_ms = self.mock_db_instance.flush_feedback_stats.call_args.kwargs[
-            "statement_timeout_ms"
+        self.assertEqual(
+            self.mock_db_instance.flush_feedback_stats.call_args.kwargs["deadline"],
+            deadline,
+        )
+
+    def test_shutdown_flush_recomputes_sql_budget_and_disables_retries(self):
+        db = object.__new__(DatabaseManager)
+        cursor = MagicMock()
+        cursor.fetchone.return_value = ("committed",)
+        connection = MagicMock()
+        connection.cursor.return_value.__enter__.return_value = cursor
+
+        def run_once(_operation, callback, max_attempts=None):
+            self.assertEqual(max_attempts, 1)
+            callback(connection)
+            return True
+
+        db._run_transaction = MagicMock(side_effect=run_once)
+        minute = datetime(2026, 1, 1, 0, 0)
+        records = [(minute, f"source-{index}", 1, 0) for index in range(101)]
+        with (
+            patch("src.database.db.time.monotonic", side_effect=[1.0, 2.0, 3.0, 4.0]),
+            patch("src.database.db.psycopg2.extras.execute_values") as execute_values,
+        ):
+            self.assertTrue(db.flush_feedback_stats(records, deadline=10.0))
+
+        timeout_calls = [
+            invocation
+            for invocation in cursor.execute.call_args_list
+            if invocation.args[0] == "SET LOCAL statement_timeout = %s;"
         ]
-        self.assertGreater(timeout_ms, 0)
-        self.assertLessEqual(timeout_ms, 1000)
+        self.assertEqual(
+            [invocation.args[1][0] for invocation in timeout_calls],
+            [9000, 8000, 7000, 6000],
+        )
+        self.assertEqual(execute_values.call_count, 2)
 
     def test_overlapping_writers_use_deterministic_order(self):
         db = object.__new__(DatabaseManager)
@@ -1199,6 +1231,22 @@ class TestApiAndLifecycleContracts(ProxyManagerTestBase):
             )
 
         self.assertEqual(events, ["insert", "validate"])
+
+    def test_cold_start_insert_failure_still_validates_existing_rows(self):
+        future = Future()
+        future.set_result([("http", "192.0.2.60", 80)])
+        self.mock_db_instance.insert_proxies.side_effect = DatabaseWriteError(
+            "insert_proxies",
+            RuntimeError("injected"),
+        )
+
+        with patch.object(self.manager, "_run_validation_cycle") as validate:
+            self.manager._handle_fetch_results(
+                [future],
+                validate_after_insert=True,
+            )
+
+        validate.assert_called_once_with()
 
     def test_production_entry_uses_single_process_waitress(self):
         import src.main as main_module

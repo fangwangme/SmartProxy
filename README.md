@@ -165,7 +165,7 @@ The service is configured via the config.ini file.
 * **\[database\]**: Credentials for your PostgreSQL database.  
 * **\[server\]**: port for the API and dashboard.  
   * production\_threads / background\_workers: Thread counts for the single-process WSGI server and tracked background work.
-  * shutdown\_deadline\_seconds: Deadline for stopping scheduling, draining or cancelling tracked work, flushing current feedback, and writing the final backup.
+  * shutdown\_deadline\_seconds: Deadline for stopping scheduling, draining or cancelling tracked work, flushing current feedback, and writing the final backup. Size it above normal drain/flush time plus the observed `smartproxy_backup_duration_seconds`; the launcher enforces the outer cutoff and backup replacement is atomic.
   * readiness\_*: Maximum dependency ages and minimum usable-pool threshold for `/ready`.
   * allowed\_ips: Comma-separated remote IP allowlist for external APIs and dashboard pages.
   * trust\_proxy\_headers / trusted\_proxy\_ips: Only trust X-Forwarded-For when the direct peer is explicitly trusted.

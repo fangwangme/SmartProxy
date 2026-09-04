@@ -1261,7 +1261,19 @@ class ProxyManager:
         logger.info(
             f"Consolidated {len(unique_proxies_list)} unique proxies from all sources for insertion."
         )
-        self.db.insert_proxies(unique_proxies_list)
+        try:
+            self.db.insert_proxies(unique_proxies_list)
+        except DatabaseWriteError:
+            # The scheduler has already advanced this cycle's validation
+            # timestamp. Validate rows that were committed by earlier cycles
+            # instead of making a transient insert failure delay recovery for
+            # a full validation interval.
+            logger.exception(
+                "Fetched proxies were not inserted; validating existing rows."
+            )
+            if validate_after_insert:
+                self._run_validation_cycle()
+            return
         if validate_after_insert:
             self._run_validation_cycle()
 
@@ -3309,7 +3321,6 @@ class ProxyManager:
                 return True
 
             try:
-                transaction_timeout_ms = None
                 if deadline is not None:
                     remaining_s = deadline - time.monotonic()
                     if remaining_s <= 0:
@@ -3317,8 +3328,7 @@ class ProxyManager:
                             "Feedback flush deferred: shutdown deadline exhausted."
                         )
                         return False
-                    transaction_timeout_ms = max(1, int(remaining_s * 1000))
-                if transaction_timeout_ms is None:
+                if deadline is None:
                     committed = self.db.flush_feedback_stats(
                         records_to_flush,
                         flush_id,
@@ -3327,7 +3337,7 @@ class ProxyManager:
                     committed = self.db.flush_feedback_stats(
                         records_to_flush,
                         flush_id,
-                        statement_timeout_ms=transaction_timeout_ms,
+                        deadline=deadline,
                     )
                 if committed is not True:
                     raise DatabaseWriteError(
