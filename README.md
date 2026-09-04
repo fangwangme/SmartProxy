@@ -169,13 +169,13 @@ The service is configured via the config.ini file.
   * readiness\_*: Maximum dependency ages and minimum usable-pool threshold for `/ready`.
   * allowed\_ips: Comma-separated remote IP allowlist for external APIs and dashboard pages.
   * trust\_proxy\_headers / trusted\_proxy\_ips: Only trust X-Forwarded-For when the direct peer is explicitly trusted.
-  * localhost (127.0.0.1 / ::1) is always allowed automatically.
+  * localhost (including IPv4-mapped loopback) is always allowed automatically.
   * internal endpoints `/health`, `/live`, `/ready`, `/metrics`, `/reload-sources`, `/backup-stats` are localhost-only.
 * **\[logging\]**:
   * log\_dir: Log directory. Relative paths are resolved from the project root. Defaults to `./.local/logs`.
 * **\[validator\]**:  
   * validation\_target / validation\_targets: URL(s) used to test proxy connectivity and anonymity. Every target must return JSON with a `headers` mapping. Production deployments should configure multiple independently operated targets; do not copy the same endpoint under several URLs merely to meet the count.
-  * validation\_success\_threshold / validation\_target\_min\_samples: Proxy pass threshold and target-health evidence threshold. If target quorum is unavailable, existing active proxies keep their last-known-good liveness and new proxies remain pending. A sole-target outage therefore fails safe instead of mass-deactivating the pool.
+  * validation\_success\_threshold / validation\_target\_min\_samples: Proxy pass threshold and target-health evidence threshold. If target quorum is unavailable, existing active proxies keep their last-known-good liveness. Never-validated candidates are recorded as failed so an oldest bad batch cannot starve newer discoveries; the ordinary failed-proxy retry window reconsiders them after recovery.
   * validation\_workers: Number of concurrent threads for validation.  
   * validation\_batch\_limit: Maximum proxies pulled into one validation cycle.  
   * validation\_new\_proxy\_ratio: Share of that budget reserved for never-validated proxies; the rest re-checks proxies that are currently alive. Unused budget is donated to the other side. Defaults to `0.5`.
@@ -194,7 +194,7 @@ The service is configured via the config.ini file.
 * **\[source\_pool\]**: Parameters for the scoring and selection algorithm.
   * selection\_strategy: `uniform`, `tiered`, `weighted`, or `softmax`. Note that `uniform` draws every proxy in the pool with equal probability, so the score only decides pool membership and the ranking is otherwise discarded; `softmax` is recommended.
   * softmax\_temperature: Controls temperature scaling for softmax selection (default `14.0`).
-  * proxy\_cooldown\_ms / proxy\_inflight\_timeout\_seconds: Optional cooldown plus the mandatory outstanding-request lease.
+  * proxy\_cooldown\_ms / proxy\_inflight\_timeout\_seconds: Optional cooldown plus the mandatory outstanding-request lease. The lease timeout is restart-only so allocation insertion order remains expiry order.
   * allow\_legacy\_feedback: Migration gate for clients that omit `allocation_id`. The default compatibility mode accepts them with a deprecation metric and warning, but cannot provide exact idempotency. Set it to `false` only after every client returns allocation IDs.
   * completed\_allocation\_*: Bounded retention for completed allocation IDs, used to reject duplicates and late feedback.
   * reliability\_prior / reliability\_slow\_alpha / reliability\_fast\_alpha: Fixed prior and two online update speeds (defaults `0.05`, `0.12`, `0.30`).

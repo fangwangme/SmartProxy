@@ -108,12 +108,8 @@ class ProxyManagerTestBase(unittest.TestCase):
         self.MockDatabaseManager = patcher_db.start()
 
         self.manager = ProxyManager(self.config_path)
-        # Rebuild the serving plan on every draw. Production refreshes it on a
-        # timer and tolerates the staleness; tests mutate proxy state directly
-        # and then assert on the very next call, so they need the control plane
-        # to be current. Plan staleness itself is covered explicitly below.
-        self.manager.serving_plan_max_age_s = 0.0
         self.mock_db_instance = self.MockDatabaseManager.return_value
+        self.mock_db_instance.flush_feedback_stats.return_value = True
         # Default to "no persisted history"; tests about reputation
         # persistence override this with real rows.
 
@@ -511,8 +507,7 @@ class TestProxyManager(ProxyManagerTestBase):
         
         self.manager._run_validation_cycle()
         
-        # Should not have updated counters
-        self.mock_db_instance.update_validation_counters.assert_not_called()
+        self.mock_db_instance.batch_update_proxy_results.assert_not_called()
 
     def test_validation_cycle_supplements_when_below_threshold(self):
         """Test validation cycle supplements with failed proxies when below threshold."""
@@ -526,7 +521,11 @@ class TestProxyManager(ProxyManagerTestBase):
         ]
         
         async def mock_validate_batch(proxies):
-            return [], [p["id"] for p in proxies]
+            return (
+                [],
+                [p["id"] for p in proxies],
+                {"quorum_healthy": True, "healthy_targets": [True]},
+            )
         
         with patch.object(self.manager, "_validate_proxies_batch_async", side_effect=mock_validate_batch):
             self.manager._run_validation_cycle()
@@ -1019,7 +1018,7 @@ class TestIssue13PoolQuality(ProxyManagerTestBase):
 
         self.manager._run_validation_cycle()
 
-        self.mock_db_instance.update_validation_counters.assert_not_called()
+        self.mock_db_instance.batch_update_proxy_results.assert_not_called()
         self.assertEqual(self.mock_db_instance.get_active_proxies.call_count, 1)
 
     # ---------- Finding 14: new proxies starved the re-validation queue ----------
@@ -1079,7 +1078,11 @@ class TestIssue13PoolQuality(ProxyManagerTestBase):
         self.mock_db_instance.get_eligible_failed_proxies.return_value = []
 
         async def mock_validate_batch(proxies):
-            return [], [p["id"] for p in proxies]
+            return (
+                [],
+                [p["id"] for p in proxies],
+                {"quorum_healthy": True, "healthy_targets": [True]},
+            )
 
         with patch.object(
             self.manager, "_validate_proxies_batch_async", side_effect=mock_validate_batch
@@ -1206,7 +1209,8 @@ class TestIssue13PoolQuality(ProxyManagerTestBase):
         incumbent = "http://incumbent:80"
         self.manager.active_proxies = {incumbent}
         self.manager.source_stats["source1"] = {
-            dead_untried: self.manager._get_new_proxy_stat()
+            dead_untried: self.manager._get_new_proxy_stat(),
+            incumbent: self.manager._get_new_proxy_stat(),
         }
         self.manager.available_proxies["source1"] = {
             "top_tier": [incumbent],
@@ -3064,6 +3068,7 @@ class TestIssue23AdaptiveExplorationAndProbation(ProxyManagerTestBase):
         for _ in range(2):
             stat = self.manager.source_stats["source1"][proxy]
             stat["retry_after_ts"] = time.time() - 1
+            self.manager._build_serving_plan("source1")
             self.assertEqual(self.manager.get_proxy("source1"), proxy)
             self.manager.process_feedback("source1", proxy, 500)
 
@@ -3089,6 +3094,7 @@ class TestIssue23AdaptiveExplorationAndProbation(ProxyManagerTestBase):
         self.assertEqual(self.manager.get_proxy("source1"), proxy)
         self.assertIsNone(self.manager.get_proxy("source1"))
         self.manager.source_stats["source1"][proxy]["inflight"] = [time.time() - 1]
+        self.manager._build_serving_plan("source1")
         self.assertEqual(self.manager.get_proxy("source1"), proxy)
 
     def test_time_forgiveness_opens_a_new_trial_epoch_without_erasing_history(self):
@@ -3399,6 +3405,7 @@ class TestIssue23ReviewFixes(ProxyManagerTestBase):
         ):
             self.assertIsNone(self.manager.get_proxy("source1"))
             stat["retry_after_ts"] = time.time() - 1
+            self.manager._build_serving_plan("source1")
             self.assertEqual(self.manager.get_proxy("source1"), proxy)
             self.manager.process_feedback("source1", proxy, 500)
             self.assertEqual(stat["trial_handout_count"], expected)
@@ -3453,7 +3460,10 @@ class TestIssue23ReviewFixes(ProxyManagerTestBase):
 
         # No feedback comes back, so every handout holds its in-flight lease.
         self.manager.proxy_max_inflight = 2
-        served = [self.manager.get_proxy("source1") for _ in range(240)]
+        served = []
+        for _ in range(240):
+            self.manager._build_serving_plan("source1")
+            served.append(self.manager.get_proxy("source1"))
 
         self.assertNotIn(None, served)
         self.assertEqual(len(set(served)), 120)
@@ -3698,7 +3708,6 @@ class TestIssue23ReviewFixes(ProxyManagerTestBase):
             name="reload-drop.ini",
         )
         manager = ProxyManager(path)
-        manager.serving_plan_max_age_s = 0.0
         proxy = "http://shared:80"
         for source in ("source1", "source2"):
             manager.active_proxies.add(proxy)
@@ -3710,6 +3719,17 @@ class TestIssue23ReviewFixes(ProxyManagerTestBase):
             self.assertEqual(manager.get_proxy(source), proxy)
         self.assertIn("source2", manager.serving_plans)
         self.assertIn("source2", manager.proxy_last_handed_out_ts)
+        completed = next(
+            allocation_id
+            for allocation_id, record in manager.allocations.items()
+            if record["source"] == "source2"
+        )
+        manager.process_feedback(
+            "source2", proxy, 200, allocation_id=completed
+        )
+        manager.proxy_cooldown_ms = 0
+        manager._build_serving_plan("source2")
+        live = manager.allocate_proxy("source2")["allocation_id"]
 
         import configparser as _cp
         config = _cp.ConfigParser()
@@ -3724,6 +3744,9 @@ class TestIssue23ReviewFixes(ProxyManagerTestBase):
         self.assertNotIn("source2", manager.source_stats)
         self.assertNotIn("source2", manager.serving_plans)
         self.assertNotIn("source2", manager.proxy_last_handed_out_ts)
+        self.assertNotIn(live, manager.allocations)
+        self.assertNotIn(completed, manager.completed_allocations)
+        self.assertNotIn(("source2", proxy), manager.allocations_by_proxy)
 
     def test_reload_rebuilds_plans_so_new_tunables_take_effect(self):
         self.manager.serving_plan_max_age_s = 600.0

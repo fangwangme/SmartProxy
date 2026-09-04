@@ -76,6 +76,11 @@ class DatabaseManager:
                 return None
             raise DatabaseWriteError(operation, e) from e
         except Exception as e:
+            logger.error(
+                "Database operation '{}' failed with {}.",
+                operation,
+                type(e).__name__,
+            )
             if conn:
                 conn.rollback()
             if fetch:
@@ -91,6 +96,7 @@ class DatabaseManager:
         base_ms = max(0, getattr(self, "write_retry_base_ms", 25))
         for attempt in range(attempts):
             conn = None
+            retry_delay = None
             try:
                 conn = self.pool.getconn()
                 callback(conn)
@@ -108,8 +114,10 @@ class DatabaseManager:
                         getattr(error, "pgcode", None),
                     )
                     raise DatabaseWriteError(operation, error) from error
-                delay = base_ms * (2**attempt) / 1000.0
-                delay += random.uniform(0.0, delay * 0.25 if delay else 0.0)
+                retry_delay = base_ms * (2**attempt) / 1000.0
+                retry_delay += random.uniform(
+                    0.0, retry_delay * 0.25 if retry_delay else 0.0
+                )
                 logger.warning(
                     "Retrying database mutation '{}' after sqlstate={} (attempt {}/{}).",
                     operation,
@@ -117,7 +125,6 @@ class DatabaseManager:
                     attempt + 1,
                     attempts,
                 )
-                time.sleep(delay)
             except Exception as error:
                 if conn:
                     conn.rollback()
@@ -125,6 +132,8 @@ class DatabaseManager:
             finally:
                 if conn:
                     self.pool.putconn(conn)
+            if retry_delay is not None:
+                time.sleep(retry_delay)
 
     def ping(self) -> bool:
         """Return whether a lightweight database readiness query succeeds."""
@@ -225,49 +234,14 @@ class DatabaseManager:
         }
         return self._execute(query, params, fetch="all") or []
 
-    def update_validation_counters(self, proxy_ids: List[int], window_minutes: int):
-        """
-        Updates the validation counters for a batch of proxies before they are validated.
-        Resets the counter and window if the window has expired.
-        """
-        if not proxy_ids:
-            return True
-
-        query = """
-            UPDATE proxies
-            SET
-                validation_attempts_in_window = CASE
-                    WHEN window_start_time IS NULL OR NOW() > window_start_time + INTERVAL '%(window)s minutes'
-                    THEN 1
-                    ELSE validation_attempts_in_window + 1
-                END,
-                window_start_time = CASE
-                    WHEN window_start_time IS NULL OR NOW() > window_start_time + INTERVAL '%(window)s minutes'
-                    THEN NOW()
-                    ELSE window_start_time
-                END
-            WHERE id = ANY(%(ids)s);
-        """
-        params = {"window": window_minutes, "ids": sorted(set(proxy_ids))}
-
-        def write(conn):
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT id FROM proxies WHERE id = ANY(%s) "
-                    "ORDER BY id FOR UPDATE;",
-                    (params["ids"],),
-                )
-                cur.execute(query, params)
-
-        self._run_transaction("update_validation_counters", write)
-        logger.debug(f"Updated validation counters for {len(proxy_ids)} proxies.")
-        return True
-
     def batch_update_proxy_results(
-        self, success_proxies: List[Dict], failure_proxy_ids: List[int]
+        self,
+        success_proxies: List[Dict],
+        failure_proxy_ids: List[int],
+        validation_window_minutes: int,
     ):
         """
-        OPTIMIZATION: Batch update results of a validation cycle.
+        Commit validation accounting and results in one transaction.
         """
         success_proxies = sorted(success_proxies, key=lambda row: int(row["id"]))
         failure_proxy_ids = sorted(set(int(proxy_id) for proxy_id in failure_proxy_ids))
@@ -282,6 +256,31 @@ class DatabaseManager:
                         "SELECT id FROM proxies WHERE id = ANY(%s) "
                         "ORDER BY id FOR UPDATE;",
                         (proxy_ids,),
+                    )
+                    cur.execute(
+                        """
+                        UPDATE proxies
+                        SET
+                            validation_attempts_in_window = CASE
+                                WHEN window_start_time IS NULL
+                                  OR NOW() > window_start_time
+                                    + INTERVAL '%(window)s minutes'
+                                THEN 1
+                                ELSE validation_attempts_in_window + 1
+                            END,
+                            window_start_time = CASE
+                                WHEN window_start_time IS NULL
+                                  OR NOW() > window_start_time
+                                    + INTERVAL '%(window)s minutes'
+                                THEN NOW()
+                                ELSE window_start_time
+                            END
+                        WHERE id = ANY(%(ids)s);
+                        """,
+                        {
+                            "window": validation_window_minutes,
+                            "ids": proxy_ids,
+                        },
                     )
                 # Batch update successful proxies
                 if success_proxies:
@@ -383,7 +382,10 @@ class DatabaseManager:
         )
 
     def flush_feedback_stats(
-        self, stats_buffer: List[Tuple], flush_id: Optional[str] = None
+        self,
+        stats_buffer: List[Tuple],
+        flush_id: Optional[str] = None,
+        statement_timeout_ms: Optional[int] = None,
     ) -> bool:
         if not stats_buffer:
             return True
@@ -399,6 +401,11 @@ class DatabaseManager:
 
         def write(conn):
             with conn.cursor() as cur:
+                if statement_timeout_ms is not None:
+                    cur.execute(
+                        "SET LOCAL statement_timeout = %s;",
+                        (max(1, int(statement_timeout_ms)),),
+                    )
                 cur.execute(
                     """
                     INSERT INTO feedback_flush_commits (flush_id)

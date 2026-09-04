@@ -7,6 +7,7 @@ import threading
 import time
 import unittest
 import socket
+from concurrent.futures import Future
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, call, patch
@@ -70,7 +71,7 @@ class ValidationOutageContractTests(ProxyManagerTestBase):
             1,
         )
 
-        self.assertEqual((successes, failures), ([], []))
+        self.assertEqual((successes, failures), ([], [1]))
         self.assertFalse(metadata["quorum_healthy"])
         self.assertEqual(metadata["healthy_targets"], [False])
 
@@ -121,12 +122,24 @@ class ValidationOutageContractTests(ProxyManagerTestBase):
         self.assertEqual(metadata["healthy_targets"], [True, True])
         self.assertEqual(([row["id"] for row in successes], failures), ([1], []))
 
-    def test_cycle_preserves_revalidation_and_pending_new_proxy_then_recovers(self):
+    def test_cycle_preserves_revalidation_and_advances_new_candidate(self):
         old_proxy = "http://192.0.2.10:80"
         self.manager.active_proxies = {old_proxy}
         batch = [
-            {"id": 1, "protocol": "http", "ip": "192.0.2.11", "port": 80},
-            {"id": 2, "protocol": "http", "ip": "192.0.2.10", "port": 80},
+            {
+                "id": 1,
+                "protocol": "http",
+                "ip": "192.0.2.11",
+                "port": 80,
+                "_validation_origin": "new",
+            },
+            {
+                "id": 2,
+                "protocol": "http",
+                "ip": "192.0.2.10",
+                "port": 80,
+                "_validation_origin": "active",
+            },
         ]
         self.manager.validation_supplement_threshold = 0
 
@@ -147,11 +160,14 @@ class ValidationOutageContractTests(ProxyManagerTestBase):
         ):
             self.manager._run_validation_cycle()
 
-        self.mock_db_instance.batch_update_proxy_results.assert_not_called()
+        self.mock_db_instance.batch_update_proxy_results.assert_called_once_with(
+            [], [1], self.manager.validation_window_minutes
+        )
         sync.assert_not_called()
         self.assertEqual(self.manager.active_proxies, {old_proxy})
         self.assertIsNone(self.manager.last_validation_success_ts)
 
+        self.mock_db_instance.batch_update_proxy_results.reset_mock()
         recovered = [
             {"id": 1, "latency": 11, "anonymity": "elite"},
             {"id": 2, "latency": 12, "anonymity": "elite"},
@@ -174,7 +190,7 @@ class ValidationOutageContractTests(ProxyManagerTestBase):
             self.manager._run_validation_cycle()
 
         self.mock_db_instance.batch_update_proxy_results.assert_called_once_with(
-            recovered, []
+            recovered, [], self.manager.validation_window_minutes
         )
         sync.assert_called_once()
         self.assertIsNotNone(self.manager.last_validation_success_ts)
@@ -331,9 +347,9 @@ class TestAllocationIdentityAndPlans(ProxyManagerTestBase):
     def test_expired_allocation_is_rejected_without_mutation(self):
         proxy, stat = self._install_qualified()
         allocation = self.manager.allocate_proxy("source1")
-        self.manager.allocations[allocation["allocation_id"]]["expires_at"] = (
-            time.time() - 1
-        )
+        expired_at = time.time() - 1
+        self.manager.allocations[allocation["allocation_id"]]["expires_at"] = expired_at
+        stat["inflight"] = [expired_at]
         before = (stat["score"], stat["success_count"], self._aggregate_total())
 
         result = self.manager.process_feedback(
@@ -342,6 +358,7 @@ class TestAllocationIdentityAndPlans(ProxyManagerTestBase):
 
         self.assertEqual(result, {"accepted": False, "reason": "expired"})
         self.assertEqual(len(stat["inflight"]), 0)
+        self.assertNotIn(("source1", proxy), self.manager.allocations_by_proxy)
         self.assertEqual(
             before, (stat["score"], stat["success_count"], self._aggregate_total())
         )
@@ -361,6 +378,67 @@ class TestAllocationIdentityAndPlans(ProxyManagerTestBase):
         self.assertNotIn(
             allocation["allocation_id"], self.manager.completed_allocations
         )
+
+    def test_pruned_expired_lease_does_not_release_a_live_request(self):
+        now = time.time()
+        expired_at = now - 1
+        live_until = now + 60
+        stat = {"inflight": [expired_at, live_until]}
+
+        self.manager._lease_count(stat, now)
+        self.manager._release_lease_expiry(stat, expired_at)
+
+        self.assertEqual(stat["inflight"], [live_until])
+
+    def test_allocation_cleanup_stops_at_the_first_live_record(self):
+        class PrefixOnlyAllocations(dict):
+            def items(inner_self):
+                iterator = iter(super(PrefixOnlyAllocations, inner_self).items())
+                yield next(iterator)
+                raise AssertionError("cleanup scanned beyond the expiry prefix")
+
+        now = time.time()
+        self.manager.allocations = PrefixOnlyAllocations(
+            {
+                "live-first": {
+                    "source": "source1",
+                    "proxy": "http://192.0.2.40:80",
+                    "expires_at": now + 60,
+                    "premium": False,
+                },
+                "live-second": {
+                    "source": "source1",
+                    "proxy": "http://192.0.2.41:80",
+                    "expires_at": now + 60,
+                    "premium": False,
+                },
+            }
+        )
+
+        self.manager._cleanup_allocations_locked(now)
+
+        self.assertEqual(len(self.manager.allocations), 2)
+
+    def test_legacy_feedback_uses_and_cleans_the_reverse_index(self):
+        proxy, stat = self._install_qualified()
+        first = self.manager.allocate_proxy("source1")
+        second = self.manager.allocate_proxy("source1")
+        key = ("source1", proxy)
+        self.assertEqual(
+            list(self.manager.allocations_by_proxy[key]),
+            [first["allocation_id"], second["allocation_id"]],
+        )
+
+        accepted = self.manager.process_feedback("source1", proxy, 200)
+
+        self.assertTrue(accepted["accepted"])
+        self.assertEqual(len(self.manager.allocations_by_proxy[key]), 1)
+        remaining_id = next(iter(self.manager.allocations_by_proxy[key]))
+        self.manager.process_feedback(
+            "source1", proxy, 200, allocation_id=remaining_id
+        )
+        self.assertNotIn(key, self.manager.allocations_by_proxy)
+        self.assertEqual(stat["inflight"], [])
 
     def test_compatibility_and_strict_modes_are_explicit(self):
         proxy, stat = self._install_qualified()
@@ -446,10 +524,12 @@ class TestAllocationIdentityAndPlans(ProxyManagerTestBase):
         allocation = self.manager.allocate_premium_proxy()
         self.assertEqual(allocation["source"], "source1")
         self.assertTrue(self.manager.allocations[allocation["allocation_id"]]["premium"])
-        self.manager.process_feedback(
-            "source1", proxy, 500, allocation_id=allocation["allocation_id"]
-        )
+        with patch.object(self.manager, "_sync_premium_proxies_locked") as sync:
+            self.manager.process_feedback(
+                "source1", proxy, 500, allocation_id=allocation["allocation_id"]
+            )
 
+        sync.assert_not_called()
         self.assertFalse(self.manager._is_qualified(stat))
         self.assertNotIn(proxy, self.manager.premium_proxies)
         self.assertIsNone(self.manager.allocate_premium_proxy())
@@ -605,14 +685,21 @@ class TestPersistenceAndTransactions(ProxyManagerTestBase):
         events = []
         original_flush = self.manager._flush_stats
 
-        def record_flush(include_current=False):
+        def record_flush(include_current=False, deadline=None):
             events.append(("flush", include_current, self.manager.accepting_background_tasks))
+            return True
 
         self.manager.fetch_executor = MagicMock()
         self.manager.background_executor = MagicMock()
         with (
             patch.object(self.manager, "_flush_stats", side_effect=record_flush),
-            patch.object(self.manager, "backup_stats", side_effect=lambda: events.append(("backup",))),
+            patch.object(
+                self.manager,
+                "backup_stats",
+                side_effect=lambda deadline=None: (
+                    events.append(("backup",)) or {"status": "success"}
+                ),
+            ),
         ):
             self.manager.stop_scheduler()
 
@@ -639,8 +726,39 @@ class TestPersistenceAndTransactions(ProxyManagerTestBase):
 
         timeout = wait_for_work.call_args.kwargs["timeout"]
         self.assertGreaterEqual(timeout, 0.0)
-        self.assertLessEqual(timeout, 2.0)
+        self.assertLessEqual(timeout, 1.0)
         unfinished.cancel.assert_called_once()
+
+    def test_shutdown_flush_does_not_wait_past_its_deadline_for_the_lock(self):
+        self.manager.feedback_flush_lock.acquire()
+        try:
+            started = time.monotonic()
+            flushed = self.manager._flush_feedback_buffer(
+                include_current=True,
+                deadline=started + 0.01,
+            )
+        finally:
+            self.manager.feedback_flush_lock.release()
+
+        self.assertFalse(flushed)
+        self.assertLess(time.monotonic() - started, 0.5)
+
+    def test_shutdown_flush_bounds_the_database_statement(self):
+        minute = datetime.now().replace(second=0, microsecond=0)
+        self.manager.feedback_buffer[minute]["source1"]["success"] = 1
+
+        self.assertTrue(
+            self.manager._flush_feedback_buffer(
+                include_current=True,
+                deadline=time.monotonic() + 1.0,
+            )
+        )
+
+        timeout_ms = self.mock_db_instance.flush_feedback_stats.call_args.kwargs[
+            "statement_timeout_ms"
+        ]
+        self.assertGreater(timeout_ms, 0)
+        self.assertLessEqual(timeout_ms, 1000)
 
     def test_overlapping_writers_use_deterministic_order(self):
         db = object.__new__(DatabaseManager)
@@ -652,16 +770,18 @@ class TestPersistenceAndTransactions(ProxyManagerTestBase):
         db.write_max_retries = 0
         db.write_retry_base_ms = 0
 
-        db.update_validation_counters([3, 1, 3, 2], 30)
-        self.assertEqual(cursor.execute.call_args.args[1]["ids"], [1, 2, 3])
-
-        cursor.reset_mock()
         successes = [
             {"id": 3, "latency": 30, "anonymity": "elite"},
             {"id": 1, "latency": 10, "anonymity": "elite"},
         ]
         with patch("src.database.db.psycopg2.extras.execute_values") as execute_values:
-            db.batch_update_proxy_results(successes, [5, 2, 5])
+            db.batch_update_proxy_results(successes, [5, 2, 5], 30)
+        counter_call = next(
+            invocation
+            for invocation in cursor.execute.call_args_list
+            if "validation_attempts_in_window" in invocation.args[0]
+        )
+        self.assertEqual(counter_call.args[1]["ids"], [1, 2, 3, 5])
         self.assertEqual([row[0] for row in execute_values.call_args.args[2]], [1, 3])
         failure_call = next(
             invocation
@@ -689,7 +809,13 @@ class TestPersistenceAndTransactions(ProxyManagerTestBase):
             if attempts < 3:
                 raise Deadlock("injected")
 
-        with patch("src.database.db.time.sleep") as sleep:
+        def assert_connection_was_returned(_delay):
+            self.assertEqual(db.pool.putconn.call_count, attempts)
+
+        with patch(
+            "src.database.db.time.sleep",
+            side_effect=assert_connection_was_returned,
+        ) as sleep:
             self.assertTrue(db._run_transaction("ordered-write", succeeds_on_third))
         self.assertEqual(attempts, 3)
         self.assertEqual(db.pool.getconn.return_value.rollback.call_count, 2)
@@ -823,11 +949,12 @@ class TestConfigurationBoundaries(ProxyManagerTestBase):
         self.assertEqual(self.manager.validation_workers, old_workers)
         self.assertEqual(self.manager.predefined_sources, old_sources)
 
-    def test_restart_only_server_values_are_reported_but_not_applied_on_reload(self):
+    def test_restart_only_values_are_reported_but_not_applied_on_reload(self):
         old_values = (
             self.manager.server_port,
             self.manager.production_threads,
             self.manager.background_workers,
+            self.manager.proxy_inflight_timeout_s,
         )
         changed = {
             section: dict(values) for section, values in self.config_dict.items()
@@ -835,6 +962,7 @@ class TestConfigurationBoundaries(ProxyManagerTestBase):
         changed["server"].update(
             {"port": "7001", "production_threads": "12", "background_workers": "6"}
         )
+        changed["source_pool"]["proxy_inflight_timeout_seconds"] = "15"
         write_config_file(self.tmp_dir, changed, name="config.ini")
 
         result = self.manager.reload_sources()
@@ -844,11 +972,16 @@ class TestConfigurationBoundaries(ProxyManagerTestBase):
                 self.manager.server_port,
                 self.manager.production_threads,
                 self.manager.background_workers,
+                self.manager.proxy_inflight_timeout_s,
             ),
             old_values,
         )
         self.assertIn(
             "[server] production_threads / background_workers",
+            result["restart_required_for"],
+        )
+        self.assertIn(
+            "[source_pool] proxy_inflight_timeout_seconds",
             result["restart_required_for"],
         )
 
@@ -861,9 +994,23 @@ class TestConfigurationBoundaries(ProxyManagerTestBase):
                 self.manager.server_port,
                 self.manager.production_threads,
                 self.manager.background_workers,
+                self.manager.proxy_inflight_timeout_s,
             ),
             old_values,
         )
+
+    def test_reload_reads_source_backoff_before_taking_the_manager_lock(self):
+        self.mock_db_instance.get_source_backoff_states.reset_mock()
+
+        def assert_unlocked():
+            self.assertFalse(self.manager.lock._is_owned())
+            return {}
+
+        self.mock_db_instance.get_source_backoff_states.side_effect = assert_unlocked
+
+        self.manager.reload_sources()
+
+        self.mock_db_instance.get_source_backoff_states.assert_called_once()
 
 
 class TestApiAndLifecycleContracts(ProxyManagerTestBase):
@@ -1024,8 +1171,34 @@ class TestApiAndLifecycleContracts(ProxyManagerTestBase):
         )
         self.assertEqual(
             sum(callback == self.manager._run_validation_cycle for callback, _ in submitted),
-            1,
+            0,
         )
+        handle_call = next(
+            args
+            for callback, args in submitted
+            if callback == self.manager._handle_fetch_results
+        )
+        self.assertEqual(handle_call, ([fetch_future], True))
+
+    def test_cold_start_validates_after_fetched_rows_are_inserted(self):
+        events = []
+        future = Future()
+        future.set_result([("http", "192.0.2.60", 80)])
+        self.mock_db_instance.insert_proxies.side_effect = (
+            lambda _rows: events.append("insert")
+        )
+
+        with patch.object(
+            self.manager,
+            "_run_validation_cycle",
+            side_effect=lambda: events.append("validate"),
+        ):
+            self.manager._handle_fetch_results(
+                [future],
+                validate_after_insert=True,
+            )
+
+        self.assertEqual(events, ["insert", "validate"])
 
     def test_production_entry_uses_single_process_waitress(self):
         import src.main as main_module
