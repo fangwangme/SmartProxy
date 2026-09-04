@@ -2050,18 +2050,22 @@ class TestStatsQueryIndexability(unittest.TestCase):
             with self.subTest(line=line):
                 self.assertNotIn("DATE(", line.upper())
 
-    def test_existing_databases_have_a_non_destructive_index_migration(self):
-        migration = (
-            Path(__file__).resolve().parents[1]
-            / "config"
-            / "migrations"
-            / "20260830_add_source_stats_source_minute_index.sql"
-        ).read_text(encoding="utf-8")
-        normalized = " ".join(migration.split()).upper()
+    def test_schema_declares_the_composite_stats_index(self):
+        """
+        The range predicate above is only cheap with (source_name, minute).
 
-        self.assertIn("CREATE INDEX CONCURRENTLY IF NOT EXISTS", normalized)
-        self.assertIn("(SOURCE_NAME, MINUTE)", normalized)
-        self.assertNotIn("DROP TABLE", normalized)
+        There is no migration file to carry this index any more: the schema is
+        authoritative and rebuilt from database_setup.sql, so that file is the
+        one place the index has to be declared.
+        """
+        schema = (
+            Path(__file__).resolve().parents[1] / "config" / "database_setup.sql"
+        ).read_text(encoding="utf-8")
+        normalized = " ".join(schema.split()).upper()
+
+        self.assertIn(
+            "ON SOURCE_STATS_BY_MINUTE (SOURCE_NAME, MINUTE)", normalized
+        )
 
 
 class TestDatabaseManager(unittest.TestCase):

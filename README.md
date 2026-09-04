@@ -75,17 +75,17 @@ SmartProxy is a sophisticated proxy management system designed to provide reliab
      psql -U your_user -d your_db -f config/database_setup.sql
      ```
 
-   Existing databases must apply the reliability migrations before starting
-   this version:
+   `database_setup.sql` is the only schema definition, and it is authoritative
+   rather than incremental: it drops and recreates every table, so an existing
+   database is upgraded by running the same file again. There are no migration
+   scripts to apply in order.
 
-   ```bash
-   psql -U your_user -d your_db -f config/migrations/20260904_add_proxy_source_fetch_state.sql
-   psql -U your_user -d your_db -f config/migrations/20260904_add_feedback_flush_commits.sql
-   ```
-
-   These migrations add only fetch-backoff state and an idempotency ledger for
-   aggregate flushes. Proxy reputation is not copied into a database history
-   table; a fresh proxy state simply relearns through normal traffic.
+   Rerunning it discards all stored proxies and minute aggregates. That is the
+   intended upgrade path: proxy rows are rediscovered by the fetchers within one
+   source-refresh interval, and proxy reputation lives in the JSON backup rather
+   than the database, so it survives the rebuild and is restored on startup.
+   Back up `source_stats_by_minute` first if you need the historical dashboard
+   series.
 
 4.  **Configure the service:**  
    * Rename or copy `config/config.example.ini` to `config/config.ini`.  
