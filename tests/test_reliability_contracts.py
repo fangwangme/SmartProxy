@@ -441,7 +441,7 @@ class TestAllocationIdentityAndPlans(ProxyManagerTestBase):
     def test_premium_uses_source_allocation_and_demotes_immediately(self):
         proxy, stat = self._install_qualified(quality=0.06)
         self.manager.premium_min_usage_count = 3
-        self.manager._sync_premium_proxies()
+        self.manager._sync_premium_proxies_locked()
 
         allocation = self.manager.allocate_premium_proxy()
         self.assertEqual(allocation["source"], "source1")
@@ -600,7 +600,7 @@ class TestPersistenceAndTransactions(ProxyManagerTestBase):
         self.assertEqual(len(ledger_calls), 2)
         self.assertEqual(ledger_calls[0].args[1], ledger_calls[1].args[1])
 
-    def test_shutdown_flushes_current_minute_then_reputation_then_backup(self):
+    def test_shutdown_flushes_current_minute_then_writes_backup(self):
         self.manager.stats_backup_enabled = True
         events = []
         original_flush = self.manager._flush_stats
@@ -707,53 +707,6 @@ class TestPersistenceAndTransactions(ProxyManagerTestBase):
             with self.assertRaises(DatabaseWriteError):
                 db._run_transaction("ordered-write", always_deadlocks)
         self.assertEqual(attempts, 2)
-
-    def test_source_reputation_round_trip_does_not_cross_contaminate(self):
-        db = object.__new__(DatabaseManager)
-        proxy = "http://192.0.2.40:80"
-        db._execute = MagicMock(
-            return_value=[
-                {
-                    "protocol": "http",
-                    "ip": "192.0.2.40",
-                    "port": 80,
-                    "source_name": "source1",
-                    "success_count": 9,
-                    "failure_count": 1,
-                    "last_feedback_ts": 1.0,
-                    "quality_slow": 0.9,
-                    "quality_fast": 0.8,
-                    "quality_updated_ts": 1.0,
-                    "recent_results": [[1.0, True, None]],
-                },
-                {
-                    "protocol": "http",
-                    "ip": "192.0.2.40",
-                    "port": 80,
-                    "source_name": "source2",
-                    "success_count": 1,
-                    "failure_count": 9,
-                    "last_feedback_ts": 2.0,
-                    "quality_slow": 0.1,
-                    "quality_fast": 0.2,
-                    "quality_updated_ts": 2.0,
-                    "recent_results": [[2.0, False, None]],
-                },
-            ]
-        )
-
-        history = db.get_active_feedback_history("source1")
-
-        self.assertEqual(history["source1"][proxy]["success_count"], 9)
-        self.assertEqual(history["source2"][proxy]["success_count"], 1)
-        self.assertNotEqual(
-            history["source1"][proxy]["recent_results"],
-            history["source2"][proxy]["recent_results"],
-        )
-        query = db._execute.call_args.args[0]
-        self.assertIn("NOT EXISTS", query)
-        self.assertIn("%(default_source)s AS source_name", query)
-
 
 class TestConfigurationBoundaries(ProxyManagerTestBase):
     def test_invalid_startup_values_are_rejected_before_database_creation(self):

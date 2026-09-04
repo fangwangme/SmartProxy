@@ -82,7 +82,7 @@ MIGRATABLE_STAT_KEYS = frozenset(
         "retry_after_ts",
     }
 )
-RESTORE_MODES = frozenset({"normal", "no-restore", "fresh-scoring"})
+RESTORE_MODES = frozenset({"normal", "no-restore"})
 
 # curl exit codes that mean "the network path failed right now" rather than
 # "the server answered and said no". Only the latter earns the long backoff.
@@ -137,7 +137,6 @@ class ProxyManager:
         if restore_mode not in RESTORE_MODES:
             raise ValueError(f"Unknown restore mode: {restore_mode}")
         self.restore_mode = restore_mode
-        self.durable_reputation_enabled = restore_mode != "fresh-scoring"
         self.config_path = config_path
         self.config = configparser.ConfigParser()
         self.config.read(config_path, encoding="utf-8")
@@ -177,10 +176,6 @@ class ProxyManager:
         # self.lock only guards the snapshot, so two concurrent backups could
         # interleave and let an older snapshot land last.
         self.backup_lock = threading.Lock()
-        # Periodic and shutdown flushes can overlap. Keep per-proxy absolute
-        # totals ordered so an older snapshot cannot land after a newer one and
-        # make durable reputation move backwards.
-        self.feedback_persist_lock = threading.Lock()
         self.feedback_flush_lock = threading.Lock()
 
         self.feedback_buffer = defaultdict(
@@ -190,10 +185,6 @@ class ProxyManager:
 
         self.dashboard_sources: Set[str] = set()
         self.last_source_refresh_time = 0
-
-        # Proxy URLs whose feedback counters have moved since the last time
-        # they were written back to the proxies table.
-        self.pending_feedback_persist: Set[Tuple[str, str]] = set()
 
         self._load_config()
         # Configuration is fully parsed and semantically validated before a
@@ -709,8 +700,7 @@ class ProxyManager:
         if restore_mode == "normal":
             return normal_path
         suffix = normal_path.suffix or ".json"
-        marker = "no-restore" if restore_mode == "no-restore" else "fresh-scoring"
-        return normal_path.with_name(f"{normal_path.stem}.{marker}{suffix}")
+        return normal_path.with_name(f"{normal_path.stem}.no-restore{suffix}")
 
     def check_config_drift(self, example_path: Path = CONFIG_EXAMPLE_PATH) -> Dict:
         """
@@ -1669,13 +1659,6 @@ class ProxyManager:
             )
             return
 
-        # A proxy the stats pool has never seen - or has evicted since - is
-        # about to be seeded. Bring its persisted feedback history back with it,
-        # or eviction plus one validation pass would launder the record into a
-        # pristine baseline score. Queried outside the lock; the query is
-        # skipped entirely when nothing needs seeding.
-        feedback_history = self._load_feedback_history_for(newly_active_proxies)
-
         with self.lock:
             self.active_proxies = newly_active_proxies
             for source in self.predefined_sources:
@@ -1683,14 +1666,7 @@ class ProxyManager:
 
                 for proxy_url in self.active_proxies:
                     if proxy_url not in stats_pool:
-                        stats_pool[proxy_url] = self._get_new_proxy_stat(
-                            source,
-                            (
-                                feedback_history.get(source, {}).get(proxy_url)
-                                if isinstance(feedback_history.get(source), dict)
-                                else feedback_history.get(proxy_url)
-                            ),
-                        )
+                        stats_pool[proxy_url] = self._get_new_proxy_stat(source)
 
                 # One pass: age every estimator toward the fixed prior, and
                 # classify the live ones while their score is in hand. This is
@@ -1782,143 +1758,9 @@ class ProxyManager:
 
             self._sync_premium_proxies_locked()
 
-    @staticmethod
-    def _split_proxy_url(proxy_url: str) -> Optional[Tuple[str, str, int]]:
-        """Split a stored proxy URL back into its (protocol, ip, port) key."""
-        if not isinstance(proxy_url, str) or "://" not in proxy_url:
-            return None
-        protocol, rest = proxy_url.split("://", 1)
-        if ":" not in rest:
-            return None
-        # rsplit, so a bracketed IPv6 literal keeps its colons and only the
-        # port is taken off the end.
-        ip, port_str = rest.rsplit(":", 1)
-        try:
-            port = int(port_str)
-        except ValueError:
-            return None
-        if not protocol or not ip:
-            return None
-        return protocol, ip, port
-
-    def _load_feedback_history_for(self, active_proxies: Set[str]) -> Dict[str, Dict]:
-        """
-        Persisted feedback records for proxies this sync is about to seed.
-
-        Skipped entirely when every live proxy is already in every pool, which
-        is the steady state - the query only runs on the cycles where a proxy
-        is actually joining or rejoining a pool.
-        """
-        if not self.durable_reputation_enabled:
-            logger.info(
-                "Fresh-scoring mode: skipping database reputation hydration."
-            )
-            return {}
-
-        with self.lock:
-            needs_seeding = any(
-                proxy_url not in self.source_stats.get(source, {})
-                for source in self.predefined_sources
-                for proxy_url in active_proxies
-            )
-        if not needs_seeding:
-            return {}
-
-        history = self.db.get_active_feedback_history(self.default_source)
-        if not isinstance(history, dict):
-            logger.warning(
-                "Feedback history unavailable this cycle; new stats are seeded "
-                "at the untried baseline instead of their persisted record."
-            )
-            return {}
-        return history
-
-    def _persist_feedback_history(self):
-        """
-        Write the in-memory feedback counters of recently updated proxies back
-        to the proxies table.
-
-        Only proxies whose counters have actually moved are written, so this
-        stays proportional to feedback volume rather than to pool size. The
-        failed writes are put back into the pending set atomically, so an idle
-        proxy is retried even if no later feedback arrives.
-        """
-        with self.feedback_persist_lock:
-            self._persist_feedback_history_locked()
-
-    def _persist_feedback_history_locked(self):
-        """Persist one ordered snapshot; caller holds feedback_persist_lock."""
-        if not self.durable_reputation_enabled:
-            with self.lock:
-                self.pending_feedback_persist.clear()
-            return
-
-        with self.lock:
-            outage_protected = {
-                (source, proxy_url)
-                for source, state in self.outage_states.items()
-                for proxy_url in state.get("protected_stats", {})
-            }
-            normalized_pending = {
-                (self.default_source, item) if isinstance(item, str) else item
-                for item in self.pending_feedback_persist
-            }
-            pending = normalized_pending - outage_protected
-            # Candidate-window mutations stay queued but cannot reach durable
-            # monotonic counters until the outage decision commits or rolls
-            # them back.
-            self.pending_feedback_persist = (
-                normalized_pending & outage_protected
-            )
-
-            rows = []
-            for source, proxy_url in sorted(pending):
-                key = self._split_proxy_url(proxy_url)
-                if key is None:
-                    continue
-                stat = self.source_stats.get(source, {}).get(proxy_url)
-                if not isinstance(stat, dict):
-                    continue
-                protocol, ip, port = key
-                rows.append(
-                    (
-                        source,
-                        protocol,
-                        ip,
-                        port,
-                        int(stat.get("success_count", 0) or 0),
-                        int(stat.get("failure_count", 0) or 0),
-                        self._coerce_timestamp(
-                            stat.get("last_feedback_ts"), time.time()
-                        ),
-                        float(stat.get("quality_slow", self.reliability_prior)),
-                        float(stat.get("quality_fast", self.reliability_prior)),
-                        self._coerce_timestamp(
-                            stat.get("quality_updated_ts"), time.time()
-                        ),
-                        copy.deepcopy(stat.get("recent_results", [])),
-                    )
-                )
-
-        if not rows:
-            return
-        try:
-            persisted = self.db.upsert_proxy_source_reputation(rows)
-        except Exception:
-            persisted = False
-            logger.exception("Durable reputation write raised unexpectedly.")
-        if persisted is False:
-            with self.lock:
-                self.pending_feedback_persist.update(pending)
-            logger.warning(
-                "Durable reputation write failed; re-queued {} proxy record(s).",
-                len(pending),
-            )
-
     def _flush_stats(self, include_current: bool = False):
-        """Periodic persistence: minute aggregates plus per-proxy reputation."""
+        """Persist eligible minute aggregates."""
         self._flush_feedback_buffer(include_current=include_current)
-        self._persist_feedback_history()
 
     def _baseline_score(self, source: Optional[str] = None) -> float:
         """Fixed initial reliability score on the public 0-100 scale."""
@@ -2200,25 +2042,15 @@ class ProxyManager:
         self.background_executor.shutdown(wait=False, cancel_futures=True)
 
         # The current partial minute follows the same acknowledge-after-commit
-        # path as periodic data, then source-specific reputation is persisted.
+        # path as periodic data.
         self._flush_stats(include_current=True)
         if self.stats_backup_enabled:
             self.backup_stats()
         logger.info("Background scheduler stopped and final persistence completed.")
 
-    def _get_new_proxy_stat(
-        self, source: Optional[str] = None, history: Optional[Dict] = None
-    ) -> Dict:
-        """
-        Create a proxy stat at the fixed reliability prior.
-
-        `history` is the proxy's persisted feedback record, when the proxies
-        table has one. Seeding those counters is what stops eviction from the
-        stats pool being an amnesty: a proxy that failed its way out and later
-        passed validation again comes back with its record, not with the
-        untried baseline it never earned.
-        """
-        stat = {
+    def _get_new_proxy_stat(self, source: Optional[str] = None) -> Dict:
+        """Create a proxy stat at the fixed reliability prior."""
+        return {
             "score": self._baseline_score(source),
             "quality_slow": self.reliability_prior,
             "quality_fast": self.reliability_prior,
@@ -2234,32 +2066,6 @@ class ProxyManager:
             "inflight": [],
             "retry_after_ts": 0.0,
         }
-        if not history:
-            return stat
-
-        stat["success_count"] = nonnegative_int(history.get("success_count"))
-        stat["failure_count"] = nonnegative_int(history.get("failure_count"))
-        now_ts = time.time()
-        stat["last_feedback_ts"] = self._coerce_timestamp(
-            history.get("last_feedback_ts"), now_ts
-        )
-        for field in (
-            "quality_slow",
-            "quality_fast",
-            "quality_updated_ts",
-            "recent_results",
-        ):
-            if history.get(field) is not None:
-                stat[field] = copy.deepcopy(history[field])
-        if stat["success_count"] or stat["failure_count"]:
-            # The durable record seeds the *score*, never the trial budget. A
-            # re-seeded proxy has an empty result window, so it cannot qualify
-            # yet; pre-spending its trial handouts on results it earned in a
-            # previous life left it ineligible for exploitation *and* for every
-            # exploration group - unreachable until the forgiveness epoch
-            # expired. It re-enters as a discovery candidate holding its score.
-            return self._migrate_legacy_stat(stat, trust_derived=True)
-        return stat
 
     def backup_stats(self) -> Dict:
         """Backup source_stats to a JSON file."""
@@ -3013,13 +2819,6 @@ class ProxyManager:
             # safer than leaking capacity indefinitely.
             del leases[0]
 
-    @staticmethod
-    def _release_lease(stat: Dict):
-        """Feedback closes the oldest outstanding handout for this proxy."""
-        leases = stat.get("inflight")
-        if leases:
-            del leases[0]
-
     def _remember_completed_allocation_locked(
         self, allocation_id: str, record: Dict, reason: str, now_ts: float
     ):
@@ -3316,40 +3115,6 @@ class ProxyManager:
                 "source": source,
                 "allocation_id": allocation_id,
             }
-
-    def _sync_premium_proxies(self):
-        """
-        Sync premium proxies from source_stats.
-        Aggregates proxies across all sources and selects the top N by score.
-        
-        Strategy:
-        1. Prefer proxies with sufficient usage history (>= min_usage_count) to avoid
-           new proxies with inflated initial scores (0 score can rank higher than negative).
-        2. Fallback: If no proxies meet the usage threshold, select from all active proxies
-           by score to ensure we never return an empty premium pool.
-        """
-        with self.lock:
-            self._sync_premium_proxies_locked()
-
-        if self.premium_proxies:
-            top_scores = []
-            with self.lock:
-                for url in self.premium_proxies[:5]:
-                    top_scores.append(
-                        max(
-                            (
-                                stats.get(url, {}).get("score", 0)
-                                for stats in self.source_stats.values()
-                            ),
-                            default=0,
-                        )
-                    )
-            logger.info(
-                f"Premium proxy pool synced: {len(self.premium_proxies)} proxies loaded "
-                f"(top 5 scores: {top_scores})"
-            )
-        else:
-            logger.warning("No premium proxies found: no active proxies available.")
 
     def _sync_premium_proxies_locked(self):
         # Aggregate all proxies with their highest score across all sources.
@@ -3970,10 +3735,6 @@ class ProxyManager:
                 -self.reliability_recent_results_limit:
             ]
         stat["last_feedback_ts"] = current_timestamp
-        # Queue the updated counters for write-back, so this proxy's record
-        # outlives its entry in the in-memory pool.
-        if self.durable_reputation_enabled:
-            self.pending_feedback_persist.add((source, proxy_url))
 
         old_score = stat["score"]
         self._update_reliability_state(stat, is_success, current_timestamp)

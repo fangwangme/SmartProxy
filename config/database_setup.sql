@@ -4,7 +4,6 @@
 -- Drop the tables if they exist to ensure a clean setup.
 DROP TABLE IF EXISTS feedback_flush_commits;
 DROP TABLE IF EXISTS proxy_source_fetch_state;
-DROP TABLE IF EXISTS proxy_source_reputation;
 DROP TABLE IF EXISTS source_stats_by_minute;
 DROP TABLE IF EXISTS proxies CASCADE;
 
@@ -46,14 +45,6 @@ CREATE TABLE proxies (
     validation_attempts_in_window INT NOT NULL DEFAULT 0,
     window_start_time TIMESTAMPTZ,
 
-    -- Durable copy of the feedback counters that rank this proxy. The in-memory
-    -- stats pool caps retained history, so without these a proxy that failed its
-    -- way out and later revalidated would be re-seeded as a clean candidate --
-    -- eviction would be an amnesty.
-    feedback_success_count INT NOT NULL DEFAULT 0,
-    feedback_failure_count INT NOT NULL DEFAULT 0,
-    feedback_last_ts TIMESTAMPTZ,
-    
     -- Ensures that each proxy (protocol, ip, port combination) is unique in the table.
     UNIQUE (protocol, ip, port)
 );
@@ -65,29 +56,6 @@ CREATE INDEX idx_proxies_validation_logic ON proxies (is_active, window_start_ti
 
 COMMENT ON TABLE proxies IS 'Stores physical attributes and validation status of all discovered proxies.';
 COMMENT ON COLUMN proxies.is_active IS 'True if the proxy passed the last validation, false otherwise.';
-COMMENT ON COLUMN proxies.feedback_success_count IS 'Durable copy of the in-memory success counter, so eviction from the stats pool is not reputation loss.';
-COMMENT ON COLUMN proxies.feedback_failure_count IS 'Durable copy of the in-memory failure counter, restored when a proxy is re-seeded into the stats pool.';
-COMMENT ON COLUMN proxies.feedback_last_ts IS 'Timestamp of the newest feedback behind those counters; drives time decay on a restored record.';
-
--- Source-specific durable reputation. The legacy counters on proxies remain
--- intact for rollback; only rows without an entry here are seeded from them.
-CREATE TABLE proxy_source_reputation (
-    proxy_id INT NOT NULL REFERENCES proxies(id) ON DELETE CASCADE,
-    source_name VARCHAR(50) NOT NULL,
-    success_count INT NOT NULL DEFAULT 0,
-    failure_count INT NOT NULL DEFAULT 0,
-    last_feedback_ts TIMESTAMPTZ,
-    quality_slow DOUBLE PRECISION NOT NULL,
-    quality_fast DOUBLE PRECISION NOT NULL,
-    quality_updated_ts TIMESTAMPTZ,
-    recent_results JSONB NOT NULL DEFAULT '[]'::jsonb,
-    PRIMARY KEY (proxy_id, source_name)
-);
-
-CREATE INDEX idx_proxy_source_reputation_source
-    ON proxy_source_reputation (source_name, proxy_id);
-
-COMMENT ON TABLE proxy_source_reputation IS 'Durable online-learning state isolated by physical proxy and request source.';
 
 CREATE TABLE proxy_source_fetch_state (
     source_name VARCHAR(100) PRIMARY KEY,

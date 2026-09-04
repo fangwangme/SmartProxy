@@ -89,7 +89,6 @@ class DatabaseManager:
         """Run one mutation with bounded retry for transaction-level conflicts."""
         attempts = max(1, getattr(self, "write_max_retries", 3) + 1)
         base_ms = max(0, getattr(self, "write_retry_base_ms", 25))
-        last_error = None
         for attempt in range(attempts):
             conn = None
             try:
@@ -98,7 +97,6 @@ class DatabaseManager:
                 conn.commit()
                 return True
             except psycopg2.Error as error:
-                last_error = error
                 if conn:
                     conn.rollback()
                 retryable = getattr(error, "pgcode", None) in RETRYABLE_SQLSTATES
@@ -127,7 +125,6 @@ class DatabaseManager:
             finally:
                 if conn:
                     self.pool.putconn(conn)
-        raise DatabaseWriteError(operation, last_error or RuntimeError("unknown error"))
 
     def ping(self) -> bool:
         """Return whether a lightweight database readiness query succeeds."""
@@ -384,176 +381,6 @@ class DatabaseManager:
             (source_name,),
             operation="clear_source_backoff",
         )
-
-    def get_active_feedback_history(
-        self, default_source: str = "default"
-    ) -> Optional[Dict[str, Dict[str, Dict]]]:
-        """
-        Persisted feedback counters for every live proxy that has any.
-
-        This is what makes eviction from the in-memory stats pool survivable.
-        The pool caps retained history, so a proxy that failed its way out and
-        later passes validation again is re-seeded from scratch; without a
-        durable record that re-seed hands it a clean sheet it never earned.
-
-        Returns None if the query failed, so the caller can tell "no history"
-        from "we do not know", and seed conservatively rather than wrongly.
-        """
-        query = """
-            SELECT p.protocol, p.ip, p.port, r.source_name,
-                   r.success_count, r.failure_count,
-                   EXTRACT(EPOCH FROM r.last_feedback_ts) AS last_feedback_ts,
-                   r.quality_slow, r.quality_fast,
-                   EXTRACT(EPOCH FROM r.quality_updated_ts) AS quality_updated_ts,
-                   r.recent_results
-            FROM proxies AS p
-            JOIN proxy_source_reputation AS r ON r.proxy_id = p.id
-            WHERE p.is_active = true
-            UNION ALL
-            SELECT p.protocol, p.ip, p.port, %(default_source)s AS source_name,
-                   p.feedback_success_count AS success_count,
-                   p.feedback_failure_count AS failure_count,
-                   EXTRACT(EPOCH FROM p.feedback_last_ts) AS last_feedback_ts,
-                   NULL::double precision AS quality_slow,
-                   NULL::double precision AS quality_fast,
-                   NULL::double precision AS quality_updated_ts,
-                   '[]'::jsonb AS recent_results
-            FROM proxies AS p
-            WHERE p.is_active = true
-              AND (p.feedback_success_count > 0 OR p.feedback_failure_count > 0)
-              AND NOT EXISTS (
-                  SELECT 1 FROM proxy_source_reputation AS r
-                  WHERE r.proxy_id = p.id
-              )
-            ORDER BY source_name, protocol, ip, port;
-        """
-        rows = self._execute(
-            query, {"default_source": default_source}, fetch="all"
-        )
-        if rows is None:
-            return None
-        history = {}
-        for row in rows:
-            url = f"{row['protocol']}://{row['ip']}:{row['port']}"
-            source = str(row["source_name"])
-            history.setdefault(source, {})[url] = {
-                "success_count": int(row["success_count"] or 0),
-                "failure_count": int(row["failure_count"] or 0),
-                "last_feedback_ts": (
-                    float(row["last_feedback_ts"])
-                    if row["last_feedback_ts"] is not None
-                    else None
-                ),
-                "quality_slow": row["quality_slow"],
-                "quality_fast": row["quality_fast"],
-                "quality_updated_ts": (
-                    float(row["quality_updated_ts"])
-                    if row["quality_updated_ts"] is not None
-                    else None
-                ),
-                "recent_results": row["recent_results"] or [],
-            }
-        return history
-
-    def upsert_proxy_source_reputation(self, rows: List[Tuple]) -> bool:
-        """
-        Write absolute feedback totals for a batch of proxies.
-
-        Absolute rather than incremental on purpose: the counters live in
-        memory and are written back periodically, so a write that is lost to a
-        transient DB error is corrected by the next one instead of leaving the
-        stored total permanently short.
-
-        Rows contain source plus the complete source-specific scoring snapshot.
-        """
-        if not rows:
-            return True
-        query = """
-            INSERT INTO proxy_source_reputation (
-                proxy_id, source_name, success_count, failure_count,
-                last_feedback_ts, quality_slow, quality_fast,
-                quality_updated_ts, recent_results
-            )
-            SELECT p.id, data.source_name, data.success_count,
-                   data.failure_count, data.last_feedback_ts,
-                   data.quality_slow, data.quality_fast,
-                   data.quality_updated_ts, data.recent_results
-            FROM (VALUES %s) AS data(
-                source_name, protocol, ip, port, success_count, failure_count,
-                last_feedback_ts, quality_slow, quality_fast,
-                quality_updated_ts, recent_results
-            )
-            JOIN proxies AS p
-              ON p.protocol = data.protocol
-             AND p.ip = data.ip
-             AND p.port = data.port
-            ORDER BY p.id, data.source_name
-            ON CONFLICT (proxy_id, source_name) DO UPDATE SET
-                success_count = EXCLUDED.success_count,
-                failure_count = EXCLUDED.failure_count,
-                last_feedback_ts = EXCLUDED.last_feedback_ts,
-                quality_slow = EXCLUDED.quality_slow,
-                quality_fast = EXCLUDED.quality_fast,
-                quality_updated_ts = EXCLUDED.quality_updated_ts,
-                recent_results = EXCLUDED.recent_results;
-        """
-        values = []
-        for row in sorted(rows, key=lambda item: (item[1], item[2], item[3], item[0])):
-            (
-                source,
-                protocol,
-                ip,
-                port,
-                success_count,
-                failure_count,
-                last_ts,
-                quality_slow,
-                quality_fast,
-                quality_updated_ts,
-                recent_results,
-            ) = row
-            values.append(
-                (
-                    source,
-                    protocol,
-                    ip,
-                    int(port),
-                    int(success_count),
-                    int(failure_count),
-                    datetime.fromtimestamp(last_ts, tz=timezone.utc)
-                    if last_ts is not None
-                    else None,
-                    float(quality_slow),
-                    float(quality_fast),
-                    datetime.fromtimestamp(quality_updated_ts, tz=timezone.utc)
-                    if quality_updated_ts is not None
-                    else None,
-                    psycopg2.extras.Json(recent_results),
-                )
-            )
-
-        def write(conn):
-            with conn.cursor() as cur:
-                psycopg2.extras.execute_values(
-                    cur,
-                    query,
-                    values,
-                    # Explicit casts: a VALUES list sends these as "unknown",
-                    # and PostgreSQL has no conversion from unknown to
-                    # timestamptz when it is only ever assigned, never compared.
-                    template=(
-                        "(%s::varchar, %s::varchar, %s::varchar, %s::int, "
-                        "%s::int, %s::int, %s::timestamptz, %s::double precision, "
-                        "%s::double precision, %s::timestamptz, %s::jsonb)"
-                    ),
-                    page_size=1000,
-                )
-            logger.debug(
-                "Persisted source-specific feedback history for {} records.",
-                len(values),
-            )
-
-        return self._run_transaction("upsert_proxy_source_reputation", write)
 
     def flush_feedback_stats(
         self, stats_buffer: List[Tuple], flush_id: Optional[str] = None

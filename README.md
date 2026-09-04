@@ -79,14 +79,13 @@ SmartProxy is a sophisticated proxy management system designed to provide reliab
    this version:
 
    ```bash
-   psql -U your_user -d your_db -f config/migrations/20260904_add_proxy_source_reputation.sql
    psql -U your_user -d your_db -f config/migrations/20260904_add_proxy_source_fetch_state.sql
    psql -U your_user -d your_db -f config/migrations/20260904_add_feedback_flush_commits.sql
    ```
 
-   These migrations are additive. The legacy reputation columns remain in
-   place for rollback; rows without source-specific history seed only the
-   configured default source.
+   These migrations add only fetch-backoff state and an idempotency ledger for
+   aggregate flushes. Proxy reputation is not copied into a database history
+   table; a fresh proxy state simply relearns through normal traffic.
 
 4.  **Configure the service:**  
    * Rename or copy `config/config.example.ini` to `config/config.ini`.  
@@ -140,11 +139,8 @@ You can use the provided shell script to manage the backend service (start, stop
     # Start with debug mode
     ./scripts/start_proxy.sh start --debug
 
-    # Skip JSON restore but keep database reputation hydration; isolated backup
+    # Skip JSON restore and write to an isolated backup
     ./scripts/start_proxy.sh start --no-restore
-
-    # Isolated cold-start scoring; no JSON/DB reputation hydration or durable reputation writes
-    ./scripts/start_proxy.sh start --fresh-scoring
 
     # Check status
     ./scripts/start_proxy.sh status
@@ -152,7 +148,7 @@ You can use the provided shell script to manage the backend service (start, stop
     # View logs
     ./scripts/start_proxy.sh logs
 
-    # Restart service (add --no-restore / --fresh-scoring only on purpose)
+    # Restart service (add --no-restore only on purpose)
     ./scripts/start_proxy.sh restart
 
     # Stop service
@@ -208,7 +204,7 @@ The service is configured via the config.ini file.
   * qualification\_min\_results / probation\_attempts / retry\_attempts / retry\_delay\_seconds / probation\_forgiveness\_hours: Qualification and bounded trial lifecycle.
   * outage\_guard\_*: Requires a healthy completed window before a broad distinct-proxy failure spike can pause and roll back proxy-level reputation updates. Aggregate traffic metrics continue, and a completed recovery window resumes learning.
   * max\_feedback\_latency\_ms: Input-safety boundary for diagnostic latency. Latency never affects reliability.
-  * Reputation is persisted by physical proxy and source in `proxy_source_reputation`, including the complete bounded scoring snapshot. Learning from one source is never copied into another source.
+  * Online reputation stays source-local in the manager and is included in the existing JSON backup. If no backup is restored, proxies start from the fixed prior and relearn through normal traffic; there is no reputation database migration or double-write path.
   * max\_pool\_size x stats\_pool\_max\_multiplier: The cap on retained **dead** proxy history - not on total memory. Proxies that passed the latest validation are never evicted, because evicting one would reset its failure history to zero on the next sync, so the stats pool grows with the number of genuinely active proxies. If the live set alone reaches the cap, all dead history is dropped and a warning is logged.
 * **\[proxy\_source\_\*\]**: Define your proxy sources here. Each source should have its own section (e.g., \[proxy\_source\_freeproxies\]).  
   * url: The URL to fetch the proxy list from.  

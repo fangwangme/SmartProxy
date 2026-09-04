@@ -214,29 +214,25 @@ dipped below the prior keeps drawing exploitation traffic until the next
 rebuild. That is bounded by `serving_plan_max_age_seconds` and is the cheaper
 error - it costs a few requests, where the reverse costs availability.
 
-## 6. Persistence and migration
+## 6. Persistence
 
 JSON snapshots contain root-level `scoring_version = 2`. Matching-version
 derived estimator state is validated and restored. A missing or mismatched
 version never trusts stored derived scores: valid `recent_results` are replayed
-in timestamp order. Raw feedback and database counters are preserved; migration
-does not delete history.
+in timestamp order.
 
-Durable database counters are absolute. Writes use monotonic database updates,
-are serialized in-process, and failed batches are re-queued so an idle proxy is
-retried without waiting for another feedback event.
+Proxy reputation is not mirrored into PostgreSQL. If a JSON snapshot is absent
+or intentionally skipped, each proxy starts from the fixed prior and relearns
+through normal feedback. This accepts a bounded warm-up period in exchange for
+removing reputation migrations, hydration, and a second write path.
 
-Runtime modes are non-destructive:
+The optional cold-start mode is non-destructive:
 
-- normal: restore normal JSON state, hydrate database reputation, and persist
-  both normal JSON and durable reputation;
-- `--no-restore`: skip JSON restore, keep database hydration/persistence, and
-  write JSON only to a `.no-restore` sibling path;
-- `--fresh-scoring`: skip JSON and database reputation hydration, disable
-  durable reputation writes, keep aggregate feedback, and write JSON only to a
-  `.fresh-scoring` sibling path.
+- normal: restore and update the normal JSON state;
+- `--no-restore`: skip JSON restore and write JSON only to a `.no-restore`
+  sibling path.
 
-Neither experimental mode deletes, renames, or overwrites normal state.
+`--no-restore` does not delete, rename, or overwrite normal state.
 
 ## 7. Configuration ownership
 
@@ -247,7 +243,7 @@ All thresholds above live in `[source_pool]` and are documented in
 ## 8. Operational observation
 
 Local deterministic replay proves ordering and learning direction, not the
-production ceiling. A rollout should run `--fresh-scoring` or a shadow replay,
+production ceiling. A rollout should run `--no-restore` or a shadow replay,
 bucket requests by score before outcome, and compare the rolling success rate
 with the observed stable wall. The target is 90-95% of that wall within roughly
 one hour. Publish only aggregate bucket counts/rates; keep proxy addresses,

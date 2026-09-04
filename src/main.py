@@ -39,16 +39,10 @@ def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="SmartProxy Service")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging for validation")
-    restore_group = parser.add_mutually_exclusive_group()
-    restore_group.add_argument(
+    parser.add_argument(
         "--no-restore",
         action="store_true",
         help="Skip JSON restore and write to isolated experiment state",
-    )
-    restore_group.add_argument(
-        "--fresh-scoring",
-        action="store_true",
-        help="Skip all reputation hydration/writes and use isolated scoring state",
     )
     args = parser.parse_args()
     
@@ -64,13 +58,7 @@ def main():
     logging.getLogger("werkzeug").setLevel(logging.WARNING)
     
     # Initialize ProxyManager
-    restore_mode = (
-        "fresh-scoring"
-        if args.fresh_scoring
-        else "no-restore"
-        if args.no_restore
-        else "normal"
-    )
+    restore_mode = "no-restore" if args.no_restore else "normal"
     logger.info("Selected scoring restore mode: {}", restore_mode)
     proxy_manager = load_proxy_manager(CONFIG_FILE_PATH, restore_mode=restore_mode)
     proxy_manager.debug_mode = args.debug

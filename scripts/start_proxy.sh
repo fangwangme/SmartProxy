@@ -229,20 +229,8 @@ for arg in "$@"; do
             SERVICE_FLAGS+=("--debug")
             ;;
         --no-restore)
-            if [ "$RESTORE_MODE" != "normal" ]; then
-                echo "Only one restore mode may be selected."
-                exit 1
-            fi
             RESTORE_MODE="no-restore"
             SERVICE_FLAGS+=("--no-restore")
-            ;;
-        --fresh-scoring)
-            if [ "$RESTORE_MODE" != "normal" ]; then
-                echo "Only one restore mode may be selected."
-                exit 1
-            fi
-            RESTORE_MODE="fresh-scoring"
-            SERVICE_FLAGS+=("--fresh-scoring")
             ;;
         *)
             echo "Unknown flag: $arg"
@@ -274,7 +262,7 @@ case "$COMMAND" in
         backup_stats
         ;;
     *)
-        echo "Usage: $0 {start|stop|restart|status|logs|backup} [--debug] [--no-restore|--fresh-scoring]"
+        echo "Usage: $0 {start|stop|restart|status|logs|backup} [--debug] [--no-restore]"
         exit 1
         ;;
 esac
