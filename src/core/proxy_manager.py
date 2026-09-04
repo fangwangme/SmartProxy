@@ -175,7 +175,6 @@ class ProxyManager:
         self.last_validation_success_ts: Optional[float] = None
         self.last_flush_success_ts: Optional[float] = None
         self.last_validation_quorum_healthy = False
-        self.last_validation_target_health: List[bool] = []
         self.last_backup_duration_s = 0.0
         self.last_manager_lock_hold_s = 0.0
         self.last_plan_refresh_duration_s = 0.0
@@ -1672,11 +1671,11 @@ class ProxyManager:
             )
 
             with self.lock:
+                # Only the quorum verdict is retained: readiness consumes it.
+                # Per-target health is already observable as the failure log
+                # below and smartproxy_validation_target_failures_total.
                 self.last_validation_quorum_healthy = bool(
                     validation_metadata["quorum_healthy"]
-                )
-                self.last_validation_target_health = list(
-                    validation_metadata["healthy_targets"]
                 )
 
             if not validation_metadata["quorum_healthy"]:
@@ -2137,15 +2136,19 @@ class ProxyManager:
                 )
         self.background_executor.shutdown(wait=False, cancel_futures=True)
 
+        # The backup goes first because it is the only durable copy of proxy
+        # reputation - the database no longer mirrors it - and because a stalled
+        # database is precisely the case where the flush cannot commit but a
+        # local file still can. Ordering it second let the losing write spend
+        # the budget belonging to the one that could still have succeeded.
+        # The flush then takes what is left; its aggregates are recoverable
+        # from a partial minute, a lost reputation snapshot is not.
+        backed_up = True
+        if self.stats_backup_enabled:
+            backed_up = self.backup_stats(deadline=deadline).get("status") == "success"
         # The current partial minute follows the same acknowledge-after-commit
         # path as periodic data.
         flushed = self._flush_stats(include_current=True, deadline=deadline)
-        backed_up = True
-        if self.stats_backup_enabled and time.monotonic() < deadline:
-            backed_up = self.backup_stats(deadline=deadline).get("status") == "success"
-        elif self.stats_backup_enabled:
-            backed_up = False
-            logger.warning("Shutdown deadline reached before the final stats backup.")
         logger.info(
             "Background scheduler stopped; final flush={} backup={} elapsed={:.2f}s.",
             "complete" if flushed else "deferred",

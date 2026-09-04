@@ -680,7 +680,12 @@ class TestPersistenceAndTransactions(ProxyManagerTestBase):
         self.assertEqual(len(ledger_calls), 2)
         self.assertEqual(ledger_calls[0].args[1], ledger_calls[1].args[1])
 
-    def test_shutdown_flushes_current_minute_then_writes_backup(self):
+    def test_shutdown_writes_backup_before_flushing_current_minute(self):
+        """
+        Reputation is the only durable state without a second copy, and a
+        stalled database is the case where the flush burns the budget and
+        fails anyway while the local backup would still have landed.
+        """
         self.manager.stats_backup_enabled = True
         events = []
         original_flush = self.manager._flush_stats
@@ -704,7 +709,7 @@ class TestPersistenceAndTransactions(ProxyManagerTestBase):
             self.manager.stop_scheduler()
 
         self.assertIsNotNone(original_flush)
-        self.assertEqual(events, [("flush", True, False), ("backup",)])
+        self.assertEqual(events, [("backup",), ("flush", True, False)])
         self.manager.fetch_executor.shutdown.assert_called_once_with(
             wait=False, cancel_futures=True
         )
