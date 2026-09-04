@@ -78,7 +78,6 @@ MIGRATABLE_STAT_KEYS = frozenset(
         "trial_handout_count",
         "last_handed_out_ts",
         "inflight",
-        "outstanding_until",
         "retry_after_ts",
     }
 )
@@ -3411,12 +3410,11 @@ class ProxyManager:
         stat["last_handed_out_ts"] = self._coerce_timestamp(
             stat.get("last_handed_out_ts"), now_ts
         )
-        # Migrate the single-slot lease that scoring_version 2 persisted, and
-        # drop expired leases from either shape on the way in.
+        # Drop expired leases on the way in. A stat with no usable lease list
+        # starts with none rather than inheriting one it cannot account for.
         leases = stat.get("inflight")
         if not isinstance(leases, list):
-            legacy = self._coerce_timestamp(stat.get("outstanding_until")) or 0.0
-            leases = [legacy] if legacy > now_ts else []
+            leases = []
         else:
             leases = sorted(
                 expiry
@@ -3424,7 +3422,6 @@ class ProxyManager:
                 if expiry is not None and expiry > now_ts
             )
         stat["inflight"] = leases
-        stat.pop("outstanding_until", None)
         stat["retry_after_ts"] = (
             self._coerce_timestamp(stat.get("retry_after_ts")) or 0.0
         )

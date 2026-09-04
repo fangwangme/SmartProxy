@@ -3519,18 +3519,32 @@ class TestIssue23ReviewFixes(ProxyManagerTestBase):
 
         self.assertEqual(served, [proxy] * 50)
 
-    def test_legacy_single_slot_lease_migrates_into_the_inflight_list(self):
+    def test_unusable_lease_state_normalizes_to_an_empty_list(self):
+        """
+        A lease list is only meaningful alongside the allocation ledger, which
+        does not survive a restart. A stat whose inflight field is missing or
+        malformed therefore starts with no leases rather than inheriting a
+        slot nothing can close.
+        """
         now = time.time()
-        stat = self.manager._migrate_legacy_stat(
-            {"success_count": 1, "outstanding_until": now + 60}
-        )
-        self.assertEqual(len(stat["inflight"]), 1)
-        self.assertNotIn("outstanding_until", stat)
+        for persisted in ({}, {"inflight": None}, {"inflight": "1"}):
+            with self.subTest(persisted=persisted):
+                stat = self.manager._migrate_legacy_stat(
+                    {"success_count": 1, **persisted}
+                )
+                self.assertEqual(stat["inflight"], [])
 
-        expired = self.manager._migrate_legacy_stat(
-            {"success_count": 1, "outstanding_until": now - 60}
+        kept = self.manager._migrate_legacy_stat(
+            {"success_count": 1, "inflight": [now - 60, now + 60]}
         )
-        self.assertEqual(expired["inflight"], [])
+        self.assertEqual(kept["inflight"], [now + 60])
+
+    def test_unknown_persisted_fields_are_dropped(self):
+        stat = self.manager._migrate_legacy_stat(
+            {"success_count": 1, "outstanding_until": 1.0, "whatever": 2}
+        )
+        self.assertNotIn("outstanding_until", stat)
+        self.assertNotIn("whatever", stat)
 
     # --- a proxy that qualifies mid-plan must not fall into a hole ---------
 
