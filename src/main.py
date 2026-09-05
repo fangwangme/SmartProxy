@@ -5,7 +5,7 @@ import argparse
 import signal
 import threading
 import configparser
-from concurrent.futures import as_completed
+from waitress import serve
 
 # Local imports
 from src.utils.logger import logger, setup_logging
@@ -28,69 +28,26 @@ def load_proxy_manager(config_path: str, restore_mode: str = "normal") -> ProxyM
     manager = ProxyManager(config_path, restore_mode=restore_mode)
     manager.restore_stats()
     manager._sync_and_select_top_proxies()
-    manager._sync_premium_proxies()  # Sync premium proxies on startup
     manager._update_dashboard_sources()
     if not manager.active_proxies:
         logger.warning(
-            "Cold start detected. Running initial fetch and validation in background..."
+            "Cold start detected; the scheduler will run one initial fetch and validation cycle."
         )
-        
-        def _cold_start_initialization():
-            """Background task for cold start initialization."""
-            try:
-                initial_jobs = manager._load_fetcher_jobs()
-                manager.fetcher_jobs = initial_jobs
-                fetch_futures = [
-                    manager.fetch_executor.submit(manager._fetch_and_parse_source, job)
-                    for job in initial_jobs
-                ]
-
-                all_proxies = []
-                for future in as_completed(fetch_futures):
-                    try:
-                        proxies = future.result()
-                        if proxies:
-                            all_proxies.extend(proxies)
-                    except Exception as e:
-                        logger.error(f"Initial fetcher job failed: {e}")
-
-                if all_proxies:
-                    unique_proxies_set = {tuple(p) for p in all_proxies}
-                    unique_proxies_list = [list(p) for p in unique_proxies_set]
-                    logger.info(
-                        f"Initial fetch: Consolidated {len(unique_proxies_list)} unique proxies for insertion."
-                    )
-                    manager.db.insert_proxies(unique_proxies_list)
-
-                manager._run_validation_cycle()
-                logger.info("Cold start initialization complete.")
-            except Exception as e:
-                logger.error(f"Cold start initialization failed: {e}")
-        
-        # Run initialization in background thread to avoid blocking server startup
-        threading.Thread(target=_cold_start_initialization, daemon=True).start()
-        logger.info("Server starting immediately, cold start running in background.")
     return manager
 
 def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="SmartProxy Service")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging for validation")
-    restore_group = parser.add_mutually_exclusive_group()
-    restore_group.add_argument(
+    parser.add_argument(
         "--no-restore",
         action="store_true",
         help="Skip JSON restore and write to isolated experiment state",
     )
-    restore_group.add_argument(
-        "--fresh-scoring",
-        action="store_true",
-        help="Skip all reputation hydration/writes and use isolated scoring state",
-    )
     args = parser.parse_args()
     
-    # Setup logging from config after CLI flags are known. The logger module has a
-    # project-local import-time default so tests and direct imports remain safe.
+    # Persistent sinks are initialized only by the process entry point. Imports
+    # and tests therefore cannot write into operational log files.
     log_level = "DEBUG" if args.debug else "INFO"
     configure_logging_from_file(CONFIG_FILE_PATH, log_level)
     if args.debug:
@@ -101,13 +58,7 @@ def main():
     logging.getLogger("werkzeug").setLevel(logging.WARNING)
     
     # Initialize ProxyManager
-    restore_mode = (
-        "fresh-scoring"
-        if args.fresh_scoring
-        else "no-restore"
-        if args.no_restore
-        else "normal"
-    )
+    restore_mode = "no-restore" if args.no_restore else "normal"
     logger.info("Selected scoring restore mode: {}", restore_mode)
     proxy_manager = load_proxy_manager(CONFIG_FILE_PATH, restore_mode=restore_mode)
     proxy_manager.debug_mode = args.debug
@@ -115,8 +66,12 @@ def main():
     # Create Flask App
     app = create_app(proxy_manager)
 
-    # Shutdown handler
+    shutdown_started = threading.Event()
+
     def handle_shutdown(signum, frame):
+        if shutdown_started.is_set():
+            return
+        shutdown_started.set()
         logger.info("Shutdown signal received. Performing graceful shutdown...")
         proxy_manager.stop_scheduler()
         sys.exit(0)
@@ -125,9 +80,21 @@ def main():
     signal.signal(signal.SIGTERM, handle_shutdown)
     
     proxy_manager.start_scheduler()
-    
-    # Run server
-    app.run(host="0.0.0.0", port=proxy_manager.server_port, debug=False)
+    try:
+        if args.debug:
+            app.run(host="0.0.0.0", port=proxy_manager.server_port, debug=False)
+        else:
+            # One process keeps lease and scoring state coherent.
+            serve(
+                app,
+                host="0.0.0.0",
+                port=proxy_manager.server_port,
+                threads=proxy_manager.production_threads,
+            )
+    finally:
+        if not shutdown_started.is_set():
+            shutdown_started.set()
+            proxy_manager.stop_scheduler()
 
 if __name__ == "__main__":
     main()

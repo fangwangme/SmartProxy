@@ -49,7 +49,10 @@ class TestIPRestriction(unittest.TestCase):
     def test_external_endpoint_always_allows_localhost(self):
         """Localhost should access external endpoints even when not in allowed_ips."""
         self.mock_proxy_manager.allowed_ips = ["192.168.1.1"]
-        self.mock_proxy_manager.get_proxy.return_value = "http://proxy:8080"
+        self.mock_proxy_manager.allocate_proxy.return_value = {
+            "proxy": "http://proxy:8080",
+            "source": "default",
+        }
 
         response = self.client.get(
             "/get-proxy?source=default", environ_overrides={"REMOTE_ADDR": "127.0.0.1"}
@@ -61,7 +64,14 @@ class TestIPRestriction(unittest.TestCase):
         """Internal endpoints should reject all non-local clients."""
         self.mock_proxy_manager.allowed_ips = ["8.8.8.8"]
 
-        for path in ["/health", "/metrics", "/reload-sources", "/backup-stats"]:
+        for path in [
+            "/health",
+            "/live",
+            "/ready",
+            "/metrics",
+            "/reload-sources",
+            "/backup-stats",
+        ]:
             response = self.client.get(
                 path, environ_overrides={"REMOTE_ADDR": "8.8.8.8"}
             )
@@ -86,7 +96,10 @@ class TestIPRestriction(unittest.TestCase):
         self.mock_proxy_manager.trust_proxy_headers = True
         self.mock_proxy_manager.trusted_proxy_ips = ["10.0.0.10"]
         self.mock_proxy_manager.allowed_ips = ["8.8.8.8"]
-        self.mock_proxy_manager.get_proxy.return_value = "http://proxy:8080"
+        self.mock_proxy_manager.allocate_proxy.return_value = {
+            "proxy": "http://proxy:8080",
+            "source": "default",
+        }
 
         response = self.client.get(
             "/get-proxy?source=default",
@@ -95,6 +108,101 @@ class TestIPRestriction(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 200)
+
+    def test_prepended_forwarded_value_cannot_override_trusted_boundary(self):
+        self.mock_proxy_manager.trust_proxy_headers = True
+        self.mock_proxy_manager.trusted_proxy_ips = ["192.0.2.10", "192.0.2.11"]
+        self.mock_proxy_manager.allowed_ips = ["198.51.100.20"]
+        self.mock_proxy_manager.allocate_proxy.return_value = {
+            "proxy": "http://proxy:8080",
+            "source": "default",
+        }
+
+        response = self.client.get(
+            "/get-proxy?source=default",
+            headers={
+                "X-Forwarded-For": "203.0.113.99, 198.51.100.20, 192.0.2.11"
+            },
+            environ_overrides={"REMOTE_ADDR": "192.0.2.10"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+    def test_malformed_forwarded_address_is_rejected(self):
+        self.mock_proxy_manager.trust_proxy_headers = True
+        self.mock_proxy_manager.trusted_proxy_ips = ["192.0.2.10"]
+        self.mock_proxy_manager.allowed_ips = ["198.51.100.20"]
+
+        response = self.client.get(
+            "/get-proxy?source=default",
+            headers={"X-Forwarded-For": "198.51.100.20, not-an-address"},
+            environ_overrides={"REMOTE_ADDR": "192.0.2.10"},
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_malformed_forwarded_chain_fails_closed_when_proxy_is_allowed(self):
+        self.mock_proxy_manager.trust_proxy_headers = True
+        self.mock_proxy_manager.trusted_proxy_ips = ["192.0.2.10"]
+        self.mock_proxy_manager.allowed_ips = ["192.0.2.10", "198.51.100.20"]
+        self.mock_proxy_manager.allocate_proxy.return_value = {
+            "proxy": "http://proxy:8080",
+            "source": "default",
+        }
+
+        response = self.client.get(
+            "/get-proxy?source=default",
+            headers={"X-Forwarded-For": "198.51.100.20, malformed"},
+            environ_overrides={"REMOTE_ADDR": "192.0.2.10"},
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_ipv4_mapped_loopback_can_reach_internal_probe(self):
+        self.mock_proxy_manager.liveness_status.return_value = {"status": "alive"}
+
+        response = self.client.get(
+            "/live",
+            environ_overrides={"REMOTE_ADDR": "::ffff:127.0.0.1"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+    def test_multiple_trusted_forwarding_hops_resolve_first_untrusted_boundary(self):
+        self.mock_proxy_manager.trust_proxy_headers = True
+        self.mock_proxy_manager.trusted_proxy_ips = [
+            "192.0.2.10",
+            "192.0.2.11",
+            "192.0.2.12",
+        ]
+        self.mock_proxy_manager.allowed_ips = ["198.51.100.20"]
+        self.mock_proxy_manager.allocate_proxy.return_value = {
+            "proxy": "http://proxy:8080",
+            "source": "default",
+        }
+
+        response = self.client.get(
+            "/get-proxy?source=default",
+            headers={
+                "X-Forwarded-For": "198.51.100.20, 192.0.2.12, 192.0.2.11"
+            },
+            environ_overrides={"REMOTE_ADDR": "192.0.2.10"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+    def test_untrusted_direct_peer_cannot_activate_forwarded_headers(self):
+        self.mock_proxy_manager.trust_proxy_headers = True
+        self.mock_proxy_manager.trusted_proxy_ips = ["192.0.2.10"]
+        self.mock_proxy_manager.allowed_ips = ["198.51.100.20"]
+
+        response = self.client.get(
+            "/get-proxy?source=default",
+            headers={"X-Forwarded-For": "198.51.100.20"},
+            environ_overrides={"REMOTE_ADDR": "203.0.113.40"},
+        )
+
+        self.assertEqual(response.status_code, 403)
 
     def test_trusted_proxy_x_forwarded_for_still_cannot_bypass_internal_endpoint(self):
         """Internal endpoints use REMOTE_ADDR, not the resolved client IP."""

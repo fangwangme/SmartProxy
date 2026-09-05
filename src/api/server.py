@@ -1,23 +1,26 @@
 # -*- coding: utf-8 -*-
 import os
-import sys
-import argparse
-import signal
-import threading
+import ipaddress
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
 
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
-from src.utils.logger import logger, setup_logging
+from src.utils.logger import logger
 from src.core.proxy_manager import (
     DEFAULT_MAX_FEEDBACK_LATENCY_MS,
     ProxyManager,
 )
 
 LOCALHOST_IPS = {"127.0.0.1", "::1"}
-INTERNAL_ONLY_ENDPOINTS = {"/health", "/metrics", "/reload-sources", "/backup-stats"}
+INTERNAL_ONLY_ENDPOINTS = {
+    "/health",
+    "/live",
+    "/ready",
+    "/metrics",
+    "/reload-sources",
+    "/backup-stats",
+}
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -27,6 +30,21 @@ def _normalize_path(path: str) -> str:
     return path.rstrip("/")
 
 
+def _prometheus_label(value: object) -> str:
+    return str(value).replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+
+
+def _is_loopback_address(value: str) -> bool:
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    if address.is_loopback:
+        return True
+    mapped = getattr(address, "ipv4_mapped", None)
+    return bool(mapped and mapped.is_loopback)
+
+
 def _get_client_ip(proxy_manager: ProxyManager) -> str:
     """Resolve the client IP, trusting proxy headers only from configured proxies."""
     remote_addr = request.remote_addr or ""
@@ -34,8 +52,30 @@ def _get_client_ip(proxy_manager: ProxyManager) -> str:
     trusted_proxy_ips = set(getattr(proxy_manager, "trusted_proxy_ips", []) or [])
     forwarded_for = request.headers.get("X-Forwarded-For", "")
 
+    try:
+        remote_addr = str(ipaddress.ip_address(remote_addr))
+    except ValueError:
+        return ""
+
     if trust_proxy_headers and remote_addr in trusted_proxy_ips and forwarded_for:
-        return forwarded_for.split(",")[0].strip()
+        forwarded = []
+        try:
+            forwarded = [
+                str(ipaddress.ip_address(value.strip()))
+                for value in forwarded_for.split(",")
+            ]
+        except ValueError:
+            # A malformed chain has no trustworthy boundary. Returning the
+            # trusted direct peer could accidentally authorize every client
+            # behind it when that peer is also in allowed_ips.
+            return ""
+        # Walk from the trusted direct peer toward the client. The first
+        # untrusted address at the boundary is authoritative; attacker-
+        # prepended values farther left cannot override it.
+        for address in reversed(forwarded):
+            if address not in trusted_proxy_ips:
+                return address
+        return forwarded[0] if forwarded else remote_addr
     return remote_addr
 
 
@@ -49,7 +89,9 @@ def create_app(proxy_manager: ProxyManager):
         # (see get_timeseries_stats_route), so the dashboard can filter
         # "now"-relative windows against the server's clock instead of the
         # viewer's.
-        response.headers["X-Server-Time"] = datetime.now().strftime("%H:%M")
+        response.headers["X-Server-Time"] = datetime.now().astimezone().isoformat(
+            timespec="seconds"
+        )
         return response
 
     @app.before_request
@@ -61,16 +103,13 @@ def create_app(proxy_manager: ProxyManager):
         - All other endpoints: configured allowed IPs + localhost.
         """
         path = _normalize_path(request.path)
-        x_forwarded_for = request.headers.get("X-Forwarded-For", "")
         remote_addr = request.remote_addr or ""
         client_ip = _get_client_ip(proxy_manager)
 
         if path in INTERNAL_ONLY_ENDPOINTS:
-            if remote_addr not in LOCALHOST_IPS:
+            if not _is_loopback_address(remote_addr):
                 logger.warning(
-                    "Unauthorized internal API access attempt: remote_addr={} x_forwarded_for={} path={}",
-                    remote_addr,
-                    x_forwarded_for,
+                    "Unauthorized internal API access attempt: path={}",
                     request.path,
                 )
                 return (
@@ -88,22 +127,15 @@ def create_app(proxy_manager: ProxyManager):
 
         if getattr(proxy_manager, "debug_mode", False):
             logger.debug(
-                "Access check path={} remote_addr={} x_forwarded_for={} resolved_client_ip={} allowed_ips={}",
+                "Access check path={} resolved_client_authorized={}",
                 request.path,
-                remote_addr,
-                x_forwarded_for,
-                client_ip,
-                sorted(allowed_ips),
+                client_ip in allowed_ips,
             )
 
-        if client_ip not in allowed_ips:
+        if client_ip not in allowed_ips and not _is_loopback_address(client_ip):
             logger.warning(
-                "Unauthorized API access attempt: resolved_client_ip={} remote_addr={} x_forwarded_for={} path={} allowed_ips={}",
-                client_ip,
-                remote_addr,
-                x_forwarded_for,
+                "Unauthorized API access attempt: path={}",
                 request.path,
-                sorted(allowed_ips),
             )
             return (
                 jsonify(
@@ -114,28 +146,33 @@ def create_app(proxy_manager: ProxyManager):
                 403,
             )
 
-    # Store proxy_manager in app config or closure, but here passing it explicitly 
-    # to routes via closure or global usage might be cleaner if we use a blueprint.
-    # For now, let's keep it simple and register routes within this function
-    # or rely on the passed instance if we define handlers locally.
-    
-    # Actually, defining routes inside create_app captures proxy_manager in closure.
-    
     @app.route("/health", methods=["GET"])
     def health_check():
-        """Health check endpoint for monitoring."""
+        """Compatibility health endpoint: dependency-aware readiness plus counts."""
+        readiness = proxy_manager.readiness_status()
         with proxy_manager.lock:
             active_count = len(proxy_manager.active_proxies)
             premium_count = len(proxy_manager.premium_proxies)
             sources_count = len(proxy_manager.predefined_sources)
-        
-        return jsonify({
-            "status": "healthy",
+        payload = {
+            "status": "healthy" if readiness["ready"] else "degraded",
+            "ready": readiness["ready"],
+            "dependencies": readiness["dependencies"],
             "active_proxies": active_count,
             "premium_proxies": premium_count,
             "sources": sources_count,
             "is_validating": proxy_manager.is_validating,
-        })
+        }
+        return jsonify(payload), 200 if readiness["ready"] else 503
+
+    @app.route("/live", methods=["GET"])
+    def liveness_check():
+        return jsonify(proxy_manager.liveness_status()), 200
+
+    @app.route("/ready", methods=["GET"])
+    def readiness_check():
+        payload = proxy_manager.readiness_status()
+        return jsonify(payload), 200 if payload["ready"] else 503
 
     @app.route("/metrics", methods=["GET"])
     def metrics():
@@ -145,22 +182,24 @@ def create_app(proxy_manager: ProxyManager):
             premium_count = len(proxy_manager.premium_proxies)
             sources_count = len(proxy_manager.predefined_sources)
             
-            # Calculate total stats across all sources
-            total_success = 0
-            total_failure = 0
-            for source_stats in proxy_manager.source_stats.values():
-                for stat in source_stats.values():
-                    total_success += stat.get("success_count", 0)
-                    total_failure += stat.get("failure_count", 0)
+            total_success = proxy_manager.accepted_feedback_success_total
+            total_failure = proxy_manager.accepted_feedback_failure_total
+            unmatched_total = proxy_manager.unmatched_feedback_total
             outage_metrics = [
                 (
-                    str(source).replace("\\", "\\\\").replace('"', '\\"'),
+                    _prometheus_label(source),
                     1 if state.get("active") else 0,
                     int(state.get("paused_updates", 0)),
                 )
                 for source, state in proxy_manager.outage_states.items()
             ]
-        
+            validation_failure_metrics = list(
+                proxy_manager.validation_target_failures.items()
+            )
+            backup_duration = proxy_manager.last_backup_duration_s
+            manager_lock_duration = proxy_manager.last_manager_lock_hold_s
+            plan_refresh_duration = proxy_manager.last_plan_refresh_duration_s
+
         total_requests = total_success + total_failure
         success_rate = (total_success / total_requests * 100) if total_requests > 0 else 0
         outage_active_lines = "\n".join(
@@ -172,7 +211,11 @@ def create_app(proxy_manager: ProxyManager):
             for source, _, paused in outage_metrics
         )
         
-        # Prometheus text format
+        validation_failure_lines = "\n".join(
+            'smartproxy_validation_target_failures_total'
+            f'{{target_index="{target_index}",kind="{_prometheus_label(kind)}"}} {count}'
+            for (target_index, kind), count in sorted(validation_failure_metrics)
+        )
         metrics_text = f"""# HELP smartproxy_active_proxies Number of active proxies
 # TYPE smartproxy_active_proxies gauge
 smartproxy_active_proxies {active_count}
@@ -185,10 +228,14 @@ smartproxy_premium_proxies {premium_count}
 # TYPE smartproxy_sources_total gauge
 smartproxy_sources_total {sources_count}
 
-# HELP smartproxy_requests_total Total requests processed
-# TYPE smartproxy_requests_total counter
-smartproxy_requests_success_total {total_success}
-smartproxy_requests_failure_total {total_failure}
+# HELP smartproxy_feedback_accepted_total Accepted feedback requests
+# TYPE smartproxy_feedback_accepted_total counter
+smartproxy_feedback_accepted_total{{outcome="success"}} {total_success}
+smartproxy_feedback_accepted_total{{outcome="failure"}} {total_failure}
+
+# HELP smartproxy_feedback_unmatched_total Accepted feedback with no outstanding handout to close
+# TYPE smartproxy_feedback_unmatched_total counter
+smartproxy_feedback_unmatched_total {unmatched_total}
 
 # HELP smartproxy_success_rate_percent Current success rate percentage
 # TYPE smartproxy_success_rate_percent gauge
@@ -205,6 +252,22 @@ smartproxy_is_validating {1 if proxy_manager.is_validating else 0}
 # HELP smartproxy_source_outage_guard_paused_updates_total Reputation updates paused by source outage guard
 # TYPE smartproxy_source_outage_guard_paused_updates_total counter
 {outage_paused_lines}
+
+# HELP smartproxy_validation_target_failures_total Validation target failures by class
+# TYPE smartproxy_validation_target_failures_total counter
+{validation_failure_lines}
+
+# HELP smartproxy_backup_duration_seconds Duration of the most recent backup
+# TYPE smartproxy_backup_duration_seconds gauge
+smartproxy_backup_duration_seconds {backup_duration:.6f}
+
+# HELP smartproxy_manager_lock_hold_seconds Manager-lock hold time during the most recent backup snapshot
+# TYPE smartproxy_manager_lock_hold_seconds gauge
+smartproxy_manager_lock_hold_seconds {manager_lock_duration:.6f}
+
+# HELP smartproxy_plan_refresh_duration_seconds Duration of the most recent serving-plan refresh
+# TYPE smartproxy_plan_refresh_duration_seconds gauge
+smartproxy_plan_refresh_duration_seconds {plan_refresh_duration:.6f}
 """
         return metrics_text, 200, {"Content-Type": "text/plain; charset=utf-8"}
 
@@ -213,10 +276,18 @@ smartproxy_is_validating {1 if proxy_manager.is_validating else 0}
         source = request.args.get("source")
         if not source:
             return jsonify({"error": "Query parameter 'source' is required."}), 400
-        proxy_url = proxy_manager.get_proxy(source)
-        if proxy_url:
+        handout = proxy_manager.allocate_proxy(source)
+        if handout:
+            proxy_url = handout["proxy"]
             protocol = proxy_url.split("://", 1)[0] if "://" in proxy_url else "http"
-            return jsonify({"http": proxy_url, "https": proxy_url, "protocol": protocol})
+            return jsonify(
+                {
+                    "http": proxy_url,
+                    "https": proxy_url,
+                    "protocol": protocol,
+                    "source": handout["source"],
+                }
+            )
         else:
             return (
                 jsonify(
@@ -228,10 +299,19 @@ smartproxy_is_validating {1 if proxy_manager.is_validating else 0}
     @app.route("/get-premium-proxy", methods=["GET"])
     def get_premium_proxy_route():
         """Get a premium (highest quality) proxy for Playwright and high-reliability use cases."""
-        proxy_url = proxy_manager.get_premium_proxy()
-        if proxy_url:
+        handout = proxy_manager.allocate_premium_proxy()
+        if handout:
+            proxy_url = handout["proxy"]
             protocol = proxy_url.split("://", 1)[0] if "://" in proxy_url else "http"
-            return jsonify({"http": proxy_url, "https": proxy_url, "protocol": protocol, "premium": True})
+            return jsonify(
+                {
+                    "http": proxy_url,
+                    "https": proxy_url,
+                    "protocol": protocol,
+                    "premium": True,
+                    "source": handout["source"],
+                }
+            )
         else:
             return (
                 jsonify(
@@ -251,9 +331,6 @@ smartproxy_is_validating {1 if proxy_manager.is_validating else 0}
         status_code = data.get("status")
         resp_time = data.get("response_time_ms")
         failure_kind = data.get("failure_kind")
-        logger.debug(
-            f"Handled feedback: {source} - {status_code} - {proxy_url} - {resp_time}"
-        )
 
         # Validate strictly at the boundary. Anything that reaches
         # process_feedback is written into persistent scoring state and is
@@ -313,7 +390,9 @@ smartproxy_is_validating {1 if proxy_manager.is_validating else 0}
                 400,
             )
 
-        proxy_manager.process_feedback(source, proxy_url, status_code, resp_time, failure_kind)
+        proxy_manager.process_feedback(
+            source, proxy_url, status_code, resp_time, failure_kind
+        )
         return jsonify({"message": "Feedback received."})
 
     @app.route("/reload-sources", methods=["POST"])
@@ -374,7 +453,21 @@ smartproxy_is_validating {1 if proxy_manager.is_validating else 0}
                 jsonify({"error": "'source' and 'date' query parameters are required."}),
                 400,
             )
-        stats = proxy_manager.db.get_daily_stats(source, date)
+        if len(source) > 50:
+            return jsonify({"error": "'source' is too long."}), 400
+        try:
+            datetime.strptime(date, "%Y-%m-%d")
+        except ValueError:
+            return jsonify({"error": "Invalid date format. Use YYYY-MM-DD."}), 400
+        try:
+            stats = proxy_manager.db.get_daily_stats(source, date)
+        except Exception:
+            stats = None
+        if stats is None:
+            return (
+                jsonify({"status": "error", "error": "Statistics backend unavailable."}),
+                503,
+            )
         if stats:
             total = stats["total_success"] + stats["total_failure"]
             success_rate = (stats["total_success"] / total * 100) if total > 0 else 0
@@ -400,9 +493,22 @@ smartproxy_is_validating {1 if proxy_manager.is_validating else 0}
         valid_intervals = [1, 2, 5, 15, 60]
         if interval not in valid_intervals:
             return jsonify({"error": f"'interval' must be one of {valid_intervals}."}), 400
-        
-        # Get raw stats from DB (sparse data)
-        stats = proxy_manager.db.get_timeseries_stats(source, date_str, interval)
+        if len(source) > 50:
+            return jsonify({"error": "'source' is too long."}), 400
+        try:
+            start_date = datetime.strptime(date_str, "%Y-%m-%d")
+        except ValueError:
+            return jsonify({"error": "Invalid date format. Use YYYY-MM-DD."}), 400
+
+        try:
+            stats = proxy_manager.db.get_timeseries_stats(source, date_str, interval)
+        except Exception:
+            stats = None
+        if stats is None:
+            return (
+                jsonify({"status": "error", "error": "Statistics backend unavailable."}),
+                503,
+            )
         
         # Convert stats to dictionary for O(1) lookup
         # Key: HH:MM string, Value: row data
@@ -414,11 +520,6 @@ smartproxy_is_validating {1 if proxy_manager.is_validating else 0}
 
         # Generate full list of time slots for the day
         results = []
-        try:
-            start_date = datetime.strptime(date_str, "%Y-%m-%d")
-        except ValueError:
-            return jsonify({"error": "Invalid date format. Use YYYY-MM-DD."}), 400
-
         current_time = start_date
         end_time = start_date + timedelta(days=1)
         
@@ -469,9 +570,17 @@ smartproxy_is_validating {1 if proxy_manager.is_validating else 0}
         except ValueError:
             return jsonify({"error": "Invalid date format. Use YYYY-MM-DD."}), 400
 
-        raw_overview = proxy_manager.db.get_overview_stats(date_str, interval)
-        daily_rows = raw_overview.get("daily", []) if raw_overview else []
-        timeseries_rows = raw_overview.get("timeseries", []) if raw_overview else []
+        try:
+            raw_overview = proxy_manager.db.get_overview_stats(date_str, interval)
+        except Exception:
+            raw_overview = None
+        if raw_overview is None:
+            return (
+                jsonify({"status": "error", "error": "Statistics backend unavailable."}),
+                503,
+            )
+        daily_rows = raw_overview.get("daily", [])
+        timeseries_rows = raw_overview.get("timeseries", [])
 
         daily_by_source = {}
         for row in daily_rows:

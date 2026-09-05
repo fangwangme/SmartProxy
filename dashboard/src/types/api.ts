@@ -11,15 +11,9 @@ export const INTERVALS = [1, 2, 5, 15, 60] as const
 /** The server hard-validates `interval` against exactly this set. */
 export type Interval = (typeof INTERVALS)[number]
 
-export const isInterval = (value: number): value is Interval =>
-  (INTERVALS as readonly number[]).includes(value)
-
 export const TIME_WINDOWS = ['1h', '2h', '5h', '24h'] as const
 
 export type TimeWindow = (typeof TIME_WINDOWS)[number]
-
-export const isTimeWindow = (value: string): value is TimeWindow =>
-  (TIME_WINDOWS as readonly string[]).includes(value)
 
 /** `GET /api/stats/daily`, and the `daily` member of an overview source. */
 export interface DailyStats {

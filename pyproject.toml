@@ -1,6 +1,6 @@
 [project]
 name = "smartproxy"
-version = "3.3.5"
+version = "3.3.6"
 description = "An intelligent, self-adapting proxy pool service"
 requires-python = ">=3.14"
 dependencies = [
@@ -10,6 +10,7 @@ dependencies = [
     "aiohttp==3.13.3",
     "aiohttp-socks==0.10.1",
     "loguru==0.7.3",
+    "waitress==3.0.2",
 ]
 
 [dependency-groups]

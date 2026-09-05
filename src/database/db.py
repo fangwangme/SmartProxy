@@ -1,12 +1,27 @@
 # -*- coding: utf-8 -*-
 import sys
 import configparser
+import random
+import time
+import uuid
 from datetime import datetime, timezone
 import psycopg2
 import psycopg2.pool
 import psycopg2.extras
 from typing import List, Dict, Optional, Set, Tuple
 from src.utils.logger import logger
+
+
+RETRYABLE_SQLSTATES = frozenset({"40001", "40P01"})
+
+
+class DatabaseWriteError(RuntimeError):
+    """A database mutation that did not commit."""
+
+    def __init__(self, operation: str, cause: Exception):
+        super().__init__(f"Database write failed during {operation}")
+        self.operation = operation
+        self.cause = cause
 
 class DatabaseManager:
     """Handles all interactions with the PostgreSQL database."""
@@ -15,10 +30,17 @@ class DatabaseManager:
         try:
             # OPTIMIZATION: Increased maxconn to better handle concurrent workers.
             # The ideal number depends on your DB server's capacity.
+            min_connections = config.getint("database", "min_connections", fallback=2)
             max_connections = config.getint("database", "max_connections", fallback=50)
+            self.write_max_retries = config.getint(
+                "database", "write_max_retries", fallback=3
+            )
+            self.write_retry_base_ms = config.getint(
+                "database", "write_retry_base_ms", fallback=25
+            )
             # Use ThreadedConnectionPool for thread-safe access in multi-threaded environment
             self.pool = psycopg2.pool.ThreadedConnectionPool(
-                minconn=2,
+                minconn=min_connections,
                 maxconn=max_connections,
                 host=config.get("database", "host"),
                 port=config.get("database", "port"),
@@ -33,7 +55,7 @@ class DatabaseManager:
             logger.error(f"Database configuration error or connection failed: {e}")
             sys.exit(1)
 
-    def _execute(self, query, params=None, fetch=None):
+    def _execute(self, query, params=None, fetch=None, operation="query"):
         """A helper to execute queries using a connection from the pool."""
         conn = None
         try:
@@ -45,60 +67,98 @@ class DatabaseManager:
                 if fetch == "all":
                     return cur.fetchall()
                 conn.commit()
+                return True
         except psycopg2.Error as e:
             logger.error(f"Database query failed: {e}")
             if conn:
                 conn.rollback()
-            return None
+            if fetch:
+                return None
+            raise DatabaseWriteError(operation, e) from e
+        except Exception as e:
+            logger.error(
+                "Database operation '{}' failed with {}.",
+                operation,
+                type(e).__name__,
+            )
+            if conn:
+                conn.rollback()
+            if fetch:
+                return None
+            raise DatabaseWriteError(operation, e) from e
         finally:
             if conn:
                 self.pool.putconn(conn)
 
-    def insert_proxies(self, proxies: List[Tuple[str, str, int]]):
+    def _run_transaction(self, operation, callback, max_attempts=None):
+        """Run one mutation with bounded retry for transaction-level conflicts."""
+        attempts = max(1, getattr(self, "write_max_retries", 3) + 1)
+        if max_attempts is not None:
+            attempts = min(attempts, max(1, int(max_attempts)))
+        base_ms = max(0, getattr(self, "write_retry_base_ms", 25))
+        for attempt in range(attempts):
+            conn = None
+            retry_delay = None
+            try:
+                conn = self.pool.getconn()
+                callback(conn)
+                conn.commit()
+                return True
+            except psycopg2.Error as error:
+                if conn:
+                    conn.rollback()
+                retryable = getattr(error, "pgcode", None) in RETRYABLE_SQLSTATES
+                if not retryable or attempt + 1 >= attempts:
+                    logger.error(
+                        "Database mutation '{}' failed after {} attempt(s), sqlstate={}.",
+                        operation,
+                        attempt + 1,
+                        getattr(error, "pgcode", None),
+                    )
+                    raise DatabaseWriteError(operation, error) from error
+                retry_delay = base_ms * (2**attempt) / 1000.0
+                retry_delay += random.uniform(
+                    0.0, retry_delay * 0.25 if retry_delay else 0.0
+                )
+                logger.warning(
+                    "Retrying database mutation '{}' after sqlstate={} (attempt {}/{}).",
+                    operation,
+                    getattr(error, "pgcode", None),
+                    attempt + 1,
+                    attempts,
+                )
+            except Exception as error:
+                if conn:
+                    conn.rollback()
+                raise DatabaseWriteError(operation, error) from error
+            finally:
+                if conn:
+                    self.pool.putconn(conn)
+            if retry_delay is not None:
+                time.sleep(retry_delay)
+
+    def ping(self) -> bool:
+        """Return whether a lightweight database readiness query succeeds."""
+        return self._execute("SELECT 1;", fetch="one") is not None
+
+    def insert_proxies(self, proxies: List[Tuple[str, str, int]]) -> bool:
         """Inserts a list of proxies, ignoring duplicates."""
         if not proxies:
-            return
+            return True
         query = "INSERT INTO proxies (protocol, ip, port) VALUES %s ON CONFLICT (protocol, ip, port) DO NOTHING;"
-        conn = None
-        try:
-            conn = self.pool.getconn()
+        ordered = sorted(tuple(row) for row in proxies)
+
+        def write(conn):
             with conn.cursor() as cur:
                 # page_size defaults to 100, which turns a 5k-row insert into
                 # 50 round trips.
-                psycopg2.extras.execute_values(cur, query, proxies, page_size=1000)
-                conn.commit()
+                psycopg2.extras.execute_values(cur, query, ordered, page_size=1000)
                 # NOTE: cursor.rowcount is deliberately not reported here.
                 # psycopg2 documents that after execute_values it "will not
                 # contain a total result" - it only reflects the last page.
-                logger.info(f"Committed {len(proxies)} proxy rows for insertion.")
-        except Exception as e:
-            logger.error(f"Database batch insert failed: {e}")
-            if conn:
-                conn.rollback()
-        finally:
-            if conn:
-                self.pool.putconn(conn)
+                logger.info(f"Committed {len(ordered)} proxy rows for insertion.")
 
-    def get_proxies_to_validate(self, interval_minutes=30, limit=2000) -> List[Tuple]:
-        """
-        Combined validation queue (never-validated + live proxies due for a
-        re-check).
-
-        Prefer get_new_proxies_to_validate / get_active_proxies_to_revalidate,
-        which let the caller budget the two populations explicitly. This method
-        is kept for callers that want one undifferentiated batch; the ORDER BY
-        at least makes which rows the LIMIT keeps deterministic instead of
-        whatever the planner returns first.
-        """
-        query = """
-            SELECT id, protocol, ip, port
-            FROM proxies
-            WHERE last_validated_at IS NULL
-               OR (is_active = true AND last_validated_at < NOW() - INTERVAL '%s minutes')
-            ORDER BY last_validated_at ASC NULLS FIRST, id ASC
-            LIMIT %s;
-        """
-        return self._execute(query, (interval_minutes, limit), fetch="all") or []
+        return self._run_transaction("insert_proxies", write)
 
     def get_new_proxies_to_validate(self, limit: int) -> List[Tuple]:
         """Proxies that have never been validated, oldest discovery first."""
@@ -176,43 +236,54 @@ class DatabaseManager:
         }
         return self._execute(query, params, fetch="all") or []
 
-    def update_validation_counters(self, proxy_ids: List[int], window_minutes: int):
-        """
-        Updates the validation counters for a batch of proxies before they are validated.
-        Resets the counter and window if the window has expired.
-        """
-        if not proxy_ids:
-            return
-
-        query = """
-            UPDATE proxies
-            SET
-                validation_attempts_in_window = CASE
-                    WHEN window_start_time IS NULL OR NOW() > window_start_time + INTERVAL '%(window)s minutes'
-                    THEN 1
-                    ELSE validation_attempts_in_window + 1
-                END,
-                window_start_time = CASE
-                    WHEN window_start_time IS NULL OR NOW() > window_start_time + INTERVAL '%(window)s minutes'
-                    THEN NOW()
-                    ELSE window_start_time
-                END
-            WHERE id = ANY(%(ids)s);
-        """
-        params = {"window": window_minutes, "ids": proxy_ids}
-        self._execute(query, params)
-        logger.debug(f"Updated validation counters for {len(proxy_ids)} proxies.")
-
     def batch_update_proxy_results(
-        self, success_proxies: List[Dict], failure_proxy_ids: List[int]
+        self,
+        success_proxies: List[Dict],
+        failure_proxy_ids: List[int],
+        validation_window_minutes: int,
     ):
         """
-        OPTIMIZATION: Batch update results of a validation cycle.
+        Commit validation accounting and results in one transaction.
         """
-        conn = None
-        try:
-            conn = self.pool.getconn()
+        success_proxies = sorted(success_proxies, key=lambda row: int(row["id"]))
+        failure_proxy_ids = sorted(set(int(proxy_id) for proxy_id in failure_proxy_ids))
+        proxy_ids = sorted(
+            {int(row["id"]) for row in success_proxies} | set(failure_proxy_ids)
+        )
+
+        def write(conn):
             with conn.cursor() as cur:
+                if proxy_ids:
+                    cur.execute(
+                        "SELECT id FROM proxies WHERE id = ANY(%s) "
+                        "ORDER BY id FOR UPDATE;",
+                        (proxy_ids,),
+                    )
+                    cur.execute(
+                        """
+                        UPDATE proxies
+                        SET
+                            validation_attempts_in_window = CASE
+                                WHEN window_start_time IS NULL
+                                  OR NOW() > window_start_time
+                                    + INTERVAL '%(window)s minutes'
+                                THEN 1
+                                ELSE validation_attempts_in_window + 1
+                            END,
+                            window_start_time = CASE
+                                WHEN window_start_time IS NULL
+                                  OR NOW() > window_start_time
+                                    + INTERVAL '%(window)s minutes'
+                                THEN NOW()
+                                ELSE window_start_time
+                            END
+                        WHERE id = ANY(%(ids)s);
+                        """,
+                        {
+                            "window": validation_window_minutes,
+                            "ids": proxy_ids,
+                        },
+                    )
                 # Batch update successful proxies
                 if success_proxies:
                     update_query_success = """
@@ -251,14 +322,7 @@ class DatabaseManager:
                         f"Batch updated {len(failure_proxy_ids)} failed proxies."
                     )
 
-                conn.commit()
-        except psycopg2.Error as e:
-            logger.error(f"Database batch update for validation results failed: {e}")
-            if conn:
-                conn.rollback()
-        finally:
-            if conn:
-                self.pool.putconn(conn)
+        return self._run_transaction("batch_update_proxy_results", write)
 
     def get_active_proxies(self) -> Optional[Set[str]]:
         query = "SELECT protocol, ip, port FROM proxies WHERE is_active = true;"
@@ -267,111 +331,66 @@ class DatabaseManager:
             return None
         return {f"{row['protocol']}://{row['ip']}:{row['port']}" for row in rows}
 
-    def get_active_feedback_history(self) -> Optional[Dict[str, Dict]]:
-        """
-        Persisted feedback counters for every live proxy that has any.
-
-        This is what makes eviction from the in-memory stats pool survivable.
-        The pool caps retained history, so a proxy that failed its way out and
-        later passes validation again is re-seeded from scratch; without a
-        durable record that re-seed hands it a clean sheet it never earned.
-
-        Returns None if the query failed, so the caller can tell "no history"
-        from "we do not know", and seed conservatively rather than wrongly.
-        """
-        query = """
-            SELECT protocol, ip, port,
-                   feedback_success_count,
-                   feedback_failure_count,
-                   EXTRACT(EPOCH FROM feedback_last_ts) AS feedback_last_ts
-            FROM proxies
-            WHERE is_active = true
-              AND (feedback_success_count > 0 OR feedback_failure_count > 0);
-        """
-        rows = self._execute(query, fetch="all")
+    def get_source_backoff_states(self) -> Optional[Dict[str, Dict]]:
+        rows = self._execute(
+            """
+            SELECT source_name, failure_count,
+                   EXTRACT(EPOCH FROM next_attempt_at) AS next_attempt_at,
+                   failure_class
+            FROM proxy_source_fetch_state
+            ORDER BY source_name;
+            """,
+            fetch="all",
+        )
         if rows is None:
             return None
-        history = {}
-        for row in rows:
-            url = f"{row['protocol']}://{row['ip']}:{row['port']}"
-            last_ts = row["feedback_last_ts"]
-            history[url] = {
-                "success_count": int(row["feedback_success_count"] or 0),
-                "failure_count": int(row["feedback_failure_count"] or 0),
-                "last_feedback_ts": float(last_ts) if last_ts is not None else None,
+        return {
+            row["source_name"]: {
+                "failure_count": int(row["failure_count"]),
+                "next_attempt_at": float(row["next_attempt_at"]),
+                "failure_class": row["failure_class"],
             }
-        return history
+            for row in rows
+        }
 
-    def upsert_proxy_feedback_history(self, rows: List[Tuple]) -> bool:
-        """
-        Write absolute feedback totals for a batch of proxies.
+    def upsert_source_backoff(
+        self, source_name: str, failure_count: int, next_attempt_at: float,
+        failure_class: str
+    ) -> bool:
+        return self._execute(
+            """
+            INSERT INTO proxy_source_fetch_state (
+                source_name, failure_count, next_attempt_at, failure_class
+            ) VALUES (%s, %s, %s, %s)
+            ON CONFLICT (source_name) DO UPDATE SET
+                failure_count = EXCLUDED.failure_count,
+                next_attempt_at = EXCLUDED.next_attempt_at,
+                failure_class = EXCLUDED.failure_class;
+            """,
+            (
+                source_name,
+                failure_count,
+                datetime.fromtimestamp(next_attempt_at, tz=timezone.utc),
+                failure_class,
+            ),
+            operation="upsert_source_backoff",
+        )
 
-        Absolute rather than incremental on purpose: the counters live in
-        memory and are written back periodically, so a write that is lost to a
-        transient DB error is corrected by the next one instead of leaving the
-        stored total permanently short.
+    def clear_source_backoff(self, source_name: str) -> bool:
+        return self._execute(
+            "DELETE FROM proxy_source_fetch_state WHERE source_name = %s;",
+            (source_name,),
+            operation="clear_source_backoff",
+        )
 
-        Each row is (protocol, ip, port, success_count, failure_count,
-        last_feedback_ts) where the timestamp is Unix seconds or None.
-        """
-        if not rows:
-            return True
-        query = """
-            UPDATE proxies SET
-                feedback_success_count = GREATEST(
-                    proxies.feedback_success_count, data.success_count
-                ),
-                feedback_failure_count = GREATEST(
-                    proxies.feedback_failure_count, data.failure_count
-                ),
-                feedback_last_ts = GREATEST(
-                    proxies.feedback_last_ts, data.last_ts
-                )
-            FROM (VALUES %s) AS data(protocol, ip, port, success_count, failure_count, last_ts)
-            WHERE proxies.protocol = data.protocol
-              AND proxies.ip = data.ip
-              AND proxies.port = data.port;
-        """
-        values = []
-        for protocol, ip, port, success_count, failure_count, last_ts in rows:
-            timestamp = (
-                datetime.fromtimestamp(last_ts, tz=timezone.utc)
-                if last_ts is not None
-                else None
-            )
-            values.append(
-                (protocol, ip, int(port), int(success_count), int(failure_count), timestamp)
-            )
-
-        conn = None
-        try:
-            conn = self.pool.getconn()
-            with conn.cursor() as cur:
-                psycopg2.extras.execute_values(
-                    cur,
-                    query,
-                    values,
-                    # Explicit casts: a VALUES list sends these as "unknown",
-                    # and PostgreSQL has no conversion from unknown to
-                    # timestamptz when it is only ever assigned, never compared.
-                    template="(%s::varchar, %s::varchar, %s::int, %s::int, %s::int, %s::timestamptz)",
-                    page_size=1000,
-                )
-                conn.commit()
-            logger.debug(f"Persisted feedback history for {len(values)} proxies.")
-            return True
-        except psycopg2.Error as e:
-            logger.error(f"Failed to persist proxy feedback history: {e}")
-            if conn:
-                conn.rollback()
-            return False
-        finally:
-            if conn:
-                self.pool.putconn(conn)
-
-    def flush_feedback_stats(self, stats_buffer: List[Tuple]):
+    def flush_feedback_stats(
+        self,
+        stats_buffer: List[Tuple],
+        flush_id: Optional[str] = None,
+        deadline: Optional[float] = None,
+    ) -> bool:
         if not stats_buffer:
-            return
+            return True
         query = """
             INSERT INTO source_stats_by_minute (minute, source_name, success_count, failure_count)
             VALUES %s
@@ -379,25 +398,66 @@ class DatabaseManager:
                 success_count = source_stats_by_minute.success_count + EXCLUDED.success_count,
                 failure_count = source_stats_by_minute.failure_count + EXCLUDED.failure_count;
         """
-        conn = None
-        try:
-            conn = self.pool.getconn()
+        ordered = sorted(stats_buffer, key=lambda row: (row[0], row[1]))
+        flush_id = flush_id or str(uuid.uuid4())
+
+        def write(conn):
             with conn.cursor() as cur:
-                psycopg2.extras.execute_values(cur, query, stats_buffer)
-                conn.commit()
+                def set_remaining_statement_timeout():
+                    if deadline is None:
+                        return
+                    remaining_ms = int((deadline - time.monotonic()) * 1000)
+                    if remaining_ms <= 0:
+                        raise TimeoutError(
+                            "feedback flush shutdown deadline exhausted"
+                        )
+                    cur.execute(
+                        "SET LOCAL statement_timeout = %s;",
+                        (remaining_ms,),
+                    )
+
+                set_remaining_statement_timeout()
+                cur.execute(
+                    """
+                    INSERT INTO feedback_flush_commits (flush_id)
+                    VALUES (%s::uuid)
+                    ON CONFLICT (flush_id) DO NOTHING
+                    RETURNING flush_id;
+                    """,
+                    (flush_id,),
+                )
+                if cur.fetchone() is None:
+                    return
+                # execute_values may otherwise emit several SQL statements
+                # under one stale timeout. Bound each explicit page by the
+                # remaining shutdown budget instead.
+                page_size = 100
+                for offset in range(0, len(ordered), page_size):
+                    set_remaining_statement_timeout()
+                    page = ordered[offset : offset + page_size]
+                    psycopg2.extras.execute_values(
+                        cur,
+                        query,
+                        page,
+                        page_size=len(page),
+                    )
+                set_remaining_statement_timeout()
+                cur.execute(
+                    "DELETE FROM feedback_flush_commits "
+                    "WHERE committed_at < NOW() - INTERVAL '7 days';"
+                )
             flushed_minutes = sorted(
-                list({item[0].strftime("%H:%M") for item in stats_buffer})
+                list({item[0].strftime("%H:%M") for item in ordered})
             )
             logger.info(
-                f"Flushed stats for {len(stats_buffer)} source-minute combination(s). Minutes: {flushed_minutes}"
+                f"Flushed stats for {len(ordered)} source-minute combination(s). Minutes: {flushed_minutes}"
             )
-        except psycopg2.Error as e:
-            logger.error(f"Failed to flush feedback stats to DB: {e}")
-            if conn:
-                conn.rollback()
-        finally:
-            if conn:
-                self.pool.putconn(conn)
+
+        return self._run_transaction(
+            "flush_feedback_stats",
+            write,
+            max_attempts=1 if deadline is not None else None,
+        )
 
     def get_daily_stats(self, source: str, date: str):
         # Range predicate rather than DATE(minute) = %s: the function call is

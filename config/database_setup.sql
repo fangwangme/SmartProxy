@@ -2,6 +2,8 @@
 -- It should be run once on your PostgreSQL database.
 
 -- Drop the tables if they exist to ensure a clean setup.
+DROP TABLE IF EXISTS feedback_flush_commits;
+DROP TABLE IF EXISTS proxy_source_fetch_state;
 DROP TABLE IF EXISTS source_stats_by_minute;
 DROP TABLE IF EXISTS proxies CASCADE;
 
@@ -43,14 +45,6 @@ CREATE TABLE proxies (
     validation_attempts_in_window INT NOT NULL DEFAULT 0,
     window_start_time TIMESTAMPTZ,
 
-    -- Durable copy of the feedback counters that rank this proxy. The in-memory
-    -- stats pool caps retained history, so without these a proxy that failed its
-    -- way out and later revalidated would be re-seeded as a clean candidate --
-    -- eviction would be an amnesty.
-    feedback_success_count INT NOT NULL DEFAULT 0,
-    feedback_failure_count INT NOT NULL DEFAULT 0,
-    feedback_last_ts TIMESTAMPTZ,
-    
     -- Ensures that each proxy (protocol, ip, port combination) is unique in the table.
     UNIQUE (protocol, ip, port)
 );
@@ -62,9 +56,15 @@ CREATE INDEX idx_proxies_validation_logic ON proxies (is_active, window_start_ti
 
 COMMENT ON TABLE proxies IS 'Stores physical attributes and validation status of all discovered proxies.';
 COMMENT ON COLUMN proxies.is_active IS 'True if the proxy passed the last validation, false otherwise.';
-COMMENT ON COLUMN proxies.feedback_success_count IS 'Durable copy of the in-memory success counter, so eviction from the stats pool is not reputation loss.';
-COMMENT ON COLUMN proxies.feedback_failure_count IS 'Durable copy of the in-memory failure counter, restored when a proxy is re-seeded into the stats pool.';
-COMMENT ON COLUMN proxies.feedback_last_ts IS 'Timestamp of the newest feedback behind those counters; drives time decay on a restored record.';
+
+CREATE TABLE proxy_source_fetch_state (
+    source_name VARCHAR(100) PRIMARY KEY,
+    failure_count INT NOT NULL,
+    next_attempt_at TIMESTAMPTZ NOT NULL,
+    failure_class VARCHAR(20) NOT NULL
+);
+
+COMMENT ON TABLE proxy_source_fetch_state IS 'Bounded source-fetch backoff retained across process restarts.';
 
 
 -- =================================================================
@@ -99,6 +99,13 @@ CREATE INDEX idx_source_stats_by_minute_source_minute ON source_stats_by_minute 
 
 COMMENT ON TABLE source_stats_by_minute IS 'Stores aggregated success/failure counts for each source per minute.';
 COMMENT ON COLUMN source_stats_by_minute.minute IS 'Timestamp truncated to the minute, e.g., 2025-08-02 16:30:00';
+
+CREATE TABLE feedback_flush_commits (
+    flush_id UUID PRIMARY KEY,
+    committed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+COMMENT ON TABLE feedback_flush_commits IS 'Idempotency ledger for retryable aggregate flush transactions.';
 
 -- Grant permissions to your application's user if necessary.
 -- Example: GRANT ALL ON ALL TABLES IN SCHEMA public TO my_proxy_user;

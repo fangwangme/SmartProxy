@@ -9,8 +9,12 @@ Validation owns only the `is_active` liveness gate. Real client feedback owns
 reliability, qualification, and traffic allocation. Validator latency,
 anonymity, and pass/fail observations must never enter the reliability score.
 
-Feedback latency remains observable as `avg_latency_ms`. It is only a
-deterministic secondary ordering key when reliability scores tie.
+Feedback latency remains observable as `avg_latency_ms`. It is recorded and
+nothing else: it does not enter the score, and it does not order the pool
+either. It was a secondary ordering key for tied scores until measurement
+showed the tie it served does not occur - across 8000 stored stats only two
+groups shared a score, and neither held distinct latencies - so a 1ms success
+and a 30s success are now worth exactly the same to selection.
 
 ## 2. Two-speed online reliability
 
@@ -52,7 +56,7 @@ sliding-window scorer. It is normalized once on the way in - at the API
 boundary, by `restore_stats()`, and by `_migrate_legacy_stat()` - and appended
 in timestamp order, so the selection path treats it as sorted and binary
 -searches the qualification cutoff instead of revalidating every stored entry
-on every request. Counter-only database history is seeded from a lifetime
+on every request. Counter-only history is seeded from a lifetime
 success rate shrunk toward `p0`, then aged from its last feedback timestamp. A
 record whose timestamp is missing or unusable is aged to the prior instead of
 trusted as fresh: unknown age is unbounded age, and the score drives
@@ -106,7 +110,7 @@ Two rules follow, and both are load-bearing:
   results carried an exhausted budget, and its first dip - which a 20%-success
   proxy reaches on a routine losing streak - exiled it for a full forgiveness
   epoch with no retry at all.
-- A proxy seeded from durable database counters has an empty result window and
+- A proxy seeded from counter-only history has an empty result window and
   therefore an untouched budget. It re-enters as a discovery candidate holding
   its seeded score; pre-spending the budget on results earned in a previous
   life left it ineligible for exploitation *and* for every exploration group,
@@ -214,29 +218,25 @@ dipped below the prior keeps drawing exploitation traffic until the next
 rebuild. That is bounded by `serving_plan_max_age_seconds` and is the cheaper
 error - it costs a few requests, where the reverse costs availability.
 
-## 6. Persistence and migration
+## 6. Persistence
 
 JSON snapshots contain root-level `scoring_version = 2`. Matching-version
 derived estimator state is validated and restored. A missing or mismatched
 version never trusts stored derived scores: valid `recent_results` are replayed
-in timestamp order. Raw feedback and database counters are preserved; migration
-does not delete history.
+in timestamp order.
 
-Durable database counters are absolute. Writes use monotonic database updates,
-are serialized in-process, and failed batches are re-queued so an idle proxy is
-retried without waiting for another feedback event.
+Proxy reputation is not mirrored into PostgreSQL. If a JSON snapshot is absent
+or intentionally skipped, each proxy starts from the fixed prior and relearns
+through normal feedback. This accepts a bounded warm-up period in exchange for
+removing reputation migrations, hydration, and a second write path.
 
-Runtime modes are non-destructive:
+The optional cold-start mode is non-destructive:
 
-- normal: restore normal JSON state, hydrate database reputation, and persist
-  both normal JSON and durable reputation;
-- `--no-restore`: skip JSON restore, keep database hydration/persistence, and
-  write JSON only to a `.no-restore` sibling path;
-- `--fresh-scoring`: skip JSON and database reputation hydration, disable
-  durable reputation writes, keep aggregate feedback, and write JSON only to a
-  `.fresh-scoring` sibling path.
+- normal: restore and update the normal JSON state;
+- `--no-restore`: skip JSON restore and write JSON only to a `.no-restore`
+  sibling path.
 
-Neither experimental mode deletes, renames, or overwrites normal state.
+`--no-restore` does not delete, rename, or overwrite normal state.
 
 ## 7. Configuration ownership
 
@@ -247,7 +247,7 @@ All thresholds above live in `[source_pool]` and are documented in
 ## 8. Operational observation
 
 Local deterministic replay proves ordering and learning direction, not the
-production ceiling. A rollout should run `--fresh-scoring` or a shadow replay,
+production ceiling. A rollout should run `--no-restore` or a shadow replay,
 bucket requests by score before outcome, and compare the rolling success rate
 with the observed stable wall. The target is 90-95% of that wall within roughly
 one hour. Publish only aggregate bucket counts/rates; keep proxy addresses,

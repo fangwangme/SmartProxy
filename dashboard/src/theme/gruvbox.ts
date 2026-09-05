@@ -89,6 +89,7 @@ export const GRUVBOX: Record<ResolvedTheme, Palette> = {
 
 export type TokenName = keyof Palette
 
+/** Consumed by `tailwind.config.ts` to generate one utility per token. */
 export const TOKEN_NAMES = Object.keys(GRUVBOX.dark) as TokenName[]
 
 /**

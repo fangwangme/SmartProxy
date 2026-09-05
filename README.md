@@ -17,7 +17,7 @@ SmartProxy is a sophisticated proxy management system designed to provide reliab
 
 1. **Fetch**: The service periodically fetches proxy lists from various sources defined in config.ini.  
 2. **Validate**: A validation cycle runs regularly. It prioritizes new and previously successful proxies. To avoid overwhelming unreliable proxies, it supplements the validation queue with failed proxies that have not been tested more than a configured number of times within a specific time window (e.g., 5 times in 30 minutes).  
-3. **Score**: Each source keeps independent slow and fast reliability estimates. Both start at `reliability_prior` (5% by default), update on every feedback event, and expose `score = 100 × min(slow, fast)`. The slow estimator limits one-hit promotion; the fast estimator reacts quickly to deterioration. Old state decays toward the same fixed prior. Latency is observable but never enters reliability; it only breaks equal-score ordering.
+3. **Score**: Each source keeps independent slow and fast reliability estimates. Both start at `reliability_prior` (5% by default), update on every feedback event, and expose `score = 100 × min(slow, fast)`. The slow estimator limits one-hit promotion; the fast estimator reacts quickly to deterioration. Old state decays toward the same fixed prior. Latency is observable but never enters reliability or selection order; it is recorded as `avg_latency_ms` and nothing more.
 4. **Select**: Only live proxies are eligible. Qualified proxies (three results and a score above the prior by default) receive score-driven exploitation traffic from the whole ranked pool. One adaptive total exploration budget falls from 30% to 5% as the live pool becomes evaluated; two thirds of it targets never-tried discovery and one third targets probation/delayed retries. Each proxy has three immediate probation attempts and at most two delayed retries per forgiveness epoch, and qualifying returns that budget so a later dip costs probation rather than the pool slot. Routing is split control-plane / data-plane: eligibility, ranking and selection weights are recomputed on a timer inside the pool sync, and `/get-proxy` only draws from that plan - one weighted pick, with no per-request work that scales with pool size. Trial candidates are claimed out of the plan while their result is outstanding; qualified proxies are not serialised.
 5. **Adapt**: Through continuous validation and feedback, low-quality proxies are phased out, and high-performing ones are prioritized, ensuring the overall quality of the pool constantly improves.
 
@@ -74,7 +74,18 @@ SmartProxy is a sophisticated proxy management system designed to provide reliab
      ```bash
      psql -U your_user -d your_db -f config/database_setup.sql
      ```
-   *(For upgrading an existing database, see the Migration Guide in `CHANGELOG.md`)*
+
+   `database_setup.sql` is the only schema definition, and it is authoritative
+   rather than incremental: it drops and recreates every table, so an existing
+   database is upgraded by running the same file again. There are no migration
+   scripts to apply in order.
+
+   Rerunning it discards all stored proxies and minute aggregates. That is the
+   intended upgrade path: proxy rows are rediscovered by the fetchers within one
+   source-refresh interval, and proxy reputation lives in the JSON backup rather
+   than the database, so it survives the rebuild and is restored on startup.
+   Back up `source_stats_by_minute` first if you need the historical dashboard
+   series.
 
 4.  **Configure the service:**  
    * Rename or copy `config/config.example.ini` to `config/config.ini`.  
@@ -85,6 +96,10 @@ SmartProxy is a sophisticated proxy management system designed to provide reliab
     uv run --locked run.py      # or: .venv/bin/python run.py
     ```
     *Or use the management script below.*
+
+    Non-debug mode uses one Waitress process with a configurable thread pool.
+    Do not add multiple WSGI worker processes while leases and scoring state
+    remain process-local. Debug mode retains Flask's server.
 
 ### **Frontend Setup (Dashboard)**
 
@@ -124,11 +139,8 @@ You can use the provided shell script to manage the backend service (start, stop
     # Start with debug mode
     ./scripts/start_proxy.sh start --debug
 
-    # Skip JSON restore but keep database reputation hydration; isolated backup
+    # Skip JSON restore and write to an isolated backup
     ./scripts/start_proxy.sh start --no-restore
-
-    # Isolated cold-start scoring; no JSON/DB reputation hydration or durable reputation writes
-    ./scripts/start_proxy.sh start --fresh-scoring
 
     # Check status
     ./scripts/start_proxy.sh status
@@ -136,7 +148,7 @@ You can use the provided shell script to manage the backend service (start, stop
     # View logs
     ./scripts/start_proxy.sh logs
 
-    # Restart service (add --no-restore / --fresh-scoring only on purpose)
+    # Restart service (add --no-restore only on purpose)
     ./scripts/start_proxy.sh restart
 
     # Stop service
@@ -152,15 +164,18 @@ The service is configured via the config.ini file.
 
 * **\[database\]**: Credentials for your PostgreSQL database.  
 * **\[server\]**: port for the API and dashboard.  
+  * production\_threads / background\_workers: Thread counts for the single-process WSGI server and tracked background work.
+  * shutdown\_deadline\_seconds: Deadline for stopping scheduling, draining or cancelling tracked work, flushing current feedback, and writing the final backup. Size it above normal drain/flush time plus the observed `smartproxy_backup_duration_seconds`; the launcher enforces the outer cutoff and backup replacement is atomic.
+  * readiness\_*: Maximum dependency ages and minimum usable-pool threshold for `/ready`.
   * allowed\_ips: Comma-separated remote IP allowlist for external APIs and dashboard pages.
   * trust\_proxy\_headers / trusted\_proxy\_ips: Only trust X-Forwarded-For when the direct peer is explicitly trusted.
-  * localhost (127.0.0.1 / ::1) is always allowed automatically.
-  * internal endpoints `/health`, `/metrics`, `/reload-sources`, `/backup-stats` are localhost-only.
+  * localhost (including IPv4-mapped loopback) is always allowed automatically.
+  * internal endpoints `/health`, `/live`, `/ready`, `/metrics`, `/reload-sources`, `/backup-stats` are localhost-only.
 * **\[logging\]**:
   * log\_dir: Log directory. Relative paths are resolved from the project root. Defaults to `./.local/logs`.
 * **\[validator\]**:  
-  * validation\_target / validation\_targets: URL(s) used to test proxy connectivity and anonymity. Anonymity is detected by looking for `X-Forwarded-For` / `Via` / `X-Real-IP` in a `headers` object in the JSON response, so the target **must echo request headers**: `http://httpbin.org/get` does, `http://httpbin.org/ip` does not and leaves `anonymity_level` permanently `unknown`. Prefer configuring several `validation_targets` - a single target that rate-limits (httpbin does) marks good proxies dead.
-  * validation\_success\_threshold: Number of targets a proxy must pass.  
+  * validation\_target / validation\_targets: URL(s) used to test proxy connectivity and anonymity. Every target must return JSON with a `headers` mapping. Production deployments should configure multiple independently operated targets; do not copy the same endpoint under several URLs merely to meet the count.
+  * validation\_success\_threshold / validation\_target\_min\_samples: Proxy pass threshold and target-health evidence threshold. If target quorum is unavailable, existing active proxies keep their last-known-good liveness. Never-validated candidates are recorded as failed so an oldest bad batch cannot starve newer discoveries; the ordinary failed-proxy retry window reconsiders them after recovery.
   * validation\_workers: Number of concurrent threads for validation.  
   * validation\_batch\_limit: Maximum proxies pulled into one validation cycle.  
   * validation\_new\_proxy\_ratio: Share of that budget reserved for never-validated proxies; the rest re-checks proxies that are currently alive. Unused budget is donated to the other side. Defaults to `0.5`.
@@ -171,6 +186,7 @@ The service is configured via the config.ini file.
   * Proxy-list downloads always use curl; there is no transport switch or fallback. The validator is unaffected — it dials proxy IPs through aiohttp and inspects response headers.
   * curl\_retries / curl\_retry\_delay\_s: `--retry` arguments for curl. The subprocess timeout is sized to cover every attempt, since `--max-time` bounds one attempt each.
   * backoff\_base\_s / backoff\_max\_s / backoff\_transient\_max\_s: Backoff after a failed fetch doubles per consecutive failure from `backoff_base_s`, capped by what kind of failure it was. A reset connection or a timeout is transient and stops at `backoff_transient_max_s` (300s); an HTTP 404 or a malformed URL is the source itself saying no and waits `backoff_max_s` (1800s). Without the split, an intermittently reset connection compounds into a near-total supply outage — a 35% fetch failure rate put every source into a 16-32 minute backoff.
+  * Fetch failure count, class, and next-attempt time are persisted, so a restart does not immediately retry a source whose circuit is still open.
 * **\[scheduler\]**: Intervals for background tasks like fetching, validation, and flushing stats.  
 * **\[sources\]**:  
   * predefined\_sources: A comma-separated list of logical names for your proxy pools (e.g., google\_search, web\_scraping).  
@@ -178,15 +194,15 @@ The service is configured via the config.ini file.
 * **\[source\_pool\]**: Parameters for the scoring and selection algorithm.
   * selection\_strategy: `uniform`, `tiered`, `weighted`, or `softmax`. Note that `uniform` draws every proxy in the pool with equal probability, so the score only decides pool membership and the ranking is otherwise discarded; `softmax` is recommended.
   * softmax\_temperature: Controls temperature scaling for softmax selection (default `14.0`).
-  * proxy\_cooldown\_ms / proxy\_inflight\_timeout\_seconds: Optional cooldown plus the mandatory outstanding-request lease.
+  * proxy\_cooldown\_ms / proxy\_inflight\_timeout\_seconds: Optional cooldown plus the outstanding-handout lease. The lease bounds the trial one-at-a-time rule and any opt-in `proxy_max_inflight`, and releases a slot the client never reported. The timeout is restart-only so the lease list stays sorted by expiry.
   * reliability\_prior / reliability\_slow\_alpha / reliability\_fast\_alpha: Fixed prior and two online update speeds (defaults `0.05`, `0.12`, `0.30`).
   * reliability\_decay\_half\_life\_hours: Wall-clock forgiveness toward the fixed prior.
   * exploration\_min\_ratio / exploration\_max\_ratio / exploration\_target\_qualified: One adaptive total exploration budget (defaults 5%, 30%, target 50).
   * exploration\_discovery\_share: Share of exploration reserved for never-tried discovery (default two thirds); probation and delayed retry use the rest.
   * qualification\_min\_results / probation\_attempts / retry\_attempts / retry\_delay\_seconds / probation\_forgiveness\_hours: Qualification and bounded trial lifecycle.
   * outage\_guard\_*: Requires a healthy completed window before a broad distinct-proxy failure spike can pause and roll back proxy-level reputation updates. Aggregate traffic metrics continue, and a completed recovery window resumes learning.
-  * max\_feedback\_latency\_ms: Input-safety boundary for diagnostic latency. Latency never affects reliability.
-  * Feedback counters are also persisted to `proxies.feedback_success_count` / `feedback_failure_count` / `feedback_last_ts`, so a proxy evicted from the stats pool and later revalidated comes back with its record instead of a clean sheet.
+  * max\_feedback\_latency\_ms: Input-safety boundary for diagnostic latency. Latency never affects reliability or ordering.
+  * Online reputation stays source-local in the manager and is included in the existing JSON backup. If no backup is restored, proxies start from the fixed prior and relearn through normal traffic; there is no reputation database migration or double-write path.
   * max\_pool\_size x stats\_pool\_max\_multiplier: The cap on retained **dead** proxy history - not on total memory. Proxies that passed the latest validation are never evicted, because evicting one would reset its failure history to zero on the next sync, so the stats pool grows with the number of genuinely active proxies. If the live set alone reaches the cap, all dead history is dropped and a warning is logged.
 * **\[proxy\_source\_\*\]**: Define your proxy sources here. Each source should have its own section (e.g., \[proxy\_source\_freeproxies\]).  
   * url: The URL to fetch the proxy list from.  
@@ -207,15 +223,16 @@ Fetches an available proxy for a specific use case.
   
 ```json
   {  
-    "http": "http://1.2.3.4:8080",  
-    "https": "http://1.2.3.4:8080",
-    "protocol": "http"
+    "http": "http://192.0.2.10:8080",
+    "https": "http://192.0.2.10:8080",
+    "protocol": "http",
+    "source": "example"
   }
 ```
 
 * **Error Response (404)**: Returned if no proxies are currently available for the requested source.
 
-**Note**: the `https` field is the same proxy URL, offered for convenience as the `https` entry of a `requests`-style proxies dict. Validation only exercises the configured `validation_target`(s); it never tests `CONNECT` tunnelling, so HTTPS support through a returned proxy is not verified. Report failures via `/feedback` so the score reflects it.
+**Note**: the `https` field is the same proxy URL, offered for convenience as the `https` entry of a `requests`-style proxies dict. Validation only exercises the configured `validation_target`(s); it never tests `CONNECT` tunnelling, so HTTPS support through a returned proxy is not verified. Return the `source` field verbatim in `/feedback` so the result is scored against the pool the proxy was drawn from - for a premium proxy this is the only way to know which pool that is.
 
 ### **POST /feedback**
 
@@ -223,15 +240,38 @@ Submits feedback on a proxy's performance. This is crucial for the scoring syste
 
 * **Request Body** (JSON):  
   * source (string, required): The source pool the proxy belongs to.  
-  * proxy (string, required): The full proxy URL (e.g., http://1.2.3.4:8080).  
+  * proxy (string, required): The exact proxy URL that was handed out.
   * status (integer, required): 0 and 4 are legacy failures; 1/2/3 and HTTP 1xx-3xx are successes; HTTP 4xx-5xx are failures; other values are rejected.  
-  * response\_time\_ms (integer, optional): Diagnostic response time in milliseconds. It does not affect reliability and is used only as a deterministic tie-break when scores are equal. Must be finite, non-negative, and no larger than `max_feedback_latency_ms` (defaults to one day, `86400000`); anything else is rejected with a 400.
+  * response\_time\_ms (integer, optional): Diagnostic response time in milliseconds. It does not affect reliability or selection; it is recorded as `avg_latency_ms` for observability only. Must be finite, non-negative, and no larger than `max_feedback_latency_ms` (defaults to one day, `86400000`); anything else is rejected with a 400.
   * failure\_kind (string, optional): One of `timeout`, `proxy_error`, `dead`, `blocked`, `slow`, or `content_error`. `dead` applies the failure to every source where that proxy is tracked; other kinds affect only the reported source.
-* **Success Response (200)**:  
+
+* **Request Example**:
 
 ```json
-  { "message": "Feedback received." }
+{
+  "source": "example",
+  "proxy": "http://192.0.2.10:8080",
+  "status": 200,
+  "response_time_ms": 120
+}
 ```
+
+* **Success Response (200)**: `{"message": "Feedback received."}`
+
+Everything that passes boundary validation is scored. The service is a neutral
+referee: it records what the client reports, and the client owns whether that
+report is correct. It does not authenticate a report against the handout it
+belongs to, because the errors that would catch - a duplicate delivery, a very
+late report, a wrong `source` - are the client's to prevent, and the errors that
+actually damage a score - calling a soft-block page a success - cannot be caught
+here at all. What the service does do is *count*: feedback that arrives with no
+outstanding handout to close is exported as
+`smartproxy_feedback_unmatched_total`, which is the number to watch if you
+suspect your client duplicates or delays its reports. Read it with two caveats:
+leases do not survive a restart, so every restart adds roughly one count per
+request that was in flight at the time, and a report that arrives later than
+`proxy_inflight_timeout_seconds` counts too, because its lease has already been
+reclaimed.
 
 ### **POST /reload-sources**
 
@@ -239,9 +279,17 @@ Triggers a hot-reload of config.ini. Every tunable is re-read - `[source_pool]`,
 
 The reload is **authoritative**: the file is re-parsed into a fresh parser, so a key or a whole `[proxy_source_*]` section you delete from the file is genuinely dropped and reverts to its built-in default, rather than keeping its old in-memory value.
 
-It is also **transactional**: the new configuration is applied as a unit. If any value fails to parse - including an `update_interval_minutes` in a `[proxy_source_*]` section, which is parsed separately from the tunables - the service rolls back to the configuration it was running and returns an error, instead of being left on a mix of old and new settings.
+It is also **transactional**: the new configuration is applied as a unit. If
+any value fails parsing or semantic validation—including an
+`update_interval_minutes` in a `[proxy_source_*]` section—the service rolls back
+to its previous configuration instead of being left on a mix of old and new
+settings.
 
-Three settings are **not** reloadable, because they are consumed once at startup: the `[database]` connection pool, `[server] port`, and `[logging]`. Changing any of them requires a restart; the response lists them under `restart_required_for`.
+Connection-pool settings, `[server] port`, `production_threads`,
+`background_workers`, and `[logging]` are consumed once at startup and require a
+restart. Every reload is semantically validated before active values change;
+invalid counts, timeouts, intervals, percentages, pool bounds, or cross-field
+relationships reject the entire reload.
 
 ```bash
 curl -X POST -H "Content-Type: application/json" http://127.0.0.1:6942/reload-sources
@@ -262,6 +310,7 @@ curl -X POST -H "Content-Type: application/json" http://127.0.0.1:6942/reload-so
       "restart_required_for": [
         "[database] connection pool",
         "[server] port",
+        "[server] production_threads / background_workers",
         "[logging] log_dir / log_file_base_name"
       ]
     }  
@@ -301,9 +350,10 @@ curl http://127.0.0.1:6942/get-premium-proxy
 
 ```json
 {
-  "http": "http://1.2.3.4:8080",  
-  "https": "http://1.2.3.4:8080",
-  "premium": true
+  "http": "http://192.0.2.10:8080",
+  "https": "http://192.0.2.10:8080",
+  "premium": true,
+  "source": "example"
 }
 ```
 
@@ -311,9 +361,37 @@ curl http://127.0.0.1:6942/get-premium-proxy
 
 **Note**: Premium proxies are selected from proxies with at least 50 uses (configurable via `premium_min_usage_count`) and sorted by score. This ensures only battle-tested, high-quality proxies are returned.
 
-### **GET /health**
+### **GET /live, /ready, and /health**
 
-Health check endpoint for monitoring.
+`/live` reports only that the process can serve HTTP:
+
+```json
+{"status": "live", "serving": true}
+```
+
+`/ready` checks the database, scheduler, age of the last healthy validation
+quorum, age of the last successful feedback flush, and minimum usable pool. It
+returns `200` when ready or `503` otherwise:
+
+```json
+{
+  "status": "ready",
+  "ready": true,
+  "dependencies": {
+    "database": true,
+    "scheduler": true,
+    "validation": true,
+    "feedback_flush": true,
+    "usable_pool": true
+  },
+  "usable_proxies": 10,
+  "minimum_usable_proxies": 1
+}
+```
+
+`/health` is the compatibility endpoint. It includes the existing pool counts
+plus the same readiness state, returning `200` with `status: healthy` or `503`
+with `status: degraded`; a dependency failure is never reported as healthy.
 
 ```bash
 curl http://127.0.0.1:6942/health
@@ -324,12 +402,26 @@ curl http://127.0.0.1:6942/health
 ```json
 {
   "status": "healthy",
+  "ready": true,
+  "dependencies": {
+    "database": true,
+    "scheduler": true,
+    "validation": true,
+    "feedback_flush": true,
+    "usable_pool": true
+  },
   "active_proxies": 1500,
   "premium_proxies": 50,
   "sources": 4,
   "is_validating": false
 }
 ```
+
+Statistics endpoints validate parameters before querying PostgreSQL. A backend
+failure returns `503` with `{"status": "error", "error": "Statistics backend
+unavailable."}` rather than an all-zero success payload. API responses include
+`X-Server-Time` as a full timezone-aware timestamp; the dashboard advances that
+clock locally and uses its calendar date for “today” and moving windows.
 
 ### **GET /metrics**
 

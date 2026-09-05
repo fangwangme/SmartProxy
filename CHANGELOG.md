@@ -1,5 +1,194 @@
 # Changelog
 
+## 3.3.6 — 2026-09-05 — PR #26: Reliability contracts, lifecycle, and observability
+
+This change closes [Issue #25](https://github.com/fangwangme/SmartProxy/issues/25).
+
+3.3.5 reached a working steady state; this release is about what happens at the
+edges of it — a validation target going down, a database stalling, a restart, a
+shutdown, a malformed forwarded header. The scoring model is unchanged.
+
+### Validation and configuration
+
+- **A target outage no longer empties the pool.** Validation results are now
+  tracked per target, and a batch only commits deactivations when a healthy
+  quorum of targets answered. Without it, existing active proxies keep their
+  last-known-good liveness. Never-validated candidates in a failed batch are
+  recorded as failed so one bad oldest batch cannot starve newer discoveries;
+  the ordinary failed-proxy retry window reconsiders them after recovery.
+  `validation_target_min_samples` sets how much evidence marks a target
+  reachable.
+- **Out-of-range configuration is rejected, not clamped.** Every tunable is
+  semantically validated — worker counts, timeouts, intervals, percentages,
+  pool bounds and cross-field relationships — at startup and before a reload
+  mutates any active value. A value that used to be silently pulled to a
+  boundary now fails loudly.
+- **Fetch backoff survives a restart.** Failure count, class and next-attempt
+  time are persisted in `proxy_source_fetch_state`, so restarting no longer
+  re-hammers a source whose circuit is still open.
+- Three `[proxy_source_*]` endpoints that are permanently unavailable were
+  dropped from the example config.
+
+### Handout, feedback, and premium
+
+- **`/get-proxy` and `/get-premium-proxy` return `source`.** For a premium
+  proxy this is the only way a client can know which pool the result should be
+  scored against; it previously had to guess.
+- **Premium routes through the normal contract.** It was a `random.choice()`
+  over a list refreshed only on sync, so a proxy that had already failed its
+  way out could still be handed out. It now honours source, liveness,
+  qualification, eligibility, the outstanding-handout lease, and immediate
+  demotion.
+- **Feedback with no outstanding handout is counted**, not rejected. The
+  service records what the client reports and the client owns whether that
+  report is right; `smartproxy_feedback_unmatched_total` is what a duplicate, a
+  late report or a wrong `source` looks like from here. Leases do not survive a
+  restart, so a restart adds roughly one count per in-flight request, and a
+  report later than `proxy_inflight_timeout_seconds` counts too.
+- **Latency no longer orders the pool.** It was a secondary sort key for tied
+  scores; measurement showed the tie it served does not occur — across 8000
+  stored stats only two groups shared a score, neither with distinct latencies.
+  `avg_latency_ms` is now recorded and nothing else.
+
+### Persistence and lifecycle
+
+- **Reputation is no longer mirrored into PostgreSQL.** The
+  `proxies.feedback_success_count` / `feedback_failure_count` /
+  `feedback_last_ts` columns are gone, along with the hydration and double-write
+  path. The JSON backup is the only durable copy: if it is absent, proxies
+  restart from the fixed prior and relearn.
+- **Minute aggregates are acknowledged after commit.** A `feedback_flush_commits`
+  ledger makes a retried flush idempotent, failed writes stay queued instead of
+  being dropped, writers touching overlapping rows use a deterministic order,
+  and retries are bounded and limited to retryable PostgreSQL SQLSTATEs
+  including deadlock.
+- **Shutdown is deadline-driven.** `shutdown_deadline_seconds` bounds stopping
+  the scheduler, draining tracked work, flushing the current partial minute and
+  writing the final backup; the launcher waits that long plus a small margin.
+  The backup goes first: a stalled database is exactly the case where a local
+  file can still be written, and a missed backup costs a relearning period
+  while a missed minute is re-sent by the ledger.
+- **The schema is authoritative.** `config/database_setup.sql` is the only
+  definition and there are no migration scripts; an existing database is
+  upgraded by running the same file again.
+- `--fresh-scoring` is removed. `--no-restore` remains.
+
+### Runtime, API, and observability
+
+- **Production serves through one Waitress process** with `production_threads`,
+  because allocation, lease and scoring state are process-local. `--debug`
+  keeps Flask's development server. Do not add WSGI worker processes.
+- **`/live` and `/ready` are added**, and `/health` no longer reports a failed
+  dependency as healthy: it returns `503` with `status: degraded` when the
+  database, scheduler, recent validation quorum, recent flush, or minimum
+  usable pool is not satisfied.
+- **Statistics endpoints validate before querying** and return `503` on a
+  backend failure instead of a successful all-zero payload.
+- **Prometheus counters have counter semantics.** They increment once per
+  accepted feedback rather than being summed from retained pool state, where a
+  dead-proxy fan-out or an eviction could double or decrease them.
+- **Forwarded headers fail closed.** The client is derived from the trusted
+  proxy boundary rather than the left-most value, a malformed chain is refused
+  rather than falling back to the direct peer, and loopback detection covers
+  IPv4-mapped addresses.
+- **`X-Server-Time` is a full timezone-aware timestamp.** The dashboard
+  advances that clock locally and derives "today" and its moving windows from
+  it instead of the viewer's calendar.
+- Request threads never synchronously rebuild an expired serving plan under the
+  manager lock; the last immutable plan is served while one background refresh
+  per source runs.
+- Persistent log sinks are initialised only by the process entry point, so an
+  import or a test cannot write into operational logs. **Exception logs no
+  longer include local variable values** (`diagnose=False`): the variables in
+  scope on this path can carry proxy addresses. Stack traces are unaffected.
+- The launcher reads the port from the config, validates PID ownership before
+  signalling (and again after the pre-stop backup, in case the PID was reused),
+  and uses a unique temporary response file.
+
+### Metrics changes
+
+Removed: `smartproxy_requests_success_total`, `smartproxy_requests_failure_total`.
+
+Added: `smartproxy_feedback_accepted_total{outcome="success"|"failure"}`,
+`smartproxy_feedback_unmatched_total`,
+`smartproxy_validation_target_failures_total{target_index,kind}`,
+`smartproxy_backup_duration_seconds`, `smartproxy_manager_lock_hold_seconds`,
+`smartproxy_plan_refresh_duration_seconds`.
+
+`smartproxy_success_rate_percent` changes meaning: it is now derived from
+process-lifetime accepted-feedback counters and therefore resets on restart,
+rather than being summed from the retained stats pool.
+
+### Upgrade and Migration Guide
+
+Order matters: the JSON backup is now the only durable copy of proxy
+reputation, so stop through the launcher, which backs up first.
+
+1. **Stop the running service** with `./scripts/start_proxy.sh stop`. Remove
+   `--fresh-scoring` from any launcher invocation, service unit, or cron entry.
+
+2. **Install the new dependency** (Waitress 3.0.2):
+
+   ```bash
+   uv sync --locked
+   ```
+
+3. **Rebuild the schema.** There are no migrations; rerunning the file is the
+   upgrade path. It drops stored proxies and minute aggregates — proxies are
+   rediscovered by the fetchers within one source-refresh interval, and
+   reputation is in the JSON backup, but **dump `source_stats_by_minute` first
+   if you need the historical dashboard series**:
+
+   ```bash
+   psql -U your_user -d your_db -f config/database_setup.sql
+   ```
+
+4. **Add the new keys to `config.ini`** (shown at their defaults). None are
+   required to start — all fall back to these values — but `check_config_drift()`
+   reports each one as missing at startup:
+
+   ```ini
+   [server]
+   production_threads = 8
+   background_workers = 8
+   shutdown_deadline_seconds = 20
+   readiness_min_usable_pool = 1
+   readiness_validation_max_age_seconds = 600
+   readiness_flush_max_age_seconds = 180
+
+   [database]
+   min_connections = 2
+   write_max_retries = 3
+   write_retry_base_ms = 25
+
+   [validator]
+   validation_target_min_samples = 1
+   ```
+
+   Size `shutdown_deadline_seconds` above the observed drain and flush time plus
+   `smartproxy_backup_duration_seconds`, rather than assuming 20s fits this host.
+
+   No keys were removed in this release. Three `[proxy_source_*]` sections were
+   dropped from the example config for being permanently unavailable
+   (`https_list_F`, `http_list_O`, `http_list_P`); remove them from your own
+   config if present.
+
+5. **Rebuild the dashboard.** The server clock header changed format, and a
+   stale bundle cannot parse it — "today" and the moving windows silently stop
+   tracking the server:
+
+   ```bash
+   cd dashboard && bun install && bun run build
+   ```
+
+6. **Update monitoring** for the metric changes above, and point liveness at
+   `/live` and readiness at `/ready`. A probe that treats any non-200 from
+   `/health` as an outage will now fire whenever a dependency degrades, which
+   is the intent — but it is a new alerting surface.
+
+7. **Start the service** and confirm `/ready` reports all five dependencies
+   healthy.
+
 ## 3.3.5 — 2026-09-03 — PR #24: Online proxy learning, control-plane routing
 
 This change closes [Issue #23](https://github.com/fangwangme/SmartProxy/issues/23).
