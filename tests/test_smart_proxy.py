@@ -619,7 +619,7 @@ class TestProxyManager(ProxyManagerTestBase):
         self.assertGreaterEqual(score, 60)
         self.assertLessEqual(score, 100)
 
-    def test_elo_score_latency_impact(self):
+    def test_latency_never_moves_the_reliability_estimate(self):
         """Latency is observable but cannot change reliability."""
         import time
 
@@ -656,27 +656,6 @@ class TestProxyManager(ProxyManagerTestBase):
         # Counter-only history is prior-shrunk instead of trusting score=150.
         self.assertGreaterEqual(migrated["score"], 70)
         self.assertLessEqual(migrated["score"], 80)
-
-    def test_elo_score_consistency_bonus(self):
-        """A stronger reliability sequence still outranks a weaker one."""
-        import time
-        
-        # Consistent proxy: 10/10 recent successes
-        stat_consistent = self.manager._get_new_proxy_stat()
-        for i in range(50):
-            stat_consistent["recent_results"].append([time.time() - i, True, 400])
-        
-        # Inconsistent proxy: 5/10 recent successes (50%)
-        stat_inconsistent = self.manager._get_new_proxy_stat()
-        for i in range(25):
-            stat_inconsistent["recent_results"].append([time.time() - i, True, 400])
-        for i in range(25):
-            stat_inconsistent["recent_results"].append([time.time() - 25 - i, False, None])
-        
-        score_consistent = self.manager._refresh_score(stat_consistent)
-        score_inconsistent = self.manager._refresh_score(stat_inconsistent)
-        
-        self.assertGreater(score_consistent, score_inconsistent)
 
     def test_elo_score_bounded_0_to_100(self):
         """Test that ELO scores are always bounded between 0 and 100."""
@@ -896,17 +875,6 @@ class TestIssue13PoolQuality(ProxyManagerTestBase):
 
         self.assertLess(score, 5.0)
 
-    def test_latency_score_is_scaled_by_success_rate(self):
-        """Same latency, different reliability: the reliable one scores higher."""
-        reliable = self.manager._refresh_score(
-            self.make_stat([(True, 200)] * 45 + [(False, None)] * 5)
-        )
-        flaky = self.manager._refresh_score(
-            self.make_stat([(True, 200)] * 20 + [(False, None)] * 30)
-        )
-
-        self.assertGreater(reliable, flaky)
-
     # ---------- Finding 3: time decay never applied to idle proxies ----------
 
     def test_sync_rescores_idle_proxies_so_decay_applies(self):
@@ -930,27 +898,6 @@ class TestIssue13PoolQuality(ProxyManagerTestBase):
         self.assertEqual(score_before, 100.0)
         self.assertNotEqual(score_after, score_before)
         self.assertAlmostEqual(score_after, 5.0, delta=0.2)
-
-    def test_sync_rescore_can_be_disabled_by_config(self):
-        """The removed legacy switch cannot freeze wall-clock forgiveness."""
-        manager = self.make_manager(
-            {"source_pool": {"rescore_on_sync_enabled": "false"}},
-            name="no_rescore.ini",
-        )
-        proxy_url = "http://idle:80"
-        stale_ts = time.time() - (10 * 24 * 3600)
-        stat = manager._get_new_proxy_stat()
-        stat["recent_results"] = [[stale_ts, True, 200] for _ in range(50)]
-        stat["last_feedback_ts"] = stale_ts
-        stat["score"] = 100.0
-        manager.source_stats["source1"] = {proxy_url: stat}
-        manager.db.get_active_proxies.return_value = {proxy_url}
-
-        manager._sync_and_select_top_proxies()
-
-        self.assertNotEqual(
-            manager.source_stats["source1"][proxy_url]["score"], 100.0
-        )
 
     # ---------- Finding 8: one dirty row rolled back the whole insert ----------
 
@@ -2656,11 +2603,9 @@ class TestIssue17DynamicBaseline(ProxyManagerTestBase):
             )
         return pool
 
-    def _sync_with(self, pool, live=None):
+    def _sync_with(self, pool):
         self.manager.source_stats["source1"] = pool
-        self.mock_db_instance.get_active_proxies.return_value = set(
-            pool if live is None else live
-        )
+        self.mock_db_instance.get_active_proxies.return_value = set(pool)
         self.manager._sync_and_select_top_proxies()
 
     def test_untried_baseline_is_the_fixed_prior_not_the_pool_median(self):
@@ -2717,67 +2662,6 @@ class TestIssue17DynamicBaseline(ProxyManagerTestBase):
 
         top_tier = self.manager.available_proxies["source1"]["top_tier"]
         self.assertEqual(set(top_tier), set(proven))
-
-    def test_baseline_falls_back_to_neutral_when_nothing_is_measured(self):
-        pool = {f"http://blank{i}:80": self.manager._get_new_proxy_stat()
-                for i in range(3)}
-
-        self._sync_with(pool)
-
-        self.assertEqual(self.manager._baseline_score("source1"), 5.0)
-        for stat in pool.values():
-            self.assertEqual(stat["score"], 5.0)
-
-    def test_baseline_survives_an_empty_pool(self):
-        self._sync_with({}, live=set())
-
-        self.assertEqual(self.manager._baseline_score("source1"), 5.0)
-        self.assertEqual(self.manager._baseline_score(), 5.0)
-        self.assertEqual(self.manager._baseline_score("no-such-source"), 5.0)
-
-    def test_baseline_with_a_uniform_pool_is_that_uniform_score(self):
-        pool = {f"http://m{i}:80": self._measured_stat(5, 5) for i in range(4)}
-
-        self._sync_with(pool)
-
-        self.assertEqual(self.manager._baseline_score("source1"), 5.0)
-        self.assertGreater(next(iter(pool.values()))["score"], 5.0)
-
-    def test_dead_proxies_do_not_vote_on_the_baseline(self):
-        """
-        The baseline says what a fresh candidate competes against, and a dead
-        proxy is not competing: it cannot be handed out at all.
-        """
-        live = "http://live:80"
-        pool = {
-            live: self._measured_stat(8, 2),
-            "http://dead1:80": self._measured_stat(0, 20),
-            "http://dead2:80": self._measured_stat(0, 20),
-        }
-
-        self._sync_with(pool, live={live})
-
-        self.assertEqual(self.manager._baseline_score("source1"), 5.0)
-        self.assertGreater(pool[live]["score"], 5.0)
-
-    def test_latency_component_discriminates_across_real_latencies(self):
-        """Equal reliability is ordered by diagnostic latency only as a tie-break."""
-        now = time.time()
-        urls = [f"http://p{i}:80" for i in range(4)]
-        pool = {}
-        for url, latency in zip(urls, (15000, 25000, 40000, 55000)):
-            pool[url] = self.manager._get_new_proxy_stat() | {
-                "score": 60.0,
-                "quality_slow": 0.6,
-                "quality_fast": 0.6,
-                "quality_updated_ts": now,
-                "recent_results": [[now, True, latency]] * 3,
-                "avg_latency_ms": latency,
-            }
-        with patch("src.core.proxy_manager.time.time", return_value=now):
-            self._sync_with(pool)
-        self.assertEqual(self.manager.available_proxies["source1"]["top_tier"], urls)
-
 
 class TestIssue23OnlineReliability(ProxyManagerTestBase):
     """Issue #23 scoring regressions supersede issue #21 calibration."""

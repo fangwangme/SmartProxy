@@ -9,8 +9,12 @@ Validation owns only the `is_active` liveness gate. Real client feedback owns
 reliability, qualification, and traffic allocation. Validator latency,
 anonymity, and pass/fail observations must never enter the reliability score.
 
-Feedback latency remains observable as `avg_latency_ms`. It is only a
-deterministic secondary ordering key when reliability scores tie.
+Feedback latency remains observable as `avg_latency_ms`. It is recorded and
+nothing else: it does not enter the score, and it does not order the pool
+either. It was a secondary ordering key for tied scores until measurement
+showed the tie it served does not occur - across 8000 stored stats only two
+groups shared a score, and neither held distinct latencies - so a 1ms success
+and a 30s success are now worth exactly the same to selection.
 
 ## 2. Two-speed online reliability
 

@@ -1755,11 +1755,7 @@ class ProxyManager:
 
                 sorted_proxies = sorted(
                     stats_pool.items(),
-                    key=lambda item: (
-                        -float(item[1]["score"]),
-                        self._latency_sort_key(item[1]),
-                        item[0],
-                    ),
+                    key=lambda item: (-float(item[1]["score"]), item[0]),
                 )
 
                 # Only proxies that survived the latest validation may be handed
@@ -1814,15 +1810,6 @@ class ProxyManager:
     def _baseline_score(self, source: Optional[str] = None) -> float:
         """Fixed initial reliability score on the public 0-100 scale."""
         return self.reliability_prior * 100.0
-
-    def _latency_sort_key(self, stat: Dict) -> float:
-        # Runs once per proxy inside the pool sort; avg_latency_ms is written
-        # as an int or None by this class and coerced on restore.
-        latency = stat.get("avg_latency_ms")
-        if type(latency) is int:
-            return float(latency)
-        latency = self._coerce_latency(latency, self.max_feedback_latency_ms)
-        return float(latency) if latency is not None else math.inf
 
     @staticmethod
     def _coerce_latency(
@@ -3670,39 +3657,30 @@ class ProxyManager:
         if not REQUIRED_STAT_KEYS <= stat.keys():
             stat = self._migrate_legacy_stat(stat)
 
+        # One boundary check for the reported latency, reused by the EMA, the
+        # replay window and the log line below.
+        latency = self._coerce_latency(response_time_ms, self.max_feedback_latency_ms)
+
         # Update historical counters
         if is_success:
             stat["success_count"] += 1
-            
-            # Update exponential moving average of latency for observability.
-            latency = self._coerce_latency(
-                response_time_ms, self.max_feedback_latency_ms
-            )
+
+            # Exponential moving average of latency, for observability only.
+            # The previous value is not re-checked: restore_stats() migrates
+            # every stat on the way in, so it is either None or a number this
+            # method wrote.
             if latency is not None:
-                alpha = self.avg_latency_alpha
-                previous = self._coerce_latency(
-                    stat.get("avg_latency_ms"), self.max_feedback_latency_ms
-                )
+                previous = stat.get("avg_latency_ms")
                 if previous is None:
                     stat["avg_latency_ms"] = latency
                 else:
+                    alpha = self.avg_latency_alpha
                     stat["avg_latency_ms"] = alpha * latency + (1 - alpha) * previous
         else:
             stat["failure_count"] += 1
-        
+
         # Add to the bounded raw replay window.
-        latency_for_log = self._coerce_latency(
-            response_time_ms, self.max_feedback_latency_ms
-        )
-        stat["recent_results"].append(
-            [
-                current_timestamp,
-                is_success,
-                self._coerce_latency(
-                    response_time_ms, self.max_feedback_latency_ms
-                ),
-            ]
-        )
+        stat["recent_results"].append([current_timestamp, is_success, latency])
         if len(stat["recent_results"]) > self.reliability_recent_results_limit:
             stat["recent_results"] = stat["recent_results"][
                 -self.reliability_recent_results_limit:
@@ -3727,7 +3705,7 @@ class ProxyManager:
                 stat["retry_after_ts"] = current_timestamp + self.retry_delay_s
         self._return_trial_candidate(source, proxy_url, stat)
         
-        response_time_str = f"{latency_for_log:.0f}" if latency_for_log is not None else "N/A"
+        response_time_str = f"{latency:.0f}" if latency is not None else "N/A"
         logger.debug(
             f"Reliability Score: {source:<15} | {proxy_url:<30} | "
             f"{'OK' if is_success else 'FAIL':<4} | {response_time_str:<6}ms | "
