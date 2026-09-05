@@ -3,14 +3,13 @@ import copy
 import importlib
 import json
 import sys
-import threading
 import time
 import unittest
 import socket
 from concurrent.futures import Future
 from datetime import datetime, timedelta
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import psycopg2
 import aiohttp

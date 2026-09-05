@@ -56,7 +56,7 @@ sliding-window scorer. It is normalized once on the way in - at the API
 boundary, by `restore_stats()`, and by `_migrate_legacy_stat()` - and appended
 in timestamp order, so the selection path treats it as sorted and binary
 -searches the qualification cutoff instead of revalidating every stored entry
-on every request. Counter-only database history is seeded from a lifetime
+on every request. Counter-only history is seeded from a lifetime
 success rate shrunk toward `p0`, then aged from its last feedback timestamp. A
 record whose timestamp is missing or unusable is aged to the prior instead of
 trusted as fresh: unknown age is unbounded age, and the score drives
@@ -110,7 +110,7 @@ Two rules follow, and both are load-bearing:
   results carried an exhausted budget, and its first dip - which a 20%-success
   proxy reaches on a routine losing streak - exiled it for a full forgiveness
   epoch with no retry at all.
-- A proxy seeded from durable database counters has an empty result window and
+- A proxy seeded from counter-only history has an empty result window and
   therefore an untouched budget. It re-enters as a discovery candidate holding
   its seeded score; pre-spending the budget on results earned in a previous
   life left it ineligible for exploitation *and* for every exploration group,

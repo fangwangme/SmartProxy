@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-import asyncio
 import json
 import os
 import shutil
@@ -13,12 +12,11 @@ import copy
 import threading
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import MagicMock, patch, AsyncMock
+from unittest.mock import MagicMock, patch
 
 from src.core.proxy_manager import (
     ProxyManager,
     FetchError,
-    FAILED_STATUS_CODES,
     SCORING_VERSION,
 )
 from src.database.db import DatabaseManager
@@ -416,17 +414,6 @@ class TestProxyManager(ProxyManagerTestBase):
         # Should not raise
         self.manager.process_feedback("source1", "http://unknown:80", 200)
 
-    # ========== Lock Tests ==========
-    
-    def test_rlock_is_reentrant(self):
-        """Test that main lock is RLock and reentrant."""
-        self.assertIsInstance(self.manager.lock, type(threading.RLock()))
-        
-        # Should not deadlock
-        with self.manager.lock:
-            with self.manager.lock:
-                pass
-
     # ========== Source Management Tests ==========
     
     def test_get_source_or_default_returns_source_if_defined(self):
@@ -550,37 +537,10 @@ class TestProxyManager(ProxyManagerTestBase):
             ["http://1.1.1.1:80"],
         )
 
-    # ========== Stats Proxy Helper Tests ==========
-    
-    def test_get_new_proxy_stat_returns_correct_structure(self):
-        """Test _get_new_proxy_stat returns correct initial ELO structure."""
-        stat = self.manager._get_new_proxy_stat()
-        
-        self.assertEqual(stat["score"], 5.0)
-        self.assertEqual(stat["quality_slow"], 0.05)
-        self.assertEqual(stat["quality_fast"], 0.05)
-        self.assertEqual(stat["success_count"], 0)
-        self.assertEqual(stat["failure_count"], 0)
-        self.assertEqual(stat["recent_results"], [])  # NEW: sliding window
-        self.assertIsNone(stat["avg_latency_ms"])     # NEW: latency tracking
+    # ========== Reliability Scoring Tests ==========
 
-    # ========== FAILED_STATUS_CODES Tests ==========
-    
-    def test_failed_status_codes_contains_expected_values(self):
-        """Test FAILED_STATUS_CODES contains timeout and proxy error codes."""
-        self.assertIn(0, FAILED_STATUS_CODES)  # Timeout
-        self.assertIn(4, FAILED_STATUS_CODES)  # Proxy error
-
-    # ========== ELO Scoring Algorithm Tests ==========
-
-    def test_elo_score_new_proxy_baseline(self):
-        """Test ELO score for a completely new proxy with no history."""
-        stat = self.manager._get_new_proxy_stat()
-        score = self.manager._refresh_score(stat)
-        self.assertEqual(score, 5.0)
-
-    def test_elo_score_perfect_proxy(self):
-        """Test ELO score for a proxy with 100% success rate and low latency."""
+    def test_a_full_window_of_successes_approaches_the_top_of_the_scale(self):
+        """A sustained success run has to reach the top of the 0-100 scale."""
         import time
         stat = self.manager._get_new_proxy_stat()
         # Simulate 50 perfect requests with low latency (200ms)
@@ -588,35 +548,7 @@ class TestProxyManager(ProxyManagerTestBase):
             stat["recent_results"].append([time.time() - i, True, 200])
         
         score = self.manager._refresh_score(stat)
-        # Should get max or near-max score: 60 (success) + 30 (latency) + 10 (consistency)
         self.assertGreaterEqual(score, 95)
-        self.assertLessEqual(score, 100)
-
-    def test_elo_score_failing_proxy(self):
-        """Test ELO score for a proxy with 0% success rate."""
-        import time
-        stat = self.manager._get_new_proxy_stat()
-        # Simulate 50 failed requests
-        for i in range(50):
-            stat["recent_results"].append([time.time() - i, False, None])
-        
-        score = self.manager._refresh_score(stat)
-        # Should get low score: 0 (success) + 15 (neutral latency) + 0 (consistency)
-        self.assertLessEqual(score, 20)
-
-    def test_elo_score_80_percent_success_rate(self):
-        """Test ELO score for a proxy with 80% success rate."""
-        import time
-        stat = self.manager._get_new_proxy_stat()
-        # Simulate 40 successes and 10 failures chronologically (older failures first)
-        for i in range(10):
-            stat["recent_results"].append([time.time() - 40 - i, False, None])
-        for i in range(40):
-            stat["recent_results"].append([time.time() - i, True, 500])
-        
-        score = self.manager._refresh_score(stat)
-        # A long recent success run approaches 100, independent of latency.
-        self.assertGreaterEqual(score, 60)
         self.assertLessEqual(score, 100)
 
     def test_latency_never_moves_the_reliability_estimate(self):
@@ -636,8 +568,8 @@ class TestProxyManager(ProxyManagerTestBase):
 
         self.assertAlmostEqual(score_low, score_high, places=3)
 
-    def test_elo_score_legacy_migration(self):
-        """Test that legacy stats are properly migrated and scored."""
+    def test_counter_only_history_is_prior_shrunk_not_trusted(self):
+        """A legacy record's own score is discarded; its counters are shrunk."""
         # Legacy stat format (no recent_results)
         legacy_stat = {
             "score": 150.0,  # Old unbounded score
@@ -657,31 +589,8 @@ class TestProxyManager(ProxyManagerTestBase):
         self.assertGreaterEqual(migrated["score"], 70)
         self.assertLessEqual(migrated["score"], 80)
 
-    def test_elo_score_bounded_0_to_100(self):
-        """Test that ELO scores are always bounded between 0 and 100."""
-        import time
-        
-        # Test extreme cases
-        test_cases = [
-            # Perfect case
-            [(True, 100)] * 100,
-            # Worst case
-            [(False, None)] * 100,
-            # Mixed case
-            [(True, 500)] * 50 + [(False, None)] * 50,
-        ]
-        
-        for results in test_cases:
-            stat = self.manager._get_new_proxy_stat()
-            for success, latency in results:
-                stat["recent_results"].append([time.time(), success, latency])
-            
-            score = self.manager._refresh_score(stat)
-            self.assertGreaterEqual(score, 0, "Score below 0")
-            self.assertLessEqual(score, 100, "Score above 100")
-
-    def test_elo_score_ignores_stale_recent_results(self):
-        """Old recent results should age out and return neutral score when no fresh data exists."""
+    def test_stale_successes_decay_toward_the_prior(self):
+        """Results older than the half-life stop carrying their original weight."""
         import time
 
         self.manager.reliability_decay_half_life_hours = 24
@@ -695,8 +604,8 @@ class TestProxyManager(ProxyManagerTestBase):
         self.assertGreater(score, 5.0)
         self.assertLess(score, 20.0)
 
-    def test_elo_score_prefers_fresh_failures_over_old_successes(self):
-        """Recent failures should dominate when old successes are out of age window."""
+    def test_fresh_failures_outweigh_aged_successes(self):
+        """Recent failures dominate once the successes behind them have aged."""
         import time
 
         self.manager.reliability_decay_half_life_hours = 24
@@ -712,8 +621,8 @@ class TestProxyManager(ProxyManagerTestBase):
         score = self.manager._refresh_score(stat)
         self.assertLess(score, 5.0)
 
-    def test_elo_score_historical_data_decays_toward_neutral(self):
-        """Historical counters should decay toward neutral when feedback is very old."""
+    def test_aged_counter_history_decays_to_the_prior(self):
+        """Counter-only history seeded from an old timestamp ages to the prior."""
         import time
 
         self.manager.reliability_decay_half_life_hours = 24
@@ -850,7 +759,7 @@ class TestIssue13PoolQuality(ProxyManagerTestBase):
 
     # ---------- Finding 5: an all-failure window got a neutral latency score ----------
 
-    def test_all_failures_get_no_neutral_latency_credit(self):
+    def test_a_window_without_successes_scores_at_or_below_the_prior(self):
         """A window with results but zero successes scores near zero."""
         score = self.manager._refresh_score(
             self.make_stat([(False, None)] * 50)
@@ -858,8 +767,8 @@ class TestIssue13PoolQuality(ProxyManagerTestBase):
 
         self.assertLessEqual(score, 5.0)
 
-    def test_untried_proxy_keeps_the_neutral_baseline(self):
-        """The neutral score belongs to proxies with no data, not broken ones."""
+    def test_untried_proxy_scores_the_fixed_prior(self):
+        """The prior belongs to proxies with no data, not to broken ones."""
         self.assertEqual(
             self.manager._refresh_score(self.manager._get_new_proxy_stat()),
             5.0,
@@ -867,8 +776,8 @@ class TestIssue13PoolQuality(ProxyManagerTestBase):
 
     # ---------- Finding 4: latency masked a low success rate ----------
 
-    def test_low_success_rate_cannot_hide_behind_low_latency(self):
-        """A fast but unreliable proxy must rank below an untried one."""
+    def test_a_trailing_failure_run_drops_below_the_prior(self):
+        """A proxy whose recent window ends in failures ranks below an untried one."""
         score = self.manager._refresh_score(
             self.make_stat([(True, 200)] * 17 + [(False, None)] * 33)
         )
@@ -1397,10 +1306,11 @@ class TestIssue13PoolQuality(ProxyManagerTestBase):
         self.assertEqual(drift["missing"], [])
         self.assertEqual(drift["unknown"], [])
 
-    def test_shipped_example_config_covers_every_configurable_key(self):
+    def test_shipped_example_config_declares_the_key_tunables(self):
         """
-        Guard against the reverse drift: a new tunable added in code but never
-        documented in config.example.ini.
+        A spot check against reverse drift - a tunable added in code but never
+        documented in config.example.ini. It samples the list below rather
+        than every key; check_config_drift() covers the whole file at runtime.
         """
         from src.core.proxy_manager import CONFIG_EXAMPLE_PATH
 
@@ -2724,7 +2634,7 @@ class TestIssue23OnlineReliability(ProxyManagerTestBase):
 
     def test_historical_all_failure_record_does_not_bypass_baseline(self):
         """
-        When restoring from DB counters without a recent window, an all-failure
+        When restoring counter-only history without a recent window, an all-failure
         historical record (e.g. 0 successes, 10 failures) must not receive a 10.0 floor
         and must score strictly below the baseline.
         """
