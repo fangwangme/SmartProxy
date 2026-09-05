@@ -52,7 +52,6 @@ class TestIPRestriction(unittest.TestCase):
         self.mock_proxy_manager.allocate_proxy.return_value = {
             "proxy": "http://proxy:8080",
             "source": "default",
-            "allocation_id": "test-allocation",
         }
 
         response = self.client.get(
@@ -100,7 +99,6 @@ class TestIPRestriction(unittest.TestCase):
         self.mock_proxy_manager.allocate_proxy.return_value = {
             "proxy": "http://proxy:8080",
             "source": "default",
-            "allocation_id": "test-allocation",
         }
 
         response = self.client.get(
@@ -118,7 +116,6 @@ class TestIPRestriction(unittest.TestCase):
         self.mock_proxy_manager.allocate_proxy.return_value = {
             "proxy": "http://proxy:8080",
             "source": "default",
-            "allocation_id": "test-allocation",
         }
 
         response = self.client.get(
@@ -151,7 +148,6 @@ class TestIPRestriction(unittest.TestCase):
         self.mock_proxy_manager.allocate_proxy.return_value = {
             "proxy": "http://proxy:8080",
             "source": "default",
-            "allocation_id": "test-allocation",
         }
 
         response = self.client.get(
@@ -183,7 +179,6 @@ class TestIPRestriction(unittest.TestCase):
         self.mock_proxy_manager.allocate_proxy.return_value = {
             "proxy": "http://proxy:8080",
             "source": "default",
-            "allocation_id": "test-allocation",
         }
 
         response = self.client.get(

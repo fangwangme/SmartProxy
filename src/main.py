@@ -84,7 +84,7 @@ def main():
         if args.debug:
             app.run(host="0.0.0.0", port=proxy_manager.server_port, debug=False)
         else:
-            # One process keeps allocation, lease, and scoring state coherent.
+            # One process keeps lease and scoring state coherent.
             serve(
                 app,
                 host="0.0.0.0",

@@ -224,7 +224,7 @@ class ValidationOutageContractTests(ProxyManagerTestBase):
         self.assertFalse(self.manager.is_validating)
 
 
-class TestAllocationIdentityAndPlans(ProxyManagerTestBase):
+class TestHandoutAccountingAndPlans(ProxyManagerTestBase):
     def _install_qualified(self, source="source1", proxy="http://192.0.2.30:80", quality=0.9):
         now = time.time()
         stat = self.manager._get_new_proxy_stat(source) | {
@@ -252,214 +252,49 @@ class TestAllocationIdentityAndPlans(ProxyManagerTestBase):
             for counts in by_source.values()
         )
 
-    def test_out_of_order_feedback_is_exactly_once_and_duplicate_is_inert(self):
+    def test_feedback_closes_one_handout_and_extra_reports_are_counted(self):
         proxy, stat = self._install_qualified()
-        first = self.manager.allocate_proxy("source1")
-        second = self.manager.allocate_proxy("source1")
-        self.assertNotEqual(first["allocation_id"], second["allocation_id"])
+        self.manager.allocate_proxy("source1")
+        self.manager.allocate_proxy("source1")
         self.assertEqual(stat["handout_count"], 2)
         self.assertEqual(len(stat["inflight"]), 2)
 
-        second_result = self.manager.process_feedback(
-            "source1", proxy, 200, allocation_id=second["allocation_id"]
-        )
-        first_result = self.manager.process_feedback(
-            "source1", proxy, 200, allocation_id=first["allocation_id"]
-        )
-        before_duplicate = (
+        self.manager.process_feedback("source1", proxy, 200)
+        self.manager.process_feedback("source1", proxy, 200)
+
+        self.assertEqual(len(stat["inflight"]), 0)
+        self.assertEqual(self.manager.unmatched_feedback_total, 0)
+
+        before = (
             stat["success_count"],
-            copy.deepcopy(stat["recent_results"]),
             self._aggregate_total(),
             self.manager.accepted_feedback_success_total,
         )
-        duplicate = self.manager.process_feedback(
-            "source1", proxy, 200, allocation_id=first["allocation_id"]
-        )
+        # A third report has no handout behind it. The service is a neutral
+        # referee, so it is still scored - but it is counted, because a
+        # duplicate, a late report or a wrong source is the only way to
+        # produce one.
+        self.manager.process_feedback("source1", proxy, 200)
 
-        self.assertTrue(second_result["accepted"] and first_result["accepted"])
-        self.assertFalse(duplicate["accepted"])
-        self.assertEqual(duplicate["reason"], "duplicate_allocation_id")
-        self.assertEqual(len(stat["inflight"]), 0)
-        self.assertEqual(stat["handout_count"], 2)
+        self.assertEqual(self.manager.unmatched_feedback_total, 1)
+        self.assertEqual(stat["success_count"], before[0] + 1)
+        self.assertEqual(self._aggregate_total(), before[1] + 1)
         self.assertEqual(
-            before_duplicate,
-            (
-                stat["success_count"],
-                stat["recent_results"],
-                self._aggregate_total(),
-                self.manager.accepted_feedback_success_total,
-            ),
+            self.manager.accepted_feedback_success_total, before[2] + 1
         )
 
-    def test_unknown_cross_source_and_cross_proxy_ids_change_nothing(self):
-        proxy, stat = self._install_qualified()
-        allocation = self.manager.allocate_proxy("source1")
-        before = (
-            stat["score"],
-            stat["success_count"],
-            stat["failure_count"],
-            list(stat["inflight"]),
-            self._aggregate_total(),
-        )
-
-        results = [
-            self.manager.process_feedback(
-                "source1", proxy, 200, allocation_id="unknown-token"
-            ),
-            self.manager.process_feedback(
-                "source2", proxy, 200, allocation_id=allocation["allocation_id"]
-            ),
-            self.manager.process_feedback(
-                "unknown-source",
-                proxy,
-                200,
-                allocation_id=allocation["allocation_id"],
-            ),
-            self.manager.process_feedback(
-                "source1",
-                "http://192.0.2.31:80",
-                200,
-                allocation_id=allocation["allocation_id"],
-            ),
-        ]
-
-        self.assertEqual(
-            [result["reason"] for result in results],
-            [
-                "unknown_allocation_id",
-                "allocation_source_mismatch",
-                "allocation_source_mismatch",
-                "allocation_proxy_mismatch",
-            ],
-        )
-        self.assertTrue(all(not result["accepted"] for result in results))
-        self.assertEqual(
-            before,
-            (
-                stat["score"],
-                stat["success_count"],
-                stat["failure_count"],
-                stat["inflight"],
-                self._aggregate_total(),
-            ),
-        )
-
-    def test_expired_allocation_is_rejected_without_mutation(self):
-        proxy, stat = self._install_qualified()
-        allocation = self.manager.allocate_proxy("source1")
-        expired_at = time.time() - 1
-        self.manager.allocations[allocation["allocation_id"]]["expires_at"] = expired_at
-        stat["inflight"] = [expired_at]
-        before = (stat["score"], stat["success_count"], self._aggregate_total())
-
-        result = self.manager.process_feedback(
-            "source1", proxy, 200, allocation_id=allocation["allocation_id"]
-        )
-
-        self.assertEqual(result, {"accepted": False, "reason": "expired"})
-        self.assertEqual(len(stat["inflight"]), 0)
-        self.assertNotIn(("source1", proxy), self.manager.allocations_by_proxy)
-        self.assertEqual(
-            before, (stat["score"], stat["success_count"], self._aggregate_total())
-        )
-
-    def test_completed_allocation_retention_is_time_bounded(self):
-        proxy, _ = self._install_qualified()
-        allocation = self.manager.allocate_proxy("source1")
-        self.manager.process_feedback(
-            "source1", proxy, 200, allocation_id=allocation["allocation_id"]
-        )
-        self.manager.completed_allocations[allocation["allocation_id"]][
-            "completed_at"
-        ] = time.time() - self.manager.completed_allocation_retention_s - 1
-
-        self.manager._cleanup_allocations_locked(time.time())
-
-        self.assertNotIn(
-            allocation["allocation_id"], self.manager.completed_allocations
-        )
-
-    def test_pruned_expired_lease_does_not_release_a_live_request(self):
+    def test_expired_leases_are_pruned_before_a_release(self):
         now = time.time()
         expired_at = now - 1
         live_until = now + 60
         stat = {"inflight": [expired_at, live_until]}
 
-        self.manager._lease_count(stat, now)
-        self.manager._release_lease_expiry(stat, expired_at)
+        # The pruning pass drops the expired slot, so the release that follows
+        # frees the live one rather than an already-reclaimed slot.
+        self.assertEqual(self.manager._lease_count(stat, now), 1)
+        self.manager._release_lease(stat)
 
-        self.assertEqual(stat["inflight"], [live_until])
-
-    def test_allocation_cleanup_stops_at_the_first_live_record(self):
-        class PrefixOnlyAllocations(dict):
-            def items(inner_self):
-                iterator = iter(super(PrefixOnlyAllocations, inner_self).items())
-                yield next(iterator)
-                raise AssertionError("cleanup scanned beyond the expiry prefix")
-
-        now = time.time()
-        self.manager.allocations = PrefixOnlyAllocations(
-            {
-                "live-first": {
-                    "source": "source1",
-                    "proxy": "http://192.0.2.40:80",
-                    "expires_at": now + 60,
-                    "premium": False,
-                },
-                "live-second": {
-                    "source": "source1",
-                    "proxy": "http://192.0.2.41:80",
-                    "expires_at": now + 60,
-                    "premium": False,
-                },
-            }
-        )
-
-        self.manager._cleanup_allocations_locked(now)
-
-        self.assertEqual(len(self.manager.allocations), 2)
-
-    def test_legacy_feedback_uses_and_cleans_the_reverse_index(self):
-        proxy, stat = self._install_qualified()
-        first = self.manager.allocate_proxy("source1")
-        second = self.manager.allocate_proxy("source1")
-        key = ("source1", proxy)
-        self.assertEqual(
-            list(self.manager.allocations_by_proxy[key]),
-            [first["allocation_id"], second["allocation_id"]],
-        )
-
-        accepted = self.manager.process_feedback("source1", proxy, 200)
-
-        self.assertTrue(accepted["accepted"])
-        self.assertEqual(len(self.manager.allocations_by_proxy[key]), 1)
-        remaining_id = next(iter(self.manager.allocations_by_proxy[key]))
-        self.manager.process_feedback(
-            "source1", proxy, 200, allocation_id=remaining_id
-        )
-        self.assertNotIn(key, self.manager.allocations_by_proxy)
         self.assertEqual(stat["inflight"], [])
-
-    def test_compatibility_and_strict_modes_are_explicit(self):
-        proxy, stat = self._install_qualified()
-        allocation = self.manager.allocate_proxy("source1")
-        compatibility = self.manager.process_feedback("source1", proxy, 200)
-
-        self.assertEqual(compatibility["reason"], "accepted_legacy")
-        self.assertEqual(self.manager.legacy_feedback_total, 1)
-        self.assertNotIn(allocation["allocation_id"], self.manager.allocations)
-        self.assertEqual(len(stat["inflight"]), 0)
-
-        strict_allocation = self.manager.allocate_proxy("source1")
-        before = (stat["score"], stat["success_count"], len(stat["inflight"]))
-        self.manager.allow_legacy_feedback = False
-        strict = self.manager.process_feedback("source1", proxy, 200)
-
-        self.assertEqual(
-            strict, {"accepted": False, "reason": "allocation_id_required"}
-        )
-        self.assertIn(strict_allocation["allocation_id"], self.manager.allocations)
-        self.assertEqual(before, (stat["score"], stat["success_count"], len(stat["inflight"])))
 
     def test_stale_exploit_member_is_tombstoned_before_handout(self):
         proxy, stat = self._install_qualified()
@@ -480,13 +315,10 @@ class TestAllocationIdentityAndPlans(ProxyManagerTestBase):
 
     def test_demotion_moves_from_exploit_to_trial_atomically(self):
         proxy, stat = self._install_qualified(quality=0.06)
-        allocation = self.manager.allocate_proxy("source1")
-        result = self.manager.process_feedback(
-            "source1", proxy, 500, allocation_id=allocation["allocation_id"]
-        )
+        self.manager.allocate_proxy("source1")
+        self.manager.process_feedback("source1", proxy, 500)
         plan = self.manager.serving_plans["source1"]
 
-        self.assertTrue(result["accepted"])
         self.assertFalse(self.manager._is_qualified(stat))
         self.assertNotIn(proxy, plan["exploit_members"])
         self.assertNotIn(proxy, plan["exploit"])
@@ -506,28 +338,26 @@ class TestAllocationIdentityAndPlans(ProxyManagerTestBase):
         with self.manager.lock:
             self.manager._build_serving_plan("source1")
 
-        allocation = self.manager.allocate_proxy("source1")
-        self.manager.process_feedback(
-            "source1", proxy, 200, allocation_id=allocation["allocation_id"]
-        )
+        self.manager.allocate_proxy("source1")
+        self.manager.process_feedback("source1", proxy, 200)
 
         plan = self.manager.serving_plans["source1"]
         self.assertNotIn(proxy, plan["members"])
         self.assertNotIn(proxy, plan["discovery"])
         self.assertNotIn(proxy, plan["fallback"])
 
-    def test_premium_uses_source_allocation_and_demotes_immediately(self):
+    def test_premium_uses_the_source_contract_and_demotes_immediately(self):
         proxy, stat = self._install_qualified(quality=0.06)
         self.manager.premium_min_usage_count = 3
         self.manager._sync_premium_proxies_locked()
 
-        allocation = self.manager.allocate_premium_proxy()
-        self.assertEqual(allocation["source"], "source1")
-        self.assertTrue(self.manager.allocations[allocation["allocation_id"]]["premium"])
+        handout = self.manager.allocate_premium_proxy()
+        # The premium endpoint reports the pool the proxy is scored under, so
+        # feedback for it lands in the right ledger instead of a guess.
+        self.assertEqual(handout["source"], "source1")
+        self.assertEqual(len(self.manager.source_stats["source1"][proxy]["inflight"]), 1)
         with patch.object(self.manager, "_sync_premium_proxies_locked") as sync:
-            self.manager.process_feedback(
-                "source1", proxy, 500, allocation_id=allocation["allocation_id"]
-            )
+            self.manager.process_feedback("source1", proxy, 500)
 
         sync.assert_not_called()
         self.assertFalse(self.manager._is_qualified(stat))
@@ -924,7 +754,7 @@ class TestConfigurationBoundaries(ProxyManagerTestBase):
             ({"source_pool": {"retry_attempts": "-1"}}, "retry attempts"),
             ({"source_pool": {"retry_delay_seconds": "-1"}}, "retry delay"),
             ({"source_pool": {"probation_forgiveness_hours": "0"}}, "forgiveness"),
-            ({"source_pool": {"proxy_inflight_timeout_seconds": "0"}}, "allocation expiry"),
+            ({"source_pool": {"proxy_inflight_timeout_seconds": "0"}}, "lease expiry"),
             ({"source_pool": {"proxy_max_inflight": "-1"}}, "capacity"),
             ({"source_pool": {"exploit_draw_attempts": "0"}}, "draw attempts"),
             ({"source_pool": {"serving_plan_max_age_seconds": "0"}}, "plan age"),
@@ -934,8 +764,6 @@ class TestConfigurationBoundaries(ProxyManagerTestBase):
             ({"source_pool": {"max_feedback_latency_ms": "0"}}, "latency bound"),
             ({"source_pool": {"premium_pool_size": "-1"}}, "premium pool"),
             ({"source_pool": {"premium_min_usage_count": "-1"}}, "premium evidence"),
-            ({"source_pool": {"completed_allocation_retention_seconds": "0"}}, "completed retention"),
-            ({"source_pool": {"completed_allocation_max": "0"}}, "completed count"),
             ({"source_pool": {"reliability_prior": "1.1"}}, "prior"),
             ({"source_pool": {"reliability_slow_alpha": "0"}}, "slow alpha"),
             ({"source_pool": {"reliability_slow_alpha": "0.5", "reliability_fast_alpha": "0.4"}}, "alpha ordering"),
@@ -1128,8 +956,7 @@ class TestApiAndLifecycleContracts(ProxyManagerTestBase):
         body = response.get_data(as_text=True)
         expected_families = [
             "smartproxy_feedback_accepted_total",
-            "smartproxy_feedback_legacy_total",
-            "smartproxy_feedback_rejected_total",
+            "smartproxy_feedback_unmatched_total",
             "smartproxy_source_outage_guard_active",
             "smartproxy_source_outage_guard_paused_updates_total",
             "smartproxy_validation_target_failures_total",
@@ -1144,28 +971,24 @@ class TestApiAndLifecycleContracts(ProxyManagerTestBase):
         self.assertIn(
             'smartproxy_feedback_accepted_total{outcome="failure"} 1', body
         )
-        self.assertIn("smartproxy_feedback_legacy_total 1", body)
+        self.assertIn("smartproxy_feedback_unmatched_total 1", body)
 
-    def test_get_routes_preserve_fields_and_add_source_and_allocation(self):
-        allocation = {
-            "proxy": "http://192.0.2.51:8080",
-            "source": "source1",
-            "allocation_id": "opaque-token",
-        }
-        with patch.object(self.manager, "allocate_proxy", return_value=allocation):
+    def test_get_routes_preserve_fields_and_add_source(self):
+        handout = {"proxy": "http://192.0.2.51:8080", "source": "source1"}
+        with patch.object(self.manager, "allocate_proxy", return_value=handout):
             normal = self.client.get("/get-proxy?source=source1")
         with patch.object(
-            self.manager, "allocate_premium_proxy", return_value=allocation
+            self.manager, "allocate_premium_proxy", return_value=handout
         ):
             premium = self.client.get("/get-premium-proxy")
 
         for response in (normal, premium):
             payload = response.get_json()
             self.assertEqual(response.status_code, 200)
-            self.assertEqual(payload["http"], allocation["proxy"])
-            self.assertEqual(payload["https"], allocation["proxy"])
+            self.assertEqual(payload["http"], handout["proxy"])
+            self.assertEqual(payload["https"], handout["proxy"])
             self.assertEqual(payload["source"], "source1")
-            self.assertEqual(payload["allocation_id"], "opaque-token")
+            self.assertNotIn("allocation_id", payload)
 
     def test_scheduler_submits_one_initial_fetch_and_tracks_work(self):
         job = {

@@ -6,7 +6,6 @@ import ipaddress
 import json
 import math
 import random
-import secrets
 import socket
 import tempfile
 import threading
@@ -17,7 +16,7 @@ import asyncio
 import subprocess
 import aiohttp
 from typing import Dict, List, NamedTuple, Optional, Set, Tuple
-from collections import defaultdict, OrderedDict
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from datetime import datetime
 from pathlib import Path
@@ -162,15 +161,13 @@ class ProxyManager:
         self.serving_plans: Dict[str, Dict] = {}
         self.cold_start_fallback_logged: Set[str] = set()
         self.plan_refreshing: Set[str] = set()
-        self.allocations: Dict[str, Dict] = {}
-        self.allocations_by_proxy: Dict[
-            Tuple[str, str], Dict[str, None]
-        ] = defaultdict(dict)
-        self.completed_allocations: OrderedDict[str, Dict] = OrderedDict()
         self.accepted_feedback_success_total = 0
         self.accepted_feedback_failure_total = 0
-        self.legacy_feedback_total = 0
-        self.rejected_feedback_total = defaultdict(int)
+        # Feedback that arrived with no outstanding handout to close. It is
+        # still scored - the client owns its own correctness - but duplicate,
+        # late and cross-source reports are the only things that can produce
+        # it, so it is the one number that says whether they happen here.
+        self.unmatched_feedback_total = 0
         self.validation_target_failures = defaultdict(int)
         self.last_validation_success_ts: Optional[float] = None
         self.last_flush_success_ts: Optional[float] = None
@@ -194,11 +191,6 @@ class ProxyManager:
         self.last_source_refresh_time = 0
 
         self._load_config()
-        if self.allow_legacy_feedback:
-            logger.warning(
-                "Legacy feedback compatibility is enabled; feedback without an "
-                "allocation_id cannot provide exact idempotency."
-            )
         # Configuration is fully parsed and semantically validated before a
         # database pool is opened or any active manager state is published.
         self.db = DatabaseManager(self.config)
@@ -548,15 +540,6 @@ class ProxyManager:
         self.premium_min_usage_count = self._cfg_int(
             "source_pool", "premium_min_usage_count", 50, low=0
         )
-        self.allow_legacy_feedback = self.config.getboolean(
-            "source_pool", "allow_legacy_feedback", fallback=True
-        )
-        self.completed_allocation_retention_s = self._cfg_float(
-            "source_pool", "completed_allocation_retention_seconds", 3600.0, low=1.0
-        )
-        self.completed_allocation_max = self._cfg_int(
-            "source_pool", "completed_allocation_max", 100000, low=1
-        )
 
         # Fetcher configuration.
         # Proxy-list downloads use curl. The validator remains aiohttp-based
@@ -849,7 +832,7 @@ class ProxyManager:
         RESTART_REQUIRED_CONFIG, which are consumed once during construction.
         """
         logger.info("Attempting to reload configuration from config file...")
-        # Database latency must not stall allocations and feedback behind the
+        # Database latency must not stall proxy handouts and feedback behind the
         # manager lock. Backoff state is advisory and can safely be snapshotted
         # immediately before applying the new file.
         backoff_states = self._read_source_backoff_states()
@@ -958,18 +941,6 @@ class ProxyManager:
             if removed_sources:
                 logger.info(f"Predefined sources changed. Removed: {removed_sources}")
                 for source in removed_sources:
-                    for allocation_id in [
-                        candidate_id
-                        for candidate_id, record in self.allocations.items()
-                        if record["source"] == source
-                    ]:
-                        self._pop_allocation_locked(allocation_id)
-                    for allocation_id in [
-                        candidate_id
-                        for candidate_id, record in self.completed_allocations.items()
-                        if record["source"] == source
-                    ]:
-                        self.completed_allocations.pop(allocation_id, None)
                     self.source_stats.pop(source, None)
                     self.available_proxies.pop(source, None)
                     self.outage_states.pop(source, None)
@@ -2454,12 +2425,12 @@ class ProxyManager:
         }
 
     def get_proxy(self, source: str) -> Optional[str]:
-        allocation = self.allocate_proxy(source)
-        return allocation["proxy"] if allocation else None
+        handout = self.allocate_proxy(source)
+        return handout["proxy"] if handout else None
 
     def allocate_proxy(self, source: str) -> Optional[Dict[str, str]]:
         """
-        Draw one proxy and create an opaque, source-bound allocation.
+        Draw one proxy for a source and record the handout.
 
         The request path deliberately holds no pool logic: eligibility,
         qualification, ranking and weights are all decided by
@@ -2471,7 +2442,6 @@ class ProxyManager:
         source = self._get_source_or_default(source)
 
         with self.lock:
-            self._cleanup_allocations_locked(time.time())
             plan = self._serving_plan(source)
             if plan is None:
                 logger.warning(f"No proxy pools defined for source '{source}'.")
@@ -2504,14 +2474,8 @@ class ProxyManager:
                             plan["exploration_ratio"] * 100,
                         )
                         self.cold_start_fallback_logged.add(source)
-                    allocation_id = self._mark_proxy_handed_out(
-                        source, selected, now_ts, premium=False
-                    )
-                    return {
-                        "proxy": selected,
-                        "source": source,
-                        "allocation_id": allocation_id,
-                    }
+                    self._mark_proxy_handed_out(source, selected, now_ts)
+                    return {"proxy": selected, "source": source}
 
             if not exploit:
                 logger.warning(
@@ -2529,14 +2493,8 @@ class ProxyManager:
                     source,
                 )
                 return None
-            allocation_id = self._mark_proxy_handed_out(
-                source, selected, now_ts, premium=False
-            )
-            return {
-                "proxy": selected,
-                "source": source,
-                "allocation_id": allocation_id,
-            }
+            self._mark_proxy_handed_out(source, selected, now_ts)
+            return {"proxy": selected, "source": source}
 
     @staticmethod
     def _pop_random(pool: List[str]) -> str:
@@ -2911,138 +2869,17 @@ class ProxyManager:
         leases.append(now_ts + self.proxy_inflight_timeout_s)
 
     @staticmethod
-    def _release_lease_expiry(stat: Dict, expiry: float):
+    def _release_lease(stat: Dict):
+        """
+        Feedback closes the oldest outstanding handout for this proxy.
+
+        Only the count is ever read, so closing the oldest slot rather than the
+        one this particular request opened is equivalent: either way one
+        outstanding handout becomes free.
+        """
         leases = stat.get("inflight")
-        if not leases:
-            return
-        try:
-            leases.remove(expiry)
-        except ValueError:
-            # _lease_count() may already have pruned this expired slot. Never
-            # substitute another live request's lease for the missing one.
-            pass
-
-    def _pop_allocation_locked(self, allocation_id: str) -> Optional[Dict]:
-        """Remove one allocation and its reverse-index entry."""
-        record = self.allocations.pop(allocation_id, None)
-        if record is None:
-            return None
-        key = (record["source"], record["proxy"])
-        indexed = self.allocations_by_proxy.get(key)
-        if indexed is not None:
-            indexed.pop(allocation_id, None)
-            if not indexed:
-                self.allocations_by_proxy.pop(key, None)
-        return record
-
-    def _remember_completed_allocation_locked(
-        self, allocation_id: str, record: Dict, reason: str, now_ts: float
-    ):
-        self.completed_allocations[allocation_id] = {
-            "source": record["source"],
-            "proxy": record["proxy"],
-            "reason": reason,
-            "completed_at": now_ts,
-        }
-        self.completed_allocations.move_to_end(allocation_id)
-        cutoff = now_ts - self.completed_allocation_retention_s
-        while self.completed_allocations:
-            _, oldest = next(iter(self.completed_allocations.items()))
-            if (
-                len(self.completed_allocations) <= self.completed_allocation_max
-                and oldest["completed_at"] >= cutoff
-            ):
-                break
-            self.completed_allocations.popitem(last=False)
-
-    def _cleanup_allocations_locked(self, now_ts: float):
-        cutoff = now_ts - self.completed_allocation_retention_s
-        while self.completed_allocations:
-            _, oldest = next(iter(self.completed_allocations.items()))
-            if oldest["completed_at"] >= cutoff:
-                break
-            self.completed_allocations.popitem(last=False)
-        # All live allocations use the same restart-only timeout, so insertion
-        # order is expiry order and expired records are a prefix.
-        expired_ids = []
-        for allocation_id, record in self.allocations.items():
-            if record["expires_at"] > now_ts:
-                break
-            expired_ids.append(allocation_id)
-        for allocation_id in expired_ids:
-            record = self._pop_allocation_locked(allocation_id)
-            if record is None:
-                continue
-            stat = self.source_stats.get(record["source"], {}).get(record["proxy"])
-            if stat is not None:
-                self._release_lease_expiry(stat, record["expires_at"])
-            self._remember_completed_allocation_locked(
-                allocation_id, record, "expired", now_ts
-            )
-
-    def _accept_feedback_allocation_locked(
-        self,
-        source: str,
-        proxy_url: str,
-        allocation_id: Optional[str],
-        now_ts: float,
-    ) -> Tuple[bool, str, str]:
-        """Validate feedback identity and close exactly one matching lease."""
-        self._cleanup_allocations_locked(now_ts)
-        if allocation_id is None:
-            if not self.allow_legacy_feedback:
-                return False, "allocation_id_required", source
-            normalized_source = self._get_source_or_default(source)
-            matching_id = next(
-                iter(
-                    self.allocations_by_proxy.get(
-                        (normalized_source, proxy_url), ()
-                    )
-                ),
-                None,
-            )
-            if matching_id is not None:
-                record = self._pop_allocation_locked(matching_id)
-                stat = self.source_stats.get(normalized_source, {}).get(proxy_url)
-                if stat is not None and record is not None:
-                    self._release_lease_expiry(stat, record["expires_at"])
-                if record is not None:
-                    self._remember_completed_allocation_locked(
-                        matching_id, record, "accepted_legacy", now_ts
-                    )
-            self.legacy_feedback_total += 1
-            logger.debug(
-                "Accepted feedback without allocation_id in compatibility mode; "
-                "exact idempotency is unavailable."
-            )
-            return True, "accepted_legacy", normalized_source
-
-        if not isinstance(allocation_id, str) or not allocation_id.strip():
-            return False, "invalid_allocation_id", source
-        completed = self.completed_allocations.get(allocation_id)
-        if completed is not None:
-            reason = completed["reason"]
-            if reason in {"accepted", "accepted_legacy"}:
-                reason = "duplicate_allocation_id"
-            return False, reason, source
-        record = self.allocations.get(allocation_id)
-        if record is None:
-            return False, "unknown_allocation_id", source
-        if source != record["source"]:
-            return False, "allocation_source_mismatch", source
-        if proxy_url != record["proxy"]:
-            return False, "allocation_proxy_mismatch", source
-
-        record = self._pop_allocation_locked(allocation_id)
-        if record is None:
-            return False, "unknown_allocation_id", source
-        stat = self.source_stats.get(source, {}).get(proxy_url)
-        if stat is not None:
-            self._release_lease_expiry(stat, record["expires_at"])
-        self._remember_completed_allocation_locked(
-            allocation_id, record, "accepted", now_ts
-        )
-        return True, "accepted", source
+        if leases:
+            del leases[0]
 
     def _inflight_limit(self, stat: Dict, now_ts: Optional[float] = None) -> int:
         return (
@@ -3107,51 +2944,36 @@ class ProxyManager:
                 groups["retry"].append(proxy_url)
         return groups, qualified, live_count
 
-    def _mark_proxy_handed_out(
-        self, source: str, proxy_url: str, now_ts: float, premium: bool = False
-    ) -> str:
+    def _mark_proxy_handed_out(self, source: str, proxy_url: str, now_ts: float):
         # Handout times exist only to answer the cooldown question. With
         # cooldown off - the default - recording them is a write on the hot
         # path feeding a map that is never read and never shrinks.
         if self.proxy_cooldown_ms > 0:
             self.proxy_last_handed_out_ts[source][proxy_url] = now_ts
         stat = self.source_stats.get(source, {}).get(proxy_url)
-        allocation_id = secrets.token_urlsafe(24)
-        expires_at = now_ts + self.proxy_inflight_timeout_s
-        self.allocations[allocation_id] = {
-            "source": source,
-            "proxy": proxy_url,
-            "expires_at": expires_at,
-            "premium": bool(premium),
-        }
-        self.allocations_by_proxy[(source, proxy_url)][allocation_id] = None
         if stat is None:
-            return allocation_id
+            return
         stat["handout_count"] = int(stat.get("handout_count", 0) or 0) + 1
         stat["last_handed_out_ts"] = now_ts
         qualified = self._is_qualified(stat, now_ts)
-        # Track the outstanding handout only where something reads it back: a
-        # trial candidate, whose one-at-a-time rule the plan enforces, or a
-        # deployment that has opted into a per-proxy concurrency cap. With the
-        # cap off there is nothing to compare against, and appending to a list
-        # nobody consults just grows it between syncs.
-        # Every handout owns a lease even when the configured capacity is
-        # unlimited; exact feedback must still be able to identify and close
-        # only this request's allocation.
+        # Every handout owns a lease, including a qualified proxy under the
+        # default unlimited cap. The trial one-at-a-time rule and an opt-in
+        # proxy_max_inflight both read the count, and so does the unmatched-
+        # feedback counter, which can only tell a duplicate from a first
+        # report if every handout is represented here.
         self._grant_lease(stat, now_ts)
         # A paused source produces no usable evidence, so a handout made during
         # one must not spend the trial budget it would otherwise be judged on:
         # the guard exists to keep an outage from costing proxies their
         # reputation, and the trial budget is part of that reputation.
         if self.outage_states.get(source, {}).get("active"):
-            return allocation_id
+            return
         if not qualified:
             stat["trial_handout_count"] = int(
                 stat.get("trial_handout_count", 0) or 0
             ) + 1
             if stat["trial_handout_count"] >= self.probation_attempts:
                 stat["retry_after_ts"] = now_ts + self.retry_delay_s
-        return allocation_id
 
     def _is_eligible(
         self,
@@ -3189,15 +3011,14 @@ class ProxyManager:
         return limit <= 0 or self._lease_count(stat, now_ts) < limit
 
     def get_premium_proxy(self) -> Optional[str]:
-        allocation = self.allocate_premium_proxy()
-        return allocation["proxy"] if allocation else None
+        handout = self.allocate_premium_proxy()
+        return handout["proxy"] if handout else None
 
     def allocate_premium_proxy(self) -> Optional[Dict[str, str]]:
         """
         Allocate a premium proxy through the normal source/capacity contract.
         """
         with self.lock:
-            self._cleanup_allocations_locked(time.time())
             candidates = []
             now_ts = time.time()
             for proxy_url in list(self.premium_proxies):
@@ -3229,18 +3050,12 @@ class ProxyManager:
                 return None
 
             source, selected = random.choice(candidates)
-            allocation_id = self._mark_proxy_handed_out(
-                source, selected, now_ts, premium=True
-            )
+            self._mark_proxy_handed_out(source, selected, now_ts)
             logger.debug(
                 f"Premium proxy selected: {selected} "
                 f"(pool size: {len(candidates)})"
             )
-            return {
-                "proxy": selected,
-                "source": source,
-                "allocation_id": allocation_id,
-            }
+            return {"proxy": selected, "source": source}
 
     def _sync_premium_proxies_locked(self):
         # Aggregate all proxies with their highest score across all sources.
@@ -3764,8 +3579,7 @@ class ProxyManager:
         status_code: int,
         response_time_ms: Optional[int] = None,
         failure_kind: Optional[str] = None,
-        allocation_id: Optional[str] = None,
-    ) -> Dict[str, object]:
+    ):
         """
         Process feedback for a proxy request with online reliability scoring.
         
@@ -3775,6 +3589,7 @@ class ProxyManager:
         - Updates the slow and fast reliability estimators
         - Maintains historical counters for analytics
         """
+        source = self._get_source_or_default(source)
         is_success = self.classify_feedback_status(status_code)
         if failure_kind and failure_kind not in VALID_FAILURE_KINDS:
             logger.warning("Ignoring unknown failure_kind '{}'", failure_kind)
@@ -3784,21 +3599,25 @@ class ProxyManager:
         current_timestamp = time.time()
 
         with self.lock:
-            accepted, reason, source = self._accept_feedback_allocation_locked(
-                source, proxy_url, allocation_id, current_timestamp
-            )
-            if not accepted:
-                self.rejected_feedback_total[reason] += 1
-                return {"accepted": False, "reason": reason}
-
-            # Aggregates and process-lifetime counters advance only after the
-            # allocation contract has accepted this feedback.
+            # Everything that passed the API boundary is scored. This service
+            # is a neutral referee: it records what the client reports and the
+            # client owns whether that report is right. The one thing worth
+            # measuring is how often a report has no handout behind it, which
+            # is what a duplicate, a late report or a wrong source looks like.
             if is_success:
                 self.feedback_buffer[current_minute][source]["success"] += 1
                 self.accepted_feedback_success_total += 1
             else:
                 self.feedback_buffer[current_minute][source]["failure"] += 1
                 self.accepted_feedback_failure_total += 1
+
+            reported_stat = self.source_stats.get(source, {}).get(proxy_url)
+            if reported_stat is not None:
+                if self._lease_count(reported_stat, current_timestamp) == 0:
+                    self.unmatched_feedback_total += 1
+                # Feedback closes the outstanding handout even when an outage
+                # guard pauses the reputation mutation itself.
+                self._release_lease(reported_stat)
 
             source_reputation_paused = self._observe_source_outage_locked(
                 source, proxy_url, is_success, current_timestamp
@@ -3834,7 +3653,6 @@ class ProxyManager:
                     response_time_ms,
                     current_timestamp,
                 )
-            return {"accepted": True, "reason": reason, "source": source}
 
     def _apply_feedback_to_stat(
         self,

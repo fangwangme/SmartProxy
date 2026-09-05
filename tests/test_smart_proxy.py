@@ -3521,10 +3521,10 @@ class TestIssue23ReviewFixes(ProxyManagerTestBase):
 
     def test_unusable_lease_state_normalizes_to_an_empty_list(self):
         """
-        A lease list is only meaningful alongside the allocation ledger, which
-        does not survive a restart. A stat whose inflight field is missing or
-        malformed therefore starts with no leases rather than inheriting a
-        slot nothing can close.
+        Leases track handouts made by this process and do not survive a
+        restart. A stat whose inflight field is missing or malformed therefore
+        starts with no leases rather than inheriting a slot nothing can
+        close.
         """
         now = time.time()
         for persisted in ({}, {"inflight": None}, {"inflight": "1"}):
@@ -3737,17 +3737,10 @@ class TestIssue23ReviewFixes(ProxyManagerTestBase):
             self.assertEqual(manager.get_proxy(source), proxy)
         self.assertIn("source2", manager.serving_plans)
         self.assertIn("source2", manager.proxy_last_handed_out_ts)
-        completed = next(
-            allocation_id
-            for allocation_id, record in manager.allocations.items()
-            if record["source"] == "source2"
-        )
-        manager.process_feedback(
-            "source2", proxy, 200, allocation_id=completed
-        )
+        manager.process_feedback("source2", proxy, 200)
         manager.proxy_cooldown_ms = 0
         manager._build_serving_plan("source2")
-        live = manager.allocate_proxy("source2")["allocation_id"]
+        manager.allocate_proxy("source2")
 
         import configparser as _cp
         config = _cp.ConfigParser()
@@ -3762,9 +3755,6 @@ class TestIssue23ReviewFixes(ProxyManagerTestBase):
         self.assertNotIn("source2", manager.source_stats)
         self.assertNotIn("source2", manager.serving_plans)
         self.assertNotIn("source2", manager.proxy_last_handed_out_ts)
-        self.assertNotIn(live, manager.allocations)
-        self.assertNotIn(completed, manager.completed_allocations)
-        self.assertNotIn(("source2", proxy), manager.allocations_by_proxy)
 
     def test_reload_rebuilds_plans_so_new_tunables_take_effect(self):
         self.manager.serving_plan_max_age_s = 600.0

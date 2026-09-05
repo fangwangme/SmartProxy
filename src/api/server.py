@@ -184,7 +184,7 @@ def create_app(proxy_manager: ProxyManager):
             
             total_success = proxy_manager.accepted_feedback_success_total
             total_failure = proxy_manager.accepted_feedback_failure_total
-            legacy_total = proxy_manager.legacy_feedback_total
+            unmatched_total = proxy_manager.unmatched_feedback_total
             outage_metrics = [
                 (
                     _prometheus_label(source),
@@ -193,7 +193,6 @@ def create_app(proxy_manager: ProxyManager):
                 )
                 for source, state in proxy_manager.outage_states.items()
             ]
-            rejected_metrics = list(proxy_manager.rejected_feedback_total.items())
             validation_failure_metrics = list(
                 proxy_manager.validation_target_failures.items()
             )
@@ -212,10 +211,6 @@ def create_app(proxy_manager: ProxyManager):
             for source, _, paused in outage_metrics
         )
         
-        rejected_lines = "\n".join(
-            f'smartproxy_feedback_rejected_total{{reason="{_prometheus_label(reason)}"}} {count}'
-            for reason, count in sorted(rejected_metrics)
-        )
         validation_failure_lines = "\n".join(
             'smartproxy_validation_target_failures_total'
             f'{{target_index="{target_index}",kind="{_prometheus_label(kind)}"}} {count}'
@@ -238,13 +233,9 @@ smartproxy_sources_total {sources_count}
 smartproxy_feedback_accepted_total{{outcome="success"}} {total_success}
 smartproxy_feedback_accepted_total{{outcome="failure"}} {total_failure}
 
-# HELP smartproxy_feedback_legacy_total Accepted feedback requests missing allocation IDs
-# TYPE smartproxy_feedback_legacy_total counter
-smartproxy_feedback_legacy_total {legacy_total}
-
-# HELP smartproxy_feedback_rejected_total Feedback requests rejected by allocation identity
-# TYPE smartproxy_feedback_rejected_total counter
-{rejected_lines}
+# HELP smartproxy_feedback_unmatched_total Accepted feedback with no outstanding handout to close
+# TYPE smartproxy_feedback_unmatched_total counter
+smartproxy_feedback_unmatched_total {unmatched_total}
 
 # HELP smartproxy_success_rate_percent Current success rate percentage
 # TYPE smartproxy_success_rate_percent gauge
@@ -285,17 +276,16 @@ smartproxy_plan_refresh_duration_seconds {plan_refresh_duration:.6f}
         source = request.args.get("source")
         if not source:
             return jsonify({"error": "Query parameter 'source' is required."}), 400
-        allocation = proxy_manager.allocate_proxy(source)
-        if allocation:
-            proxy_url = allocation["proxy"]
+        handout = proxy_manager.allocate_proxy(source)
+        if handout:
+            proxy_url = handout["proxy"]
             protocol = proxy_url.split("://", 1)[0] if "://" in proxy_url else "http"
             return jsonify(
                 {
                     "http": proxy_url,
                     "https": proxy_url,
                     "protocol": protocol,
-                    "source": allocation["source"],
-                    "allocation_id": allocation["allocation_id"],
+                    "source": handout["source"],
                 }
             )
         else:
@@ -309,9 +299,9 @@ smartproxy_plan_refresh_duration_seconds {plan_refresh_duration:.6f}
     @app.route("/get-premium-proxy", methods=["GET"])
     def get_premium_proxy_route():
         """Get a premium (highest quality) proxy for Playwright and high-reliability use cases."""
-        allocation = proxy_manager.allocate_premium_proxy()
-        if allocation:
-            proxy_url = allocation["proxy"]
+        handout = proxy_manager.allocate_premium_proxy()
+        if handout:
+            proxy_url = handout["proxy"]
             protocol = proxy_url.split("://", 1)[0] if "://" in proxy_url else "http"
             return jsonify(
                 {
@@ -319,8 +309,7 @@ smartproxy_plan_refresh_duration_seconds {plan_refresh_duration:.6f}
                     "https": proxy_url,
                     "protocol": protocol,
                     "premium": True,
-                    "source": allocation["source"],
-                    "allocation_id": allocation["allocation_id"],
+                    "source": handout["source"],
                 }
             )
         else:
@@ -342,11 +331,6 @@ smartproxy_plan_refresh_duration_seconds {plan_refresh_duration:.6f}
         status_code = data.get("status")
         resp_time = data.get("response_time_ms")
         failure_kind = data.get("failure_kind")
-        allocation_id = data.get("allocation_id")
-        logger.debug(
-            "Handling feedback with allocation_id_present={}.",
-            allocation_id is not None,
-        )
 
         # Validate strictly at the boundary. Anything that reaches
         # process_feedback is written into persistent scoring state and is
@@ -396,10 +380,6 @@ smartproxy_plan_refresh_duration_seconds {plan_refresh_duration:.6f}
             )
         if failure_kind is not None and not isinstance(failure_kind, str):
             return jsonify({"error": "'failure_kind' must be a string."}), 400
-        if allocation_id is not None and (
-            not isinstance(allocation_id, str) or not allocation_id.strip()
-        ):
-            return jsonify({"error": "'allocation_id' must be a non-empty string."}), 400
         if not proxy_manager.is_valid_feedback_status(status_code):
             return (
                 jsonify(
@@ -410,26 +390,10 @@ smartproxy_plan_refresh_duration_seconds {plan_refresh_duration:.6f}
                 400,
             )
 
-        result = proxy_manager.process_feedback(
-            source,
-            proxy_url,
-            status_code,
-            resp_time,
-            failure_kind,
-            allocation_id,
+        proxy_manager.process_feedback(
+            source, proxy_url, status_code, resp_time, failure_kind
         )
-        if not result["accepted"]:
-            status = 400 if result["reason"] == "allocation_id_required" else 409
-            return (
-                jsonify(
-                    {
-                        "error": "Feedback rejected by allocation contract.",
-                        "reason": result["reason"],
-                    }
-                ),
-                status,
-            )
-        return jsonify({"message": "Feedback received.", "accepted": True})
+        return jsonify({"message": "Feedback received."})
 
     @app.route("/reload-sources", methods=["POST"])
     def reload_sources_route():

@@ -98,8 +98,8 @@ SmartProxy is a sophisticated proxy management system designed to provide reliab
     *Or use the management script below.*
 
     Non-debug mode uses one Waitress process with a configurable thread pool.
-    Do not add multiple WSGI worker processes while allocations, leases, and
-    scoring state remain process-local. Debug mode retains Flask's server.
+    Do not add multiple WSGI worker processes while leases and scoring state
+    remain process-local. Debug mode retains Flask's server.
 
 ### **Frontend Setup (Dashboard)**
 
@@ -194,9 +194,7 @@ The service is configured via the config.ini file.
 * **\[source\_pool\]**: Parameters for the scoring and selection algorithm.
   * selection\_strategy: `uniform`, `tiered`, `weighted`, or `softmax`. Note that `uniform` draws every proxy in the pool with equal probability, so the score only decides pool membership and the ranking is otherwise discarded; `softmax` is recommended.
   * softmax\_temperature: Controls temperature scaling for softmax selection (default `14.0`).
-  * proxy\_cooldown\_ms / proxy\_inflight\_timeout\_seconds: Optional cooldown plus the mandatory outstanding-request lease. The lease timeout is restart-only so allocation insertion order remains expiry order.
-  * allow\_legacy\_feedback: Migration gate for clients that omit `allocation_id`. The default compatibility mode accepts them with a deprecation metric and warning, but cannot provide exact idempotency. Set it to `false` only after every client returns allocation IDs.
-  * completed\_allocation\_*: Bounded retention for completed allocation IDs, used to reject duplicates and late feedback.
+  * proxy\_cooldown\_ms / proxy\_inflight\_timeout\_seconds: Optional cooldown plus the outstanding-handout lease. The lease bounds the trial one-at-a-time rule and any opt-in `proxy_max_inflight`, and releases a slot the client never reported. The timeout is restart-only so the lease list stays sorted by expiry.
   * reliability\_prior / reliability\_slow\_alpha / reliability\_fast\_alpha: Fixed prior and two online update speeds (defaults `0.05`, `0.12`, `0.30`).
   * reliability\_decay\_half\_life\_hours: Wall-clock forgiveness toward the fixed prior.
   * exploration\_min\_ratio / exploration\_max\_ratio / exploration\_target\_qualified: One adaptive total exploration budget (defaults 5%, 30%, target 50).
@@ -228,14 +226,13 @@ Fetches an available proxy for a specific use case.
     "http": "http://192.0.2.10:8080",
     "https": "http://192.0.2.10:8080",
     "protocol": "http",
-    "source": "example",
-    "allocation_id": "opaque-token"
+    "source": "example"
   }
 ```
 
 * **Error Response (404)**: Returned if no proxies are currently available for the requested source.
 
-**Note**: the `https` field is the same proxy URL, offered for convenience as the `https` entry of a `requests`-style proxies dict. Validation only exercises the configured `validation_target`(s); it never tests `CONNECT` tunnelling, so HTTPS support through a returned proxy is not verified. Keep `source` and `allocation_id` with the request and return both in `/feedback`.
+**Note**: the `https` field is the same proxy URL, offered for convenience as the `https` entry of a `requests`-style proxies dict. Validation only exercises the configured `validation_target`(s); it never tests `CONNECT` tunnelling, so HTTPS support through a returned proxy is not verified. Return the `source` field verbatim in `/feedback` so the result is scored against the pool the proxy was drawn from - for a premium proxy this is the only way to know which pool that is.
 
 ### **POST /feedback**
 
@@ -243,8 +240,7 @@ Submits feedback on a proxy's performance. This is crucial for the scoring syste
 
 * **Request Body** (JSON):  
   * source (string, required): The source pool the proxy belongs to.  
-  * proxy (string, required): The exact proxy URL returned by the allocation.
-  * allocation\_id (string, required for exact mode): The opaque ID returned by `/get-proxy` or `/get-premium-proxy`. It is source- and proxy-bound and is accepted once.
+  * proxy (string, required): The exact proxy URL that was handed out.
   * status (integer, required): 0 and 4 are legacy failures; 1/2/3 and HTTP 1xx-3xx are successes; HTTP 4xx-5xx are failures; other values are rejected.  
   * response\_time\_ms (integer, optional): Diagnostic response time in milliseconds. It does not affect reliability and is used only as a deterministic tie-break when scores are equal. Must be finite, non-negative, and no larger than `max_feedback_latency_ms` (defaults to one day, `86400000`); anything else is rejected with a 400.
   * failure\_kind (string, optional): One of `timeout`, `proxy_error`, `dead`, `blocked`, `slow`, or `content_error`. `dead` applies the failure to every source where that proxy is tracked; other kinds affect only the reported source.
@@ -255,19 +251,27 @@ Submits feedback on a proxy's performance. This is crucial for the scoring syste
 {
   "source": "example",
   "proxy": "http://192.0.2.10:8080",
-  "allocation_id": "opaque-token",
   "status": 200,
   "response_time_ms": 120
 }
 ```
 
-* **Success Response (200)**: `{"accepted": true, "message": "Feedback received."}`
+* **Success Response (200)**: `{"message": "Feedback received."}`
 
-Unknown, stale, duplicate, cross-source, or cross-proxy
-allocation IDs return `409` and do not release a lease or update any score,
-aggregate, or accepted-feedback counter. With `allow_legacy_feedback = false`, a
-missing ID returns `400`; compatibility mode accepts it but is intentionally not
-idempotent.
+Everything that passes boundary validation is scored. The service is a neutral
+referee: it records what the client reports, and the client owns whether that
+report is correct. It does not authenticate a report against the handout it
+belongs to, because the errors that would catch - a duplicate delivery, a very
+late report, a wrong `source` - are the client's to prevent, and the errors that
+actually damage a score - calling a soft-block page a success - cannot be caught
+here at all. What the service does do is *count*: feedback that arrives with no
+outstanding handout to close is exported as
+`smartproxy_feedback_unmatched_total`, which is the number to watch if you
+suspect your client duplicates or delays its reports. Read it with two caveats:
+leases do not survive a restart, so every restart adds roughly one count per
+request that was in flight at the time, and a report that arrives later than
+`proxy_inflight_timeout_seconds` counts too, because its lease has already been
+reclaimed.
 
 ### **POST /reload-sources**
 
@@ -349,8 +353,7 @@ curl http://127.0.0.1:6942/get-premium-proxy
   "http": "http://192.0.2.10:8080",
   "https": "http://192.0.2.10:8080",
   "premium": true,
-  "source": "example",
-  "allocation_id": "opaque-token"
+  "source": "example"
 }
 ```
 
