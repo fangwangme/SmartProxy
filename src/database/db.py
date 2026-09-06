@@ -331,6 +331,35 @@ class DatabaseManager:
             return None
         return {f"{row['protocol']}://{row['ip']}:{row['port']}" for row in rows}
 
+    def get_reserve_proxies(self, limit: int) -> Optional[List[str]]:
+        """
+        The rest of the table, for the routing layer to fall back on.
+
+        get_active_proxies() answers `is_active = true` only, so a pool with
+        nothing validated yet - a fresh install, a rebuilt database, the first
+        minutes after a restart - leaves the router unable to see a single
+        proxy. These are the rows it would otherwise never reach.
+
+        Ordering is the tier-3 preference: never-validated rows first, because
+        an unmeasured proxy is a better guess than one that has already failed
+        a check, then the failures whose last check is oldest. Returned in that
+        order and bounded by `limit` - the table holds far more dead rows than
+        live ones, and the caller only ever needs enough to fill one pool.
+        """
+        if limit <= 0:
+            return []
+        query = """
+            SELECT protocol, ip, port
+            FROM proxies
+            WHERE is_active = false
+            ORDER BY last_validated_at ASC NULLS FIRST, id ASC
+            LIMIT %(limit)s;
+        """
+        rows = self._execute(query, {"limit": limit}, fetch="all")
+        if rows is None:
+            return None
+        return [f"{row['protocol']}://{row['ip']}:{row['port']}" for row in rows]
+
     def get_source_backoff_states(self) -> Optional[Dict[str, Dict]]:
         rows = self._execute(
             """

@@ -265,7 +265,7 @@ smartproxy_backup_duration_seconds {backup_duration:.6f}
 # TYPE smartproxy_manager_lock_hold_seconds gauge
 smartproxy_manager_lock_hold_seconds {manager_lock_duration:.6f}
 
-# HELP smartproxy_plan_refresh_duration_seconds Duration of the most recent serving-plan refresh
+# HELP smartproxy_plan_refresh_duration_seconds Duration of the most recent candidate-pool refresh
 # TYPE smartproxy_plan_refresh_duration_seconds gauge
 smartproxy_plan_refresh_duration_seconds {plan_refresh_duration:.6f}
 """

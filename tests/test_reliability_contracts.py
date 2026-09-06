@@ -223,8 +223,8 @@ class ValidationOutageContractTests(ProxyManagerTestBase):
         self.assertFalse(self.manager.is_validating)
 
 
-class TestHandoutAccountingAndPlans(ProxyManagerTestBase):
-    def _install_qualified(self, source="source1", proxy="http://192.0.2.30:80", quality=0.9):
+class TestHandoutAccountingAndPools(ProxyManagerTestBase):
+    def _install_proven(self, source="source1", proxy="http://192.0.2.30:80", quality=0.9):
         now = time.time()
         stat = self.manager._get_new_proxy_stat(source) | {
             "score": quality * 100,
@@ -241,7 +241,7 @@ class TestHandoutAccountingAndPlans(ProxyManagerTestBase):
             "bottom_tier": [],
         }
         with self.manager.lock:
-            self.manager._build_serving_plan(source)
+            self.manager._rebuild_candidate_pool(source)
         return proxy, stat
 
     def _aggregate_total(self):
@@ -252,7 +252,7 @@ class TestHandoutAccountingAndPlans(ProxyManagerTestBase):
         )
 
     def test_feedback_closes_one_handout_and_extra_reports_are_counted(self):
-        proxy, stat = self._install_qualified()
+        proxy, stat = self._install_proven()
         self.manager.allocate_proxy("source1")
         self.manager.allocate_proxy("source1")
         self.assertEqual(stat["handout_count"], 2)
@@ -295,9 +295,16 @@ class TestHandoutAccountingAndPlans(ProxyManagerTestBase):
 
         self.assertEqual(stat["inflight"], [])
 
-    def test_stale_exploit_member_is_tombstoned_before_handout(self):
-        proxy, stat = self._install_qualified()
-        self.manager.serving_plan_max_age_s = 60.0
+    def test_a_proxy_that_stops_scoring_well_is_still_served(self):
+        """
+        Issue #27: the pool re-ranks, it does not evict.
+
+        This replaces three tests that asserted the opposite - that a proxy
+        dropping below the prior was tombstoned out of the exploit set, demoted
+        into a trial group, or held out by a cooldown. Each of those could empty
+        the servable set, which is the defect this issue removes.
+        """
+        proxy, stat = self._install_proven()
         stat.update(
             {
                 "score": 1.0,
@@ -306,47 +313,16 @@ class TestHandoutAccountingAndPlans(ProxyManagerTestBase):
                 "recent_results": [[time.time(), False, None]],
             }
         )
-
-        self.assertIsNone(self.manager.allocate_proxy("source1"))
-        plan = self.manager.serving_plans["source1"]
-        self.assertNotIn(proxy, plan["exploit"])
-        self.assertNotIn(proxy, plan["exploit_members"])
-
-    def test_demotion_moves_from_exploit_to_trial_atomically(self):
-        proxy, stat = self._install_qualified(quality=0.06)
-        self.manager.allocate_proxy("source1")
-        self.manager.process_feedback("source1", proxy, 500)
-        plan = self.manager.serving_plans["source1"]
-
-        self.assertFalse(self.manager._is_qualified(stat))
-        self.assertNotIn(proxy, plan["exploit_members"])
-        self.assertNotIn(proxy, plan["exploit"])
-        self.assertIn(proxy, plan["members"])
-        self.assertEqual(plan["fallback"].count(proxy), 1)
-
-    def test_trial_cooldown_prevents_immediate_reinsertion(self):
-        proxy = "http://192.0.2.32:80"
-        stat = self.manager._get_new_proxy_stat("source1")
-        self.manager.source_stats["source1"][proxy] = stat
-        self.manager.active_proxies = {proxy}
-        self.manager.available_proxies["source1"] = {
-            "top_tier": [proxy],
-            "bottom_tier": [],
-        }
-        self.manager.proxy_cooldown_ms = 1000
         with self.manager.lock:
-            self.manager._build_serving_plan("source1")
+            self.manager._rebuild_candidate_pool("source1")
 
-        self.manager.allocate_proxy("source1")
-        self.manager.process_feedback("source1", proxy, 200)
+        handout = self.manager.allocate_proxy("source1")
 
-        plan = self.manager.serving_plans["source1"]
-        self.assertNotIn(proxy, plan["members"])
-        self.assertNotIn(proxy, plan["discovery"])
-        self.assertNotIn(proxy, plan["fallback"])
+        self.assertEqual(handout["proxy"], proxy)
+        self.assertIn(proxy, self.manager.candidate_pools["source1"])
 
     def test_premium_uses_the_source_contract_and_demotes_immediately(self):
-        proxy, stat = self._install_qualified(quality=0.06)
+        proxy, stat = self._install_proven(quality=0.06)
         self.manager.premium_min_usage_count = 3
         self.manager._sync_premium_proxies_locked()
 
@@ -359,26 +335,28 @@ class TestHandoutAccountingAndPlans(ProxyManagerTestBase):
             self.manager.process_feedback("source1", proxy, 500)
 
         sync.assert_not_called()
-        self.assertFalse(self.manager._is_qualified(stat))
+        self.assertFalse(self.manager._is_premium_grade(stat, "source1"))
         self.assertNotIn(proxy, self.manager.premium_proxies)
         self.assertIsNone(self.manager.allocate_premium_proxy())
 
-    def test_expired_plan_serves_without_synchronous_rebuild_and_schedules_once(self):
-        proxy, _ = self._install_qualified()
-        self.manager.serving_plan_max_age_s = 1.0
-        self.manager.serving_plans["source1"]["built_at"] = time.time() - 10
+    def test_a_stale_pool_serves_without_rebuilding_on_the_request_thread(self):
+        """
+        Staleness costs ranking accuracy, never availability.
 
-        with (
-            patch.object(self.manager, "_build_serving_plan") as build,
-            patch.object(self.manager, "_submit_background") as submit,
-        ):
+        The refresh timer owns rebuilds. Doing one on the request path would
+        put pool-sized work behind the manager lock on every handout, and a
+        request that arrives while the pool is stale still has a pool.
+        """
+        proxy, _ = self._install_proven()
+        self.manager.pool_refresh_seconds = 1.0
+        self.manager.candidate_pool_built_at["source1"] = time.time() - 3600
+
+        with patch.object(self.manager, "_rebuild_candidate_pool") as rebuild:
             first = self.manager.allocate_proxy("source1")
             second = self.manager.allocate_proxy("source1")
 
         self.assertEqual((first["proxy"], second["proxy"]), (proxy, proxy))
-        build.assert_not_called()
-        submit.assert_called_once()
-        self.assertIn("source1", self.manager.plan_refreshing)
+        rebuild.assert_not_called()
 
 
 class TestPersistenceAndTransactions(ProxyManagerTestBase):
@@ -404,6 +382,7 @@ class TestPersistenceAndTransactions(ProxyManagerTestBase):
                                 "recent_results": [[time.time(), True, None]] * 3,
                                 "handout_count": 3,
                                 "trial_handout_count": 0,
+                                "retry_after_ts": 1234.0,
                                 "inflight": [],
                             }
                         }
@@ -418,10 +397,17 @@ class TestPersistenceAndTransactions(ProxyManagerTestBase):
         restored = self.manager.source_stats["source1"][proxy]
         self.assertNotIn("completed_feedback_count", restored)
         self.assertNotIn("consecutive_failures", restored)
+        # The #27 gate fields are now in the same class: a snapshot written by
+        # an older build still loads, and its gate bookkeeping is dropped
+        # rather than rejected.
+        self.assertNotIn("trial_handout_count", restored)
+        self.assertNotIn("retry_after_ts", restored)
         self.assertEqual(self.manager.backup_stats()["status"], "success")
         serialized = backup_path.read_text(encoding="utf-8")
         self.assertNotIn("completed_feedback_count", serialized)
         self.assertNotIn("consecutive_failures", serialized)
+        self.assertNotIn("trial_handout_count", serialized)
+        self.assertNotIn("retry_after_ts", serialized)
 
     def test_fetch_backoff_is_restored_and_success_clears_durable_state(self):
         next_attempt = time.time() + 120
@@ -709,6 +695,7 @@ class TestConfigurationBoundaries(ProxyManagerTestBase):
             ({"server": {"readiness_validation_max_age_seconds": "0"}}, "validation age"),
             ({"server": {"readiness_flush_max_age_seconds": "0"}}, "flush age"),
             ({"server": {"background_workers": "0"}}, "background workers"),
+            ({"server": {"connection_limit": "0"}}, "connection limit"),
             ({"server": {"allowed_ips": "not-an-address"}}, "allowed address"),
             ({"server": {"trusted_proxy_ips": "not-an-address"}}, "trusted address"),
             ({"database": {"min_connections": "0"}}, "database minimum"),
@@ -741,25 +728,12 @@ class TestConfigurationBoundaries(ProxyManagerTestBase):
             ({"source_pool": {"top_tier_size": "-1"}}, "tier size"),
             ({"source_pool": {"max_pool_size": "10", "top_tier_size": "11"}}, "tier over pool"),
             ({"source_pool": {"top_tier_load_percentage": "101"}}, "percentage over 100"),
-            ({"source_pool": {"proxy_cooldown_ms": "-1"}}, "negative cooldown"),
-            ({"source_pool": {"exploration_min_ratio": "-0.1"}}, "exploration minimum"),
-            ({"source_pool": {"exploration_max_ratio": "1.1"}}, "exploration maximum"),
-            ({"source_pool": {"exploration_min_ratio": "0.5", "exploration_max_ratio": "0.4"}}, "exploration bounds"),
-            ({"source_pool": {"exploration_target_qualified": "0"}}, "exploration target"),
-            ({"source_pool": {"exploration_target_qualified_ratio": "1.1"}}, "qualified ratio"),
-            ({"source_pool": {"exploration_discovery_share": "1.1"}}, "discovery share"),
-            ({"source_pool": {"qualification_min_results": "0"}}, "qualification evidence"),
-            ({"source_pool": {"qualification_min_results": "4", "probation_attempts": "3"}}, "probation evidence"),
-            ({"source_pool": {"retry_attempts": "-1"}}, "retry attempts"),
-            ({"source_pool": {"retry_delay_seconds": "-1"}}, "retry delay"),
-            ({"source_pool": {"probation_forgiveness_hours": "0"}}, "forgiveness"),
             ({"source_pool": {"proxy_inflight_timeout_seconds": "0"}}, "lease expiry"),
-            ({"source_pool": {"proxy_max_inflight": "-1"}}, "capacity"),
-            ({"source_pool": {"exploit_draw_attempts": "0"}}, "draw attempts"),
-            ({"source_pool": {"serving_plan_max_age_seconds": "0"}}, "plan age"),
+            ({"source_pool": {"candidate_pool_size": "0"}}, "candidate pool size"),
+            ({"source_pool": {"pool_refresh_seconds": "0"}}, "pool refresh"),
+            ({"source_pool": {"exploration_slots": "-1"}}, "exploration slots"),
             ({"source_pool": {"selection_weight_floor": "0"}}, "weight floor"),
             ({"source_pool": {"softmax_temperature": "0"}}, "temperature"),
-            ({"source_pool": {"avg_latency_alpha": "0"}}, "latency alpha"),
             ({"source_pool": {"max_feedback_latency_ms": "0"}}, "latency bound"),
             ({"source_pool": {"premium_pool_size": "-1"}}, "premium pool"),
             ({"source_pool": {"premium_min_usage_count": "-1"}}, "premium evidence"),
@@ -841,7 +815,7 @@ class TestConfigurationBoundaries(ProxyManagerTestBase):
             old_values,
         )
         self.assertIn(
-            "[server] production_threads / background_workers",
+            "[server] production_threads / background_workers / connection_limit",
             result["restart_required_for"],
         )
         self.assertIn(
@@ -1012,7 +986,7 @@ class TestApiAndLifecycleContracts(ProxyManagerTestBase):
 
         with (
             patch.object(self.manager, "_submit_background", side_effect=submit),
-            patch.object(self.manager, "refresh_serving_plans"),
+            patch.object(self.manager, "refresh_candidate_pools"),
             patch.object(
                 self.manager.stop_scheduler_event,
                 "wait",
@@ -1082,6 +1056,7 @@ class TestApiAndLifecycleContracts(ProxyManagerTestBase):
         fake_manager.debug_mode = False
         fake_manager.server_port = 7000
         fake_manager.production_threads = 9
+        fake_manager.server_connection_limit = 900
         fake_app = MagicMock()
         with (
             patch.object(sys, "argv", ["smartproxy"]),
@@ -1095,8 +1070,14 @@ class TestApiAndLifecycleContracts(ProxyManagerTestBase):
 
         fake_manager.start_scheduler.assert_called_once()
         fake_manager.stop_scheduler.assert_called_once()
+        # connection_limit is passed explicitly: waitress defaults it to 100,
+        # and exhausting that turns any refusal into a connection-level outage.
         serve.assert_called_once_with(
-            fake_app, host="0.0.0.0", port=7000, threads=9
+            fake_app,
+            host="0.0.0.0",
+            port=7000,
+            threads=9,
+            connection_limit=900,
         )
         fake_app.run.assert_not_called()
 

@@ -90,6 +90,7 @@ def main():
                 host="0.0.0.0",
                 port=proxy_manager.server_port,
                 threads=proxy_manager.production_threads,
+                connection_limit=proxy_manager.server_connection_limit,
             )
     finally:
         if not shutdown_started.is_set():
