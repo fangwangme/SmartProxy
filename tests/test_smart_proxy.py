@@ -1801,14 +1801,15 @@ class TestSecondReviewRegressions(ProxyManagerTestBase):
         stat["quality_updated_ts"] = old
         return stat
 
-    def _manager_with_three_proxies(self, age_hours="48"):
-        manager = self.make_manager(
-            {"source_pool": {"probation_forgiveness_hours": age_hours}},
-            name=f"recovery-{age_hours}.ini",
-        )
+    def _manager_with_three_proxies(self):
+        # Recovery is score decay, driven by reliability_decay_half_life_hours.
+        # It used to also depend on a forgiveness epoch resetting a trial
+        # budget; #27 removed the budget, so nothing here configures one.
+        manager = self.make_manager({}, name="recovery.ini")
         urls = ["http://bad:1", "http://n1:1", "http://n2:1"]
         manager.active_proxies = set(urls)
         manager.db.get_active_proxies.return_value = set(urls)
+        manager.db.get_reserve_proxies.return_value = []
         manager.source_stats["source1"] = {
             url: manager._get_new_proxy_stat() for url in urls
         }

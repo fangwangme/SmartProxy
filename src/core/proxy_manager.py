@@ -803,6 +803,7 @@ class ProxyManager:
                 "server_port": self.server_port,
                 "production_threads": self.production_threads,
                 "background_workers": self.background_workers,
+                "server_connection_limit": self.server_connection_limit,
                 "proxy_inflight_timeout_s": self.proxy_inflight_timeout_s,
             }
             old_predefined_sources_before_reload = self.predefined_sources.copy()

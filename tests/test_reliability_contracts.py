@@ -792,13 +792,19 @@ class TestConfigurationBoundaries(ProxyManagerTestBase):
             self.manager.server_port,
             self.manager.production_threads,
             self.manager.background_workers,
+            self.manager.server_connection_limit,
             self.manager.proxy_inflight_timeout_s,
         )
         changed = {
             section: dict(values) for section, values in self.config_dict.items()
         }
         changed["server"].update(
-            {"port": "7001", "production_threads": "12", "background_workers": "6"}
+            {
+                "port": "7001",
+                "production_threads": "12",
+                "background_workers": "6",
+                "connection_limit": "77",
+            }
         )
         changed["source_pool"]["proxy_inflight_timeout_seconds"] = "15"
         write_config_file(self.tmp_dir, changed, name="config.ini")
@@ -810,6 +816,7 @@ class TestConfigurationBoundaries(ProxyManagerTestBase):
                 self.manager.server_port,
                 self.manager.production_threads,
                 self.manager.background_workers,
+                self.manager.server_connection_limit,
                 self.manager.proxy_inflight_timeout_s,
             ),
             old_values,
@@ -832,6 +839,7 @@ class TestConfigurationBoundaries(ProxyManagerTestBase):
                 self.manager.server_port,
                 self.manager.production_threads,
                 self.manager.background_workers,
+                self.manager.server_connection_limit,
                 self.manager.proxy_inflight_timeout_s,
             ),
             old_values,

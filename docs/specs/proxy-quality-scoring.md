@@ -1,13 +1,24 @@
-# Proxy Quality: Online Reliability and Selection Boundaries
+# Proxy Quality: Online Reliability and Candidate Pool Selection
 
-This spec defines the issue #23 scoring and routing contract. Implementation:
+This spec defines the scoring contract from issue #23 and the routing contract
+that replaced its selection boundaries in issue #27. Implementation:
 `src/core/proxy_manager.py`.
+
+**The governing rule.** Learning decides *which* proxy is served, never
+*whether* one is served. No threshold sits anywhere on the routing path, and no
+routing parameter can empty the servable set at any value in its accepted
+range. A parameter whose wrong value degrades performance is a tunable; a
+parameter whose wrong value empties the servable set is a design defect.
 
 ## 1. Validation and feedback remain separate
 
-Validation owns only the `is_active` liveness gate. Real client feedback owns
-reliability, qualification, and traffic allocation. Validator latency,
-anonymity, and pass/fail observations must never enter the reliability score.
+Validation owns only the `is_active` liveness signal. Real client feedback owns
+reliability and traffic allocation. Validator latency, anonymity, and pass/fail
+observations must never enter the reliability score.
+
+`is_active` is a *signal*, not an admission test. It is the ordering boundary
+between tier 2 and tier 3 of the candidate pool (section 4); a proxy that has
+never been validated is still servable.
 
 Feedback latency remains observable as `avg_latency_ms`. It is recorded and
 nothing else: it does not enter the score, and it does not order the pool
@@ -54,99 +65,130 @@ of evidence: old good and bad state both converge on the initial score.
 `recent_results` is retained as bounded raw replay data. It is not a separate
 sliding-window scorer. It is normalized once on the way in - at the API
 boundary, by `restore_stats()`, and by `_migrate_legacy_stat()` - and appended
-in timestamp order, so the selection path treats it as sorted and binary
--searches the qualification cutoff instead of revalidating every stored entry
-on every request. Counter-only history is seeded from a lifetime
+in timestamp order. Counter-only history is seeded from a lifetime
 success rate shrunk toward `p0`, then aged from its last feedback timestamp. A
 record whose timestamp is missing or unusable is aged to the prior instead of
-trusted as fresh: unknown age is unbounded age, and the score drives
-exploitation weight. The raw counters survive either way, and the proxy
-re-enters as a discovery candidate, so it earns its score back on fresh
-evidence.
+trusted as fresh: unknown age is unbounded age, and the score decides pool
+membership and ordering. The raw counters survive either way, so the proxy
+earns its score back on fresh evidence while remaining servable throughout.
 
-## 4. Qualification, exploration, and probation
+## 4. Candidate pool selection
 
-Scoring and trial allocation are independent. A proxy is qualified when it is
-live, has at least `qualification_min_results` valid results in the current
-forgiveness epoch (default 3), and scores strictly above the fixed prior.
-Qualified proxies receive score-driven exploitation traffic from the active
-ranked pool.
-
-There is one total exploration budget, driven by how much of the live pool has
-been evaluated rather than by an absolute count of winners:
+Ranking is the only mechanism. Each source keeps a fixed-size candidate pool,
+rebuilt on a timer and filled best-first; a handout is a uniform random pick
+from that pool.
 
 ```text
-target   = max(exploration_target_qualified,
-               live_count * exploration_target_qualified_ratio)
-progress = min(qualified_count / target, 1)
-ratio    = max_ratio - (max_ratio - min_ratio) * progress
+every pool_refresh_seconds, fill candidate_pool_size slots in priority order:
+
+  tier 1   proxies with successful feedback on record   <- scored, ordered
+  tier 2   proxies that passed validation (is_active)   <- tops up tier 1
+  tier 3   anything else, including never-validated     <- tops up the rest
 ```
 
-Defaults are 30% at zero qualified proxies and 5% once half the live pool
-qualifies, with linear interpolation between and an absolute floor of 50 so a
-small pool still converges. The absolute target alone would read a 1200-proxy
-pool with 110 qualified members as finished and drop exploration to its minimum
-while 91% of the pool had never been measured. Discovery, probation, retry, and unqualified proxies in
-the ranked pool cannot create extra exploration outside that decision.
+Score orders within a tier and decides who makes the cut. It never decides
+whether a proxy may serve. The pool therefore always holds
+`min(candidate_pool_size, everything available)`, which makes an empty answer
+structurally impossible while the database holds any proxy at all. The
+invariant is a property of the data structure, not a fallback branch someone
+has to remember to write - and it is asserted by test, not by review note.
 
-Within exploration, two thirds goes to never-tried discovery by default. The
-remaining third serves immediate probation and delayed retry candidates. If no
-qualified exploit candidate exists, the service may explicitly serve an
-eligible trial candidate above the nominal ratio; this cold-start safety
-fallback is logged and is not reported as ordinary budgeted exploration.
+Ordering within tiers 1 and 2 is by descending score, then by URL, so two
+rebuilds over the same state agree; `active_proxies` is a set and its iteration
+order is not reproducible on its own. Tier 3 keeps the order the database
+returned, because score there is the untouched prior for very nearly every row.
 
-Each proxy receives three immediate probation handouts. Failing probation
-removes it from normal exploitation. At most two later handouts are available,
-each only after `retry_delay_seconds`. Once the last handout/feedback is older
-than `probation_forgiveness_hours`, the trial epoch resets while historical
-counters remain intact.
+A cold pool is the same code path as a warm one. With nothing validated and
+nothing scored, tier 3 fills every slot from whatever the fetchers have found;
+validation and feedback then promote proxies into tiers 2 and 1 over the
+following hours, and the served-quality curve rises while the served volume
+never drops.
 
-The trial budget is spent by trial handouts alone, and qualifying returns it.
-Two rules follow, and both are load-bearing:
+### 4.1 Tier 3 has its own query
 
-- A proxy that qualifies has its trial counter cleared, so a later dip below
-  the prior costs it probation and the delayed retries, not the pool. Charging
-  the budget for observed results instead meant any proxy with five recent
-  results carried an exhausted budget, and its first dip - which a 20%-success
-  proxy reaches on a routine losing streak - exiled it for a full forgiveness
-  epoch with no retry at all.
-- A proxy seeded from counter-only history has an empty result window and
-  therefore an untouched budget. It re-enters as a discovery candidate holding
-  its seeded score; pre-spending the budget on results earned in a previous
-  life left it ineligible for exploitation *and* for every exploration group,
-  which is unreachable rather than deprioritised.
+`get_active_proxies()` answers `is_active = true` only, so the routing layer
+cannot see a never-validated proxy through it - which on a cold start is the
+entire population, and exactly the tier that has to carry it.
+`get_reserve_proxies(limit)` supplies the rest of the table. It runs once per
+pool sync, alongside the active query, and its result is held in memory as
+`reserve_proxies`, so the pool refresh stays lock-only and never waits on the
+database.
 
-Exploitation draws from every live, qualified proxy. Neither tiering nor
-`max_pool_size` is an eligibility gate: the tier lists weight the `tiered`
-strategy and are recomputed only by the pool sync, so gating on them stranded
-any proxy that qualified between syncs - feedback had already removed it from
-the trial pool for being qualified, and the exploit set would not take it for
-being outside the ranked slice. The plan is ordered by score so a rebuild is
-reproducible.
+That placement is deliberate. Running the query on the refresh timer instead
+would put a network round trip inside the routing control plane, and a brief
+database outage would then empty tier 3 - the one tier that carries a cold
+start. A failed reserve query keeps the previous list rather than emptying it.
 
-A trial candidate is claimed out of the serving plan when it is handed out and
-returned when its feedback arrives, so one candidate cannot absorb a burst
-before its result is known. Removal *is* the lease, which is why it costs
-nothing on the request path; `proxy_inflight_timeout_seconds` bounds how long a
-claim survives if feedback never comes.
+The row count is bounded by `candidate_pool_size`: one pool's worth is all
+tier 3 can ever place, so the bound needs no tunable of its own. Rows are
+ordered never-validated first - an unmeasured proxy is a better guess than one
+that has already failed a check - then by the stalest last check.
+`idx_proxies_reserve_pool` matches that ordering so the `LIMIT` stops at the
+first page rather than sorting every dead row in the table.
 
-Qualified proxies are not serialised. Their success rate is already known, so
-holding each to one outstanding request would cap the service at (qualified
-proxies / round-trip time) - single-digit requests per second for a pool of a
-hundred against a slow target. `proxy_max_inflight` is available as a per-proxy
-capacity guard and defaults to 0, meaning unlimited. When it is set, the plan
-alone cannot enforce it - a burst inside one plan's lifetime would hand the
-same proxy out without limit - so the drawn candidate is checked and redrawn,
-which is O(1) on one proxy rather than a pass over the pool. With the cap off
-the draw does no checking at all.
+### 4.2 Reserved exploration slots
 
-`proxy_cooldown_ms` spaces out *trial* handouts and nothing else. It cannot
-gate exploitation: the plan is rebuilt on an interval longer than any sane
-cooldown, so filtering the exploit set by it removes precisely the proxies that
-are getting traffic - the highest-scoring ones - for the whole life of the next
-plan. On a 40-proxy pool at a 500ms cooldown, a burst left every one of the top
-ten out of the following plan and dropped the best servable score from 99.7 to
-38.0.
+`exploration_slots` of the N slots are held back for proxies that have never
+been measured. This is the only remaining role of exploration, and it exists
+for one reason: a pool filled entirely from tier 1 would never admit a new
+proxy again - today's best would hold their slots indefinitely and tomorrow's
+better proxy would never be discovered.
+
+It is a floor, not a gate:
+
+- reserved slots that no newcomer claims go back to the ranking;
+- `0` disables the reservation and the pool still fills;
+- a value at or above `candidate_pool_size` still fills the pool, it merely
+  spends it all on newcomers - degraded quality, never degraded availability.
+
+### 4.3 What is not on the routing path
+
+Attempt history and per-proxy concurrency may be tie-breaks or weights when
+filling the pool. Neither may remove a proxy from it.
+
+- **Leases** (`inflight`, bounded by `proxy_inflight_timeout_seconds`) are
+  bookkeeping. Their only consumer is `process_feedback`, which reads the count
+  to tell a first report from a duplicate or a late one. Selection never looks
+  at one, so a burst against a one-proxy pool keeps being served by that proxy.
+  A lease is runtime state and is not persisted: it cannot outlive the process
+  that granted it, so restoring one would only manufacture a phantom.
+- **Weighting inside the pool is dormant.** The draw is uniform;
+  `selection_strategy`, `softmax_temperature`, `selection_weight_floor` and
+  `top_tier_load_percentage` are parsed and validated but not consulted.
+  Re-introducing weights on top of the pool is a later change and an
+  optimisation, not a requirement.
+- **The ranked tier lists** (`max_pool_size`, `top_tier_size`) are reporting
+  and the input that later weighting change would use. They are not an
+  eligibility gate and are not what `/get-proxy` reads.
+
+### 4.4 Removed in issue #27
+
+Four absolute thresholds sat in front of this ranking system, and each could
+independently empty the servable set. A deliberate cold start on 2026-09-05
+produced 1,178 refusals while 300+ proxies were validated alive; the score gate
+was the load-bearing one and was self-defeating, since the threshold was by
+definition the score of an unmeasured proxy.
+
+| Removed gate | Rule it enforced |
+| --- | --- |
+| Validation | only `is_active` proxies were candidates |
+| Score | `>= qualification_min_results` results **and** `score > prior` |
+| Attempts | 3 probation handouts, then a locked retry delay, then exile |
+| Concurrency | unqualified proxies hardcoded to 1 in-flight request |
+
+With them went 18 functions and 13 routing tunables:
+`exploration_min_ratio`, `exploration_max_ratio`,
+`exploration_target_qualified`, `exploration_target_qualified_ratio`,
+`exploration_discovery_share`, `qualification_min_results`,
+`probation_attempts`, `retry_attempts`, `retry_delay_seconds`,
+`probation_forgiveness_hours`, `exploit_draw_attempts`, `proxy_max_inflight`
+and `proxy_cooldown_ms`. `serving_plan_max_age_seconds` became
+`pool_refresh_seconds`, and `avg_latency_alpha` became a module constant since
+nothing reads `avg_latency_ms` to decide anything.
+
+`proxy_cooldown_ms` went with them although it is not one of the four gates: a
+cooldown filters pool members, so at a large enough value it holds every member
+out at once, which the governing rule does not permit to survive.
 
 ## 5. Source-wide outage guard
 
@@ -178,50 +220,45 @@ history on every healthy feedback event. While active, aggregate per-minute
 feedback continues, in-flight leases are released, and proxy reputation
 mutation pauses for every source rather than only the reporting one - a
 `dead` report from a source the guard has judged unreliable must not strip the
-reputation those proxies earned elsewhere - including the trial budget, which is reputation: a handout
-made while the source is paused produces no usable evidence and must not be
-charged. A completed recovery window reaching
+reputation those proxies earned elsewhere. A paused source keeps serving from
+its pool throughout; the guard protects reputation, never availability.
+A completed recovery window reaching
 `outage_recovery_baseline_ratio` of the baseline, with enough distinct
 proxies, resumes learning. Transitions are logged, and
 Prometheus metrics expose active state and paused-update totals per source.
 
-## 5a. Serving plan
+## 5a. Pool refresh
 
 Routing is split into a control plane and a data plane.
 
-`_build_serving_plan()` decides everything: which proxies are live, qualified
-and eligible, which are trial candidates and in which group, what the
-exploration budget is, and what the selection weights are. It runs inside the
-pool sync - reusing the pass that already refreshes every score and ranks the
-pool, rather than sweeping it a second time - and on `serving_plan_max_age_seconds`
-between syncs.
+`_rebuild_candidate_pool()` decides everything: which proxies are in the pool
+and in what order. It runs inside the pool sync - reusing the pass that already
+refreshes every score - and on `pool_refresh_seconds` between syncs. It also
+seeds a stat for every pool member, because anything that can be handed out
+needs somewhere to record feedback, or a tier-3 proxy could never earn its way
+up into tier 1.
 
-`get_proxy()` holds no pool logic. It reads the plan, spends one random draw on
-the exploration budget, and takes either a trial candidate (O(1), removed from
-the plan) or a weighted exploit pick (O(log n), against cumulative weights the
-plan precomputed). Nothing in it scales with the size of the pool.
+`allocate_proxy()` holds no pool logic: one dict lookup and one
+`random.choice`. Nothing in it scales with the size of the pool, and nothing in
+it can refuse. Its only `None` is an empty pool, which means an empty database.
 
-The plan is therefore allowed to be slightly stale, and that staleness is
-bounded by its refresh interval. Two things must not wait for a rebuild, and
-neither does:
+The pool is therefore allowed to be stale, and that staleness is bounded by
+`pool_refresh_seconds`. Nothing is repaired on the request thread - a rebuild
+there would put pool-sized work behind the manager lock on every handout, and a
+request arriving while the pool is stale still has a pool. Staleness costs
+ranking accuracy, which feedback corrects on the next rebuild; it never costs
+availability, which is the trade the previous design got backwards.
 
-- whether a trial candidate is currently out, maintained by claim and return;
-- a proxy that has just qualified, which is promoted into the live exploit set
-  the moment its feedback crosses the line. Without that it falls into a hole -
-  feedback removes it from the trial pool because it is no longer a trial
-  candidate, while the exploit set was frozen before it qualified. During a cold
-  start that hole is most of the pool, and the service answers "no proxy
-  available" while holding one that is healthy.
-
-Staleness in the other direction is accepted: a proxy whose score has just
-dipped below the prior keeps drawing exploitation traffic until the next
-rebuild. That is bounded by `serving_plan_max_age_seconds` and is the cheaper
-error - it costs a few requests, where the reverse costs availability.
+The one case built on demand is a source whose pool does not exist yet, which
+covers embedders that construct a manager without running the sync lifecycle.
 
 ## 6. Persistence
 
 JSON snapshots contain root-level `scoring_version = 2`. Matching-version
-derived estimator state is validated and restored. A missing or mismatched
+derived estimator state is validated and restored. Keys an older build wrote
+that the current one does not know - `trial_handout_count`, `retry_after_ts`
+and `inflight` among them - are ignored on load, never rejected. There is no
+migration script: `database_setup.sql` is the only schema authority. A missing or mismatched
 version never trusts stored derived scores: valid `recent_results` are replayed
 in timestamp order.
 
