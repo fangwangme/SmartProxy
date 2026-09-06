@@ -86,6 +86,12 @@ every pool_refresh_seconds, fill candidate_pool_size slots in priority order:
   tier 3   anything else, including never-validated     <- tops up the rest
 ```
 
+Tier 1 is defined by feedback and nothing else. `is_active` is not part of it:
+requiring one would put validation back in front of the ranking as an admission
+test, and would rank a never-measured proxy above one that real client traffic
+keeps succeeding on. A proxy the validator cannot currently reach still sorts
+into tier 1 on the strength of its own results.
+
 Score orders within a tier and decides who makes the cut. It never decides
 whether a proxy may serve. The pool therefore always holds
 `min(candidate_pool_size, everything available)`, which makes an empty answer
@@ -109,15 +115,29 @@ never drops.
 `get_active_proxies()` answers `is_active = true` only, so the routing layer
 cannot see a never-validated proxy through it - which on a cold start is the
 entire population, and exactly the tier that has to carry it.
-`get_reserve_proxies(limit)` supplies the rest of the table. It runs once per
-pool sync, alongside the active query, and its result is held in memory as
-`reserve_proxies`, so the pool refresh stays lock-only and never waits on the
-database.
+`get_reserve_proxies(limit)` supplies the rest of the table. Its result is held
+in memory as `reserve_proxies`, so the pool refresh stays lock-only and never
+waits on the database.
 
 That placement is deliberate. Running the query on the refresh timer instead
 would put a network round trip inside the routing control plane, and a brief
 database outage would then empty tier 3 - the one tier that carries a cold
 start. A failed reserve query keeps the previous list rather than emptying it.
+
+Publication is event-driven, and must never be conditional on a validation
+cycle *succeeding* - rows are servable the moment they are committed, whatever
+the validator later makes of them. Three paths publish it:
+
+| Path | Why |
+| --- | --- |
+| pool sync | the ordinary case, alongside the active query |
+| a fetch that committed rows | "serves from the first fetch onward" means the fetch, not the validation cycle that may follow minutes later |
+| a validation cycle whose target quorum is down | otherwise a target that stays down leaves the router blind to the whole table |
+
+The last two go through `_publish_reserve_pool()`, which republishes tier 3 and
+rebuilds but never reads or rewrites `active_proxies`. That narrowness is the
+point: it can run on a path where a validation batch has just failed, where
+preserving last-known-good liveness is the standing contract.
 
 The row count is bounded by `candidate_pool_size`: one pool's worth is all
 tier 3 can ever place, so the bound needs no tunable of its own. Rows are
@@ -152,6 +172,12 @@ filling the pool. Neither may remove a proxy from it.
   at one, so a burst against a one-proxy pool keeps being served by that proxy.
   A lease is runtime state and is not persisted: it cannot outlive the process
   that granted it, so restoring one would only manufacture a phantom.
+  Expired leases are reclaimed where the list grows - `_grant_lease()` drops
+  the expired prefix before appending - and again in the sync's pass over every
+  stat, which is what reaches proxies that stopped being handed out entirely.
+  Feedback alone is not enough: a client that takes proxies and never reports
+  is precisely the case that sends none, and the list is deep-copied and
+  serialised by every backup.
 - **Weighting inside the pool is dormant.** The draw is uniform;
   `selection_strategy`, `softmax_temperature`, `selection_weight_floor` and
   `top_tier_load_percentage` are parsed and validated but not consulted.

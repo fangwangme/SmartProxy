@@ -9,6 +9,8 @@ than against the mechanism that implements it.
 """
 import random
 import time
+from concurrent.futures import Future
+from unittest.mock import patch
 
 from src.api.server import create_app
 from tests.test_smart_proxy import ProxyManagerTestBase
@@ -558,3 +560,170 @@ class RoutingParameterAuditTests(ProxyManagerTestBase):
             "avg_latency_alpha",
         ):
             self.assertFalse(example.has_option("source_pool", key), key)
+
+
+class ReviewRegressionTests(ProxyManagerTestBase):
+    """
+    Three holes the PR #28 review found in the first implementation.
+
+    Each is the same mistake in a different place: the invariant was asserted
+    from the pool-sync boundary inward, so anything that could stop the sync
+    from running, or stop a servable proxy from reaching a tier, went unseen.
+    """
+
+    SOURCE = "source1"
+
+    def test_a_failed_validation_cycle_does_not_strand_fetched_rows(self):
+        """
+        The reserve must not depend on a validation cycle *succeeding*.
+
+        Rows are servable the moment they are committed. Waiting for a healthy
+        validation quorum leaves the router blind to the whole table on a cold
+        pool, which is exactly when it has nothing else to serve.
+        """
+        rows = urls(50)
+        self.mock_db_instance.get_active_proxies.return_value = set()
+        self.mock_db_instance.get_reserve_proxies.return_value = rows
+        self.mock_db_instance.get_new_proxies_to_validate.return_value = [
+            {"id": index, "protocol": "http", "ip": "192.0.2.1", "port": 9000 + index}
+            for index in range(5)
+        ]
+        self.mock_db_instance.get_active_proxies_to_revalidate.return_value = []
+        self.mock_db_instance.get_eligible_failed_proxies.return_value = []
+
+        async def quorum_down(_proxies):
+            return [], [0, 1, 2, 3, 4], {"quorum_healthy": False, "healthy_targets": 0}
+
+        with patch.object(
+            self.manager, "_validate_proxies_batch_async", side_effect=quorum_down
+        ):
+            self.manager._run_validation_cycle()
+        self.manager.refresh_candidate_pools()
+
+        self.assertIsNotNone(
+            self.manager.allocate_proxy(self.SOURCE),
+            "refused while the database held 50 proxies",
+        )
+
+    def test_a_fetch_alone_makes_the_service_servable(self):
+        """
+        "Serves continuously from the first fetch onward" means the fetch, not
+        the validation cycle that may follow it minutes later or fail.
+        """
+        rows = urls(30)
+        self.mock_db_instance.get_active_proxies.return_value = set()
+        self.mock_db_instance.get_reserve_proxies.return_value = rows
+        self.mock_db_instance.insert_proxies.return_value = True
+        fetched = Future()
+        fetched.set_result([("http", "192.0.2.100", 9000)])
+
+        self.manager._handle_fetch_results([fetched], False)
+
+        self.assertIsNotNone(
+            self.manager.allocate_proxy(self.SOURCE),
+            "refused after a fetch committed rows to an empty pool",
+        )
+
+    def test_a_failed_reserve_query_keeps_the_previous_reserve(self):
+        """The design rule the fix must not break: a blip cannot empty tier 3."""
+        rows = urls(20)
+        self.mock_db_instance.get_active_proxies.return_value = set()
+        self.mock_db_instance.get_reserve_proxies.return_value = rows
+        self.manager._sync_and_select_top_proxies()
+
+        self.mock_db_instance.get_reserve_proxies.return_value = None
+        self.assertFalse(self.manager._refresh_reserve_proxies())
+        self.manager.refresh_candidate_pools()
+
+        self.assertEqual(len(self.manager.reserve_proxies), 20)
+        self.assertIsNotNone(self.manager.allocate_proxy(self.SOURCE))
+
+    def test_successful_feedback_reaches_tier_one_without_is_active(self):
+        """
+        Tier 1 is "proxies with successful feedback on record" — no more.
+
+        Requiring is_active would put validation back in front of the ranking
+        as an admission test, and would rank a never-measured proxy above one
+        that real traffic keeps succeeding on.
+        """
+        self.manager.candidate_pool_size = 1
+        self.manager.exploration_slots = 0
+        proven, unproven = "http://192.0.2.50:9000", "http://192.0.2.60:9000"
+        now = time.time()
+        stat = self.manager._get_new_proxy_stat(self.SOURCE)
+        stat.update(
+            {
+                "success_count": 10,
+                "recent_results": [[now, True, None]] * 10,
+                "quality_slow": 0.74,
+                "quality_fast": 0.74,
+                "quality_updated_ts": now,
+            }
+        )
+        self.manager.source_stats[self.SOURCE][proven] = stat
+        self.manager._refresh_score(stat, self.SOURCE)
+        self.mock_db_instance.get_active_proxies.return_value = {unproven}
+        self.mock_db_instance.get_reserve_proxies.return_value = [proven]
+
+        self.manager._sync_and_select_top_proxies()
+
+        self.assertGreater(stat["score"], 50.0)
+        self.assertEqual(self.manager.candidate_pools[self.SOURCE], [proven])
+
+    def test_tier_one_is_not_duplicated_when_both_queries_report_a_proxy(self):
+        """The two queries can race; a proxy in both must occupy one slot."""
+        self.manager.candidate_pool_size = 10
+        shared = "http://192.0.2.70:9000"
+        now = time.time()
+        stat = self.manager._get_new_proxy_stat(self.SOURCE)
+        stat.update({"success_count": 3, "recent_results": [[now, True, None]] * 3})
+        self.manager.source_stats[self.SOURCE][shared] = stat
+        self.mock_db_instance.get_active_proxies.return_value = {shared}
+        self.mock_db_instance.get_reserve_proxies.return_value = [shared]
+
+        self.manager._sync_and_select_top_proxies()
+
+        self.assertEqual(self.manager.candidate_pools[self.SOURCE], [shared])
+
+    def test_expired_leases_are_reclaimed_without_any_feedback(self):
+        """
+        A client that takes proxies and never reports must not grow the stat.
+
+        Deleting the trial epoch removed the sweep that used to prune these as
+        a side effect, leaving feedback as the only thing that reclaimed a
+        lease — and feedback is precisely what this client never sends.
+        """
+        only = urls(1)
+        self.mock_db_instance.get_active_proxies.return_value = set(only)
+        self.mock_db_instance.get_reserve_proxies.return_value = []
+        self.manager._sync_and_select_top_proxies()
+        stat = self.manager.source_stats[self.SOURCE][only[0]]
+
+        start = time.time()
+        for step in range(500):
+            with patch(
+                "src.core.proxy_manager.time.time",
+                return_value=start + step * (self.manager.proxy_inflight_timeout_s + 1),
+            ):
+                self.manager.allocate_proxy(self.SOURCE)
+                self.manager.refresh_candidate_pools()
+
+        self.assertLessEqual(len(stat["inflight"]), 2)
+        self.assertEqual(stat["handout_count"], 500)
+
+    def test_an_idle_proxy_does_not_keep_its_leases_forever(self):
+        """The sync sweep reaches proxies that stopped being handed out."""
+        only = urls(1)
+        self.mock_db_instance.get_active_proxies.return_value = set(only)
+        self.mock_db_instance.get_reserve_proxies.return_value = []
+        self.manager._sync_and_select_top_proxies()
+        stat = self.manager.source_stats[self.SOURCE][only[0]]
+        for _ in range(20):
+            self.manager.allocate_proxy(self.SOURCE)
+        self.assertEqual(len(stat["inflight"]), 20)
+
+        future = time.time() + self.manager.proxy_inflight_timeout_s + 1
+        with patch("src.core.proxy_manager.time.time", return_value=future):
+            self.manager._sync_and_select_top_proxies()
+
+        self.assertEqual(stat["inflight"], [])

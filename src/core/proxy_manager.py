@@ -1177,6 +1177,11 @@ class ProxyManager:
         )
         try:
             self.db.insert_proxies(unique_proxies_list)
+            # "Serves continuously from the first fetch onward" is the
+            # contract, and the first fetch of a cold install is followed by a
+            # validation cycle that may take minutes or fail outright. The
+            # rows are committed and therefore servable now.
+            self._publish_reserve_pool()
         except DatabaseWriteError:
             # The scheduler has already advanced this cycle's validation
             # timestamp. Validate rows that were committed by earlier cycles
@@ -1618,6 +1623,12 @@ class ProxyManager:
                     "liveness; deferred candidates remain retryable. target_health={}",
                     validation_metadata["healthy_targets"],
                 )
+                # Liveness stays last-known-good - that is why this returns
+                # without a pool sync - but tier 3 must still be published, or
+                # a validation target that stays down leaves the router blind
+                # to every row in the table, which on a cold pool is all of
+                # them and is the one case it has nothing else to serve.
+                self._publish_reserve_pool()
                 return
 
             self.db.batch_update_proxy_results(
@@ -1633,6 +1644,42 @@ class ProxyManager:
             with self.lock:
                 self.is_validating = False
             logger.info("Validation cycle lock released.")
+
+    def _refresh_reserve_proxies(self) -> bool:
+        """
+        Reload the bounded reserve that tier 3 serves from. Do not hold the lock.
+
+        Deliberately not on the pool-refresh timer: a rebuild is lock-only so
+        it can run often, and a database blip must never be able to empty
+        tier 3 - the one tier that carries a cold start. A failed query keeps
+        the previous list instead of clearing it.
+
+        It must equally not depend on a validation cycle *succeeding*. Fetched
+        rows are servable the moment they are committed, whatever the
+        validator later makes of them, so every path that learns the table has
+        grown publishes the reserve.
+        """
+        reserve = self.db.get_reserve_proxies(self.candidate_pool_size)
+        if reserve is None:
+            logger.warning(
+                "Reserve proxy query failed. Keeping the previous reserve list."
+            )
+            return False
+        with self.lock:
+            self.reserve_proxies = reserve
+        return True
+
+    def _publish_reserve_pool(self):
+        """
+        Make committed rows servable now, without touching liveness.
+
+        Deliberately narrower than a pool sync: it republishes tier 3 and
+        rebuilds, and never reads or rewrites `active_proxies`. That is what
+        lets it run on paths where a validation batch has just failed, where
+        preserving last-known-good liveness is the standing contract.
+        """
+        if self._refresh_reserve_proxies():
+            self.refresh_candidate_pools()
 
     def _sync_and_select_top_proxies(self):
         """
@@ -1650,19 +1697,10 @@ class ProxyManager:
                 "Skipping proxy sync because active proxy query failed. Keeping previous in-memory pools."
             )
             return
-        # One pool's worth is all tier 3 can ever place, so that is all this
-        # asks for. A failure here keeps the previous reserve rather than
-        # emptying the tier that carries a cold start.
-        newly_reserved = self.db.get_reserve_proxies(self.candidate_pool_size)
-        if newly_reserved is None:
-            logger.warning(
-                "Reserve proxy query failed. Keeping the previous reserve list."
-            )
+        self._refresh_reserve_proxies()
 
         with self.lock:
             self.active_proxies = newly_active_proxies
-            if newly_reserved is not None:
-                self.reserve_proxies = newly_reserved
             for source in self.predefined_sources:
                 stats_pool = self.source_stats.get(source, {})
 
@@ -1676,6 +1714,11 @@ class ProxyManager:
                 now_ts = time.time()
                 for stat in stats_pool.values():
                     self._refresh_score(stat, source)
+                    # The sweep that also reaches proxies which stopped being
+                    # handed out: those never reach _grant_lease again, so
+                    # whatever they held at the time would sit there for good,
+                    # deep-copied and serialised by every backup.
+                    self._lease_count(stat, now_ts)
 
                 stats_pool = self._truncate_stats_pool(source, stats_pool)
                 self.source_stats[source] = stats_pool
@@ -2389,6 +2432,13 @@ class ProxyManager:
         return pool
 
     @staticmethod
+    def _has_succeeded(stat: Optional[Dict]) -> bool:
+        """Whether this proxy has any successful client feedback on record."""
+        return stat is not None and bool(
+            nonnegative_int(stat.get("success_count", 0))
+        )
+
+    @staticmethod
     def _has_been_measured(stat: Optional[Dict]) -> bool:
         """Whether any feedback has ever been recorded against this proxy."""
         if stat is None:
@@ -2438,16 +2488,26 @@ class ProxyManager:
             score = baseline if stat is None else float(stat.get("score", baseline))
             return (-score, proxy_url)
 
-        proven, validated = [], []
-        for proxy_url in self.active_proxies:
-            stat = stats_pool.get(proxy_url)
-            if stat is not None and nonnegative_int(stat.get("success_count", 0)):
-                proven.append(proxy_url)
-            else:
-                validated.append(proxy_url)
+        # Tier 1 is defined by feedback and nothing else. Requiring is_active
+        # here would put validation back in front of the ranking as an
+        # admission test - the gate this issue removed - and would demote the
+        # best evidence the pool has: a proxy the validator cannot reach but
+        # that real client traffic keeps succeeding on.
+        proven = [
+            proxy_url
+            for proxy_url in (*self.active_proxies, *self.reserve_proxies)
+            if self._has_succeeded(stats_pool.get(proxy_url))
+        ]
+        promoted = set(proven)
+        validated = [
+            proxy_url
+            for proxy_url in self.active_proxies
+            if proxy_url not in promoted
+        ]
         # active_proxies is a set, so its iteration order is not reproducible;
-        # the sort is what makes two rebuilds over the same state agree.
-        proven.sort(key=by_score)
+        # the sort is what makes two rebuilds over the same state agree. It
+        # also de-duplicates tier 1, which the two source lists can overlap in.
+        proven = sorted(set(proven), key=by_score)
         validated.sort(key=by_score)
         # Tier 3 keeps the order the database returned - never-validated first,
         # then the stalest failures. Sorting it by score would be sorting a
@@ -2455,7 +2515,7 @@ class ProxyManager:
         unvalidated = [
             proxy_url
             for proxy_url in self.reserve_proxies
-            if proxy_url not in self.active_proxies
+            if proxy_url not in self.active_proxies and proxy_url not in promoted
         ]
         ranked = proven + validated + unvalidated
 
@@ -2517,6 +2577,12 @@ class ProxyManager:
         return len(leases)
 
     def _grant_lease(self, stat: Dict, now_ts: float):
+        # Reclaim what has already expired before appending. Nothing on the
+        # routing path reads this list any more, so feedback was the only
+        # thing still pruning it - and a client that takes proxies without
+        # ever reporting is exactly the case that produces no feedback. Pruning
+        # where the list grows bounds it to one timeout window's handouts.
+        self._lease_count(stat, now_ts)
         leases = stat.get("inflight")
         if not isinstance(leases, list):
             leases = stat["inflight"] = []
