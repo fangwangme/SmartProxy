@@ -1853,28 +1853,32 @@ class ProxyManager:
         Cap the stats pool by evicting dead history only.
 
         Eviction is reputation loss, because the record does not survive it:
-        _sync_and_select_top_proxies re-seeds any active proxy missing from the
-        pool with _get_new_proxy_stat(), so an evicted-but-still-active proxy
-        returns one cycle later as a pristine score=50 / failure_count=0
-        candidate. Whatever the eviction order is, if a live proxy can be
-        evicted at all then a bad record can be laundered by waiting two syncs -
-        which is the failure this pool exists to prevent.
+        the sync re-seeds any active proxy missing from the pool, and
+        _rebuild_candidate_pool() does the same for every pool member, both
+        with _get_new_proxy_stat() - so an evicted proxy that is still
+        servable returns one cycle later as a pristine candidate at the prior
+        with failure_count=0. Whatever the eviction order is, if a servable
+        proxy can be evicted at all then a bad record can be laundered by
+        waiting two syncs - which is the failure this pool exists to prevent.
 
-        So live proxies do not participate in the cap. It applies to dead
-        history alone, oldest feedback first; that is the part which is safe to
-        drop, because a dead proxy that comes back has to pass validation again
-        anyway. The cap therefore bounds retained *dead* history, not total
-        memory: the live half tracks however many proxies are genuinely active,
-        and the pool logs a warning when that alone exceeds the configured size
-        so the operator can raise it or lower max_pool_size.
+        So servable proxies do not participate in the cap. Since #27 that is
+        the live set *and* the reserve page: a reserve proxy is handed out like
+        any other pool member, and its record is as much reputation as a live
+        one's. The cap applies to the rest, oldest feedback first - history
+        nothing is serving, which re-enters as a newcomer at the prior if the
+        database reports it again. It therefore bounds retained history, not
+        total memory: the servable half tracks the live set plus one reserve
+        page, and the pool logs a warning when that alone exceeds the
+        configured size so the operator can raise it or lower max_pool_size.
         """
         max_stats_size = self.max_pool_size * self.stats_pool_max_multiplier
         if len(stats_pool) <= max_stats_size:
             return stats_pool
 
+        servable = self.active_proxies.union(self.reserve_proxies)
         live, dead = [], []
         for item in stats_pool.items():
-            (live if item[0] in self.active_proxies else dead).append(item)
+            (live if item[0] in servable else dead).append(item)
 
         room_for_dead = max_stats_size - len(live)
         if room_for_dead <= 0:

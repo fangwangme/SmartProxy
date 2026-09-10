@@ -45,6 +45,23 @@ def _is_loopback_address(value: str) -> bool:
     return bool(mapped and mapped.is_loopback)
 
 
+# Headers a reverse proxy adds. A loopback request carrying any of them is a
+# proxy on this host relaying someone else, not a caller on this host.
+FORWARDING_HEADERS = (
+    "X-Forwarded-For",
+    "Forwarded",
+    "X-Real-IP",
+    "X-Forwarded-Host",
+    "X-Forwarded-Proto",
+    "X-Forwarded-Port",
+    "X-Forwarded-By",
+)
+
+
+def _is_forwarded() -> bool:
+    return any(request.headers.get(name) is not None for name in FORWARDING_HEADERS)
+
+
 def _get_client_ip(proxy_manager: ProxyManager) -> str:
     """Resolve the client IP, trusting proxy headers only from configured proxies."""
     remote_addr = request.remote_addr or ""
@@ -107,7 +124,13 @@ def create_app(proxy_manager: ProxyManager):
         client_ip = _get_client_ip(proxy_manager)
 
         if path in INTERNAL_ONLY_ENDPOINTS:
-            if not _is_loopback_address(remote_addr):
+            # Loopback is necessary, not sufficient. A reverse proxy on this
+            # host also connects from loopback while relaying an outside
+            # client, and it says so with forwarding headers - which a genuine
+            # local caller (the launcher's curl, a local scraper) never sends.
+            # Forwarded requests are refused whatever the trust settings: these
+            # endpoints are for this host, not for anyone behind a proxy.
+            if not _is_loopback_address(remote_addr) or _is_forwarded():
                 logger.warning(
                     "Unauthorized internal API access attempt: path={}",
                     request.path,

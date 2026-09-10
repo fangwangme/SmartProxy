@@ -727,3 +727,59 @@ class ReviewRegressionTests(ProxyManagerTestBase):
             self.manager._sync_and_select_top_proxies()
 
         self.assertEqual(stat["inflight"], [])
+
+
+class SecondReviewRegressionTests(ProxyManagerTestBase):
+    """Findings from the second review of PR #28."""
+
+    SOURCE = "source1"
+
+    def test_truncation_keeps_the_record_of_a_servable_reserve_proxy(self):
+        """
+        Eviction must follow the servable set, not only the live one.
+
+        The pool re-seeds a blank stat for any member that lacks one, so
+        evicting a reserve proxy still in the pool erased its failure history
+        while it went on being served.
+        """
+        self.manager.max_pool_size = 1
+        self.manager.stats_pool_max_multiplier = 2
+        active = urls(2, first_octet=10)
+        reserve = urls(1, first_octet=80)[0]
+        now = time.time()
+        record = self.manager._get_new_proxy_stat(self.SOURCE)
+        record.update(
+            {
+                "success_count": 1,
+                "failure_count": 4,
+                "recent_results": [[now, True, None]] + [[now, False, None]] * 4,
+                "last_feedback_ts": now,
+            }
+        )
+        self.manager.source_stats[self.SOURCE][reserve] = record
+        self.mock_db_instance.get_active_proxies.return_value = set(active)
+        self.mock_db_instance.get_reserve_proxies.return_value = [reserve]
+
+        self.manager._sync_and_select_top_proxies()
+
+        self.assertIn(reserve, self.manager.candidate_pools[self.SOURCE])
+        kept = self.manager.source_stats[self.SOURCE][reserve]
+        self.assertIs(kept, record)
+        self.assertEqual((kept["success_count"], kept["failure_count"]), (1, 4))
+
+    def test_truncation_still_evicts_history_nothing_serves(self):
+        """Only the servable set is exempt; the cap still bounds the rest."""
+        self.manager.max_pool_size = 1
+        self.manager.stats_pool_max_multiplier = 2
+        active = urls(2, first_octet=10)
+        gone = urls(3, first_octet=90)
+        for proxy_url in gone:
+            self.manager.source_stats[self.SOURCE][proxy_url] = (
+                self.manager._get_new_proxy_stat(self.SOURCE)
+            )
+        self.mock_db_instance.get_active_proxies.return_value = set(active)
+        self.mock_db_instance.get_reserve_proxies.return_value = []
+
+        self.manager._sync_and_select_top_proxies()
+
+        self.assertFalse(set(gone) & set(self.manager.source_stats[self.SOURCE]))

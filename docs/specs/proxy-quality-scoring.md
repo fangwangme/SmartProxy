@@ -86,11 +86,11 @@ every pool_refresh_seconds, fill candidate_pool_size slots in priority order:
   tier 3   anything else, including never-validated     <- tops up the rest
 ```
 
-Tier 1 is defined by feedback and nothing else. `is_active` is not part of it:
-requiring one would put validation back in front of the ranking as an admission
-test, and would rank a never-measured proxy above one that real client traffic
-keeps succeeding on. A proxy the validator cannot currently reach still sorts
-into tier 1 on the strength of its own results.
+Tier 1 is defined by feedback, not by validation: `is_active` is not one of its
+conditions. Its candidates are the proxies the router can see - the live set
+and the reserve page (4.1) - so a proxy with a success on record that has since
+failed validation is usually outside both until it passes again. That boundary
+is provisional; see 4.5.
 
 Score orders within a tier and decides who makes the cut. It never decides
 whether a proxy may serve. The pool therefore always holds
@@ -138,6 +138,11 @@ The last two go through `_publish_reserve_pool()`, which republishes tier 3 and
 rebuilds but never reads or rewrites `active_proxies`. That narrowness is the
 point: it can run on a path where a validation batch has just failed, where
 preserving last-known-good liveness is the standing contract.
+
+Reserve proxies keep their records under the stats cap exactly as live ones do:
+`_truncate_stats_pool()` exempts the whole servable set, live and reserve. The
+pool re-seeds a blank stat for any member that lacks one, so evicting a reserve
+proxy that is still being served would launder its failure history.
 
 The row count is bounded by `candidate_pool_size`: one pool's worth is all
 tier 3 can ever place, so the bound needs no tunable of its own. Rows are
@@ -215,6 +220,45 @@ nothing reads `avg_latency_ms` to decide anything.
 `proxy_cooldown_ms` went with them although it is not one of the four gates: a
 cooldown filters pool members, so at a large enough value it holds every member
 out at once, which the governing rule does not permit to survive.
+
+### 4.5 Open decision: proven proxies outside the reserve page
+
+A proxy that has succeeded for real clients and then failed validation is a
+tier-1 proxy by definition, but the router usually cannot see it: its last
+check is the newest in the table, so it sorts to the end of the reserve
+ordering and falls outside the page. Until it passes validation again - and the
+failed-proxy retry queue is oldest-first across the whole dead table, so that
+can take hours - it is out of the ranking.
+
+Pulling every such proxy into tier 1, existence-checked against the database,
+is the obvious fix and was deliberately not taken, because of how tier 1 is
+defined: *any* success on record, a lifetime counter that never resets, filled
+as a block ahead of tier 2. Widened to all history, tier 1 fills with proxies
+that succeeded once and have since died, ahead of proxies validated alive. A
+simulation of 120 live proxies and 170 non-active proxies with a success on
+record, 20 of which still work:
+
+| True success rate of the 20 that still work | not widened | widened | widened: traffic to dead proxies |
+| --- | ---: | ---: | ---: |
+| 30% | 0.073 | 0.141 | 25% |
+| 12% | 0.073 | 0.081 | 26% |
+| 3% | 0.073 | 0.057 | 36% |
+| 0% | 0.073 | 0.057 | 37% |
+
+Widening pays only if proven-but-non-active proxies keep succeeding at about
+the rate of the better live ones; otherwise it costs roughly a fifth of served
+quality. The simulation does not model re-validation, which returns a working
+proxy to the live set on its own, so it overstates the gain.
+
+Bounding the widening by score - only proxies scoring above the prior - was
+tested and rejected. It is the removed score gate in miniature: a non-active
+proxy that dips below the prior on an ordinary losing streak is never served
+again, so it can never produce the evidence that would lift it back (0.116 in
+the 30% row, below both alternatives).
+
+The decision waits on production data: how many proxies with a success on
+record are non-active, how recent that success is, and how often they pass
+re-validation.
 
 ## 5. Source-wide outage guard
 

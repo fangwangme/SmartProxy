@@ -240,5 +240,28 @@ class TestIPRestriction(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
 
+    def test_local_reverse_proxy_cannot_reach_internal_endpoints(self):
+        """
+        A loopback peer carrying forwarding headers is a proxy on this host
+        relaying an outside client. Loopback alone does not open internal
+        endpoints.
+        """
+        for header in ("X-Forwarded-For", "Forwarded", "X-Real-IP"):
+            for path in ("/metrics", "/health", "/ready"):
+                with self.subTest(header=header, path=path):
+                    response = self.client.get(
+                        path,
+                        headers={header: "203.0.113.9"},
+                        environ_overrides={"REMOTE_ADDR": "127.0.0.1"},
+                    )
+                    self.assertEqual(response.status_code, 403)
+        response = self.client.post(
+            "/reload-sources",
+            headers={"X-Forwarded-For": "203.0.113.9"},
+            environ_overrides={"REMOTE_ADDR": "127.0.0.1"},
+        )
+        self.assertEqual(response.status_code, 403)
+        self.mock_proxy_manager.reload_sources.assert_not_called()
+
 if __name__ == "__main__":
     unittest.main()

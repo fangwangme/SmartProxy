@@ -169,9 +169,9 @@ The service is configured via the config.ini file.
   * shutdown\_deadline\_seconds: Deadline for stopping scheduling, draining or cancelling tracked work, flushing current feedback, and writing the final backup. Size it above normal drain/flush time plus the observed `smartproxy_backup_duration_seconds`; the launcher enforces the outer cutoff and backup replacement is atomic.
   * readiness\_*: Maximum dependency ages and minimum usable-pool threshold for `/ready`.
   * allowed\_ips: Comma-separated remote IP allowlist for external APIs and dashboard pages.
-  * trust\_proxy\_headers / trusted\_proxy\_ips: Only trust X-Forwarded-For when the direct peer is explicitly trusted.
+  * trust\_proxy\_headers / trusted\_proxy\_ips: Only trust X-Forwarded-For when the direct peer is explicitly trusted. The server passes forwarding headers through to the application, so this list is the one authority on them (waitress's own `trusted_proxy` accepts only a single address).
   * localhost (including IPv4-mapped loopback) is always allowed automatically.
-  * internal endpoints `/health`, `/live`, `/ready`, `/metrics`, `/reload-sources`, `/backup-stats` are localhost-only.
+  * internal endpoints `/health`, `/live`, `/ready`, `/metrics`, `/reload-sources`, `/backup-stats` are localhost-only, and refuse any request carrying forwarding headers (`X-Forwarded-For`, `Forwarded`, `X-Real-IP`, ...). A reverse proxy on the same host connects from loopback too; those headers are how it shows it is relaying someone else. Reach these endpoints directly on the service port, never through a proxy - a proxy configured to add no forwarding header at all cannot be told apart from a local caller.
 * **\[logging\]**:
   * log\_dir: Log directory. Relative paths are resolved from the project root. Defaults to `./.local/logs`.
 * **\[validator\]**:  
@@ -202,7 +202,7 @@ The service is configured via the config.ini file.
   * max\_feedback\_latency\_ms: Input-safety boundary for diagnostic latency. Latency never affects reliability or ordering.
   * Online reputation stays source-local in the manager and is included in the existing JSON backup. If no backup is restored, proxies start from the fixed prior and relearn through normal traffic; there is no reputation database migration or double-write path.
   * max\_pool\_size / top\_tier\_size: Bound the ranked tier lists, which are reporting and the input a later weighting change would use. They are not an eligibility gate and are not what `/get-proxy` reads.
-  * max\_pool\_size x stats\_pool\_max\_multiplier: The cap on retained **dead** proxy history - not on total memory. Proxies that passed the latest validation are never evicted, because evicting one would reset its failure history to zero on the next sync, so the stats pool grows with the number of genuinely active proxies. If the live set alone reaches the cap, all dead history is dropped and a warning is logged.
+  * max\_pool\_size x stats\_pool\_max\_multiplier: The cap on retained **dead** proxy history - not on total memory. Proxies the pool can serve - those that passed the latest validation and those in the reserve page - are never evicted, because the pool would re-seed a blank record for one on the next sync and launder its failure history, so the stats pool grows with the servable set. If the servable set alone reaches the cap, all other history is dropped and a warning is logged.
 * **\[proxy\_source\_\*\]**: Define your proxy sources here. Each source should have its own section (e.g., \[proxy\_source\_freeproxies\]).  
   * url: The URL to fetch the proxy list from.  
   * update\_interval\_minutes: How often to fetch from this source.  

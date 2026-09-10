@@ -1090,6 +1090,9 @@ class TestApiAndLifecycleContracts(ProxyManagerTestBase):
             threads=9,
             connection_limit=900,
             asyncore_use_poll=True,
+            # Forwarding headers reach the app, whose trusted_proxy_ips list
+            # is the one authority on them; waitress would strip them first.
+            clear_untrusted_proxy_headers=False,
         )
         fake_app.run.assert_not_called()
 

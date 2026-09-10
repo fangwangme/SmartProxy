@@ -35,6 +35,31 @@ def load_proxy_manager(config_path: str, restore_mode: str = "normal") -> ProxyM
         )
     return manager
 
+
+def waitress_options(proxy_manager) -> dict:
+    """
+    The production server's settings, in one place so tests run the same ones.
+
+    - asyncore_use_poll: poll(), not waitress's default select(). select()
+      cannot watch a descriptor numbered 1024 or above and raises straight out
+      of the serving loop when it meets one. The database pool, validation
+      sockets and fetcher pipes share that numbering, so a connection_limit
+      sized for real traffic crosses the line long before its own count does.
+    - clear_untrusted_proxy_headers=False: by default waitress strips
+      forwarding headers before the app sees them, which silently disabled
+      [server] trust_proxy_headers / trusted_proxy_ips in production. Waitress's
+      own trusted_proxy takes a single address; the app's list is the one
+      authority, and it only honours forwarding headers from a peer on it.
+    """
+    return {
+        "host": "0.0.0.0",
+        "port": proxy_manager.server_port,
+        "threads": proxy_manager.production_threads,
+        "connection_limit": proxy_manager.server_connection_limit,
+        "asyncore_use_poll": True,
+        "clear_untrusted_proxy_headers": False,
+    }
+
 def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="SmartProxy Service")
@@ -85,20 +110,7 @@ def main():
             app.run(host="0.0.0.0", port=proxy_manager.server_port, debug=False)
         else:
             # One process keeps lease and scoring state coherent.
-            # poll(), not waitress's default select(): select() cannot watch a
-            # descriptor numbered 1024 or above and raises straight out of the
-            # serving loop when it meets one. The database pool, validation
-            # sockets and fetcher pipes share that numbering, so a
-            # connection_limit sized for real traffic crosses the line long
-            # before its own count reaches it.
-            serve(
-                app,
-                host="0.0.0.0",
-                port=proxy_manager.server_port,
-                threads=proxy_manager.production_threads,
-                connection_limit=proxy_manager.server_connection_limit,
-                asyncore_use_poll=True,
-            )
+            serve(app, **waitress_options(proxy_manager))
     finally:
         if not shutdown_started.is_set():
             shutdown_started.set()
