@@ -165,7 +165,7 @@ The service is configured via the config.ini file.
 * **\[database\]**: Credentials for your PostgreSQL database.  
 * **\[server\]**: port for the API and dashboard.  
   * production\_threads / background\_workers: Thread counts for the single-process WSGI server and tracked background work.
-  * connection\_limit: Maximum simultaneously open connections (default `1000`). Waitress defaults this to `100`; a client that retries without backoff exhausts that in seconds and turns any slow answer into a connection-level outage. Restart-only.
+  * connection\_limit: Maximum simultaneously open connections (default `1000`). Waitress defaults this to `100`; a client that retries without backoff exhausts that in seconds and turns any slow answer into a connection-level outage. The server loop runs on `poll()` rather than waitress's default `select()`, which cannot watch descriptors numbered 1024 or above and would crash the loop once connections plus the database pool reach that line. Restart-only.
   * shutdown\_deadline\_seconds: Deadline for stopping scheduling, draining or cancelling tracked work, flushing current feedback, and writing the final backup. Size it above normal drain/flush time plus the observed `smartproxy_backup_duration_seconds`; the launcher enforces the outer cutoff and backup replacement is atomic.
   * readiness\_*: Maximum dependency ages and minimum usable-pool threshold for `/ready`.
   * allowed\_ips: Comma-separated remote IP allowlist for external APIs and dashboard pages.

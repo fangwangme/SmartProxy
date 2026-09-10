@@ -1080,12 +1080,16 @@ class TestApiAndLifecycleContracts(ProxyManagerTestBase):
         fake_manager.stop_scheduler.assert_called_once()
         # connection_limit is passed explicitly: waitress defaults it to 100,
         # and exhausting that turns any refusal into a connection-level outage.
+        # asyncore_use_poll goes with it: under the default select() loop, a
+        # descriptor numbered 1024 or above raises out of the server - with a
+        # thousand connections plus the database pool, that is reachable.
         serve.assert_called_once_with(
             fake_app,
             host="0.0.0.0",
             port=7000,
             threads=9,
             connection_limit=900,
+            asyncore_use_poll=True,
         )
         fake_app.run.assert_not_called()
 

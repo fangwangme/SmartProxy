@@ -85,12 +85,19 @@ def main():
             app.run(host="0.0.0.0", port=proxy_manager.server_port, debug=False)
         else:
             # One process keeps lease and scoring state coherent.
+            # poll(), not waitress's default select(): select() cannot watch a
+            # descriptor numbered 1024 or above and raises straight out of the
+            # serving loop when it meets one. The database pool, validation
+            # sockets and fetcher pipes share that numbering, so a
+            # connection_limit sized for real traffic crosses the line long
+            # before its own count reaches it.
             serve(
                 app,
                 host="0.0.0.0",
                 port=proxy_manager.server_port,
                 threads=proxy_manager.production_threads,
                 connection_limit=proxy_manager.server_connection_limit,
+                asyncore_use_poll=True,
             )
     finally:
         if not shutdown_started.is_set():
