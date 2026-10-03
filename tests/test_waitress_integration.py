@@ -9,15 +9,14 @@ them, and a reverse proxy on the same host reaching internal endpoints - and
 none of them was visible through the test client.
 """
 import http.client
+import logging
 import resource
 import threading
 import unittest
 from unittest.mock import patch
 
-from waitress.server import create_server
-
 from src.api.server import create_app
-from src.main import waitress_options
+from src.main import create_production_server, waitress_options
 from tests.test_smart_proxy import ProxyManagerTestBase
 
 # Never 6942: the real service lives there.
@@ -34,11 +33,9 @@ class WaitressProductionPathTests(ProxyManagerTestBase):
         self.manager.trust_proxy_headers = True
         self.manager.trusted_proxy_ips = ["127.0.0.1"]
         self.manager.allowed_ips = [OUTSIDE_CLIENT]
-        options = waitress_options(self.manager) | {
-            "host": "127.0.0.1",
-            "port": MOCK_PORT,
-        }
-        self.server = create_server(create_app(self.manager), **options)
+        self.server = create_production_server(
+            create_app(self.manager), self.manager, host="127.0.0.1", port=MOCK_PORT
+        )
         self.loop_errors = []
 
         def run():
@@ -65,6 +62,28 @@ class WaitressProductionPathTests(ProxyManagerTestBase):
             return connection.getresponse().status
         finally:
             connection.close()
+
+    def test_a_client_closing_its_connection_is_not_an_event(self):
+        """
+        A closed connection is routine, not a "priority event".
+
+        macOS poll() reports POLLPRI alongside POLLHUP when the peer closes,
+        and waitress subscribed to POLLPRI, so every request ended with
+        "unhandled incoming priority event" - one warning per request. HTTP
+        never sends TCP urgent data, so the loop no longer asks for it.
+        """
+        records = []
+        handler = logging.Handler()
+        handler.emit = records.append
+        waitress_logger = logging.getLogger("waitress")
+        waitress_logger.addHandler(handler)
+        self.addCleanup(waitress_logger.removeHandler, handler)
+
+        for _ in range(20):
+            self.assertEqual(self.status("GET", "/api/sources"), 200)
+        self.status("GET", "/api/sources")  # lets the loop see the last close
+
+        self.assertEqual([record.getMessage() for record in records], [])
 
     def test_forwarding_headers_reach_the_allowlist(self):
         """

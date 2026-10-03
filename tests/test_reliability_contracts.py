@@ -1307,7 +1307,7 @@ class TestApiAndLifecycleContracts(ProxyManagerTestBase):
             patch.object(main_module, "configure_logging_from_file"),
             patch.object(main_module, "load_proxy_manager", return_value=fake_manager),
             patch.object(main_module, "create_app", return_value=fake_app),
-            patch.object(main_module, "serve") as serve,
+            patch.object(main_module, "create_server") as create_server,
             patch.object(main_module.signal, "signal"),
         ):
             main_module.main()
@@ -1319,7 +1319,7 @@ class TestApiAndLifecycleContracts(ProxyManagerTestBase):
         # asyncore_use_poll goes with it: under the default select() loop, a
         # descriptor numbered 1024 or above raises out of the server - with a
         # thousand connections plus the database pool, that is reachable.
-        serve.assert_called_once_with(
+        create_server.assert_called_once_with(
             fake_app,
             host="0.0.0.0",
             port=7000,
@@ -1330,6 +1330,10 @@ class TestApiAndLifecycleContracts(ProxyManagerTestBase):
             # is the one authority on them; waitress would strip them first.
             clear_untrusted_proxy_headers=False,
         )
+        server = create_server.return_value
+        # The poll loop that never subscribes to POLLPRI, not waitress's own.
+        self.assertIs(server.asyncore, main_module._PollLoop)
+        server.run.assert_called_once()
         fake_app.run.assert_not_called()
 
     def test_importing_logger_does_not_initialize_a_persistent_sink(self):
