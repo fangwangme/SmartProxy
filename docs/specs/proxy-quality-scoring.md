@@ -223,11 +223,14 @@ filling the pool. Neither may remove a proxy from it.
   Feedback alone is not enough: a client that takes proxies and never reports
   is precisely the case that sends none, and the list is deep-copied and
   serialised by every backup.
-- **Weighting inside the pool is dormant.** The draw is uniform;
-  `selection_strategy`, `softmax_temperature`, `selection_weight_floor` and
-  `top_tier_load_percentage` are parsed and validated but not consulted.
-  Re-introducing weights on top of the pool is a later change and an
-  optimisation, not a requirement.
+- **Weighting inside the pool decides how often, not whether.** The ranked
+  slots are drawn by `selection_strategy` (softmax by default); the
+  exploration slots get `exploration_slots / candidate_pool_size` of handouts,
+  uniformly, because an untried proxy at the prior would almost never win a
+  score-weighted draw. A real cold start (2026-10-03) showed why weighting
+  matters: with the pool drawn uniformly the client's success rate reached
+  ~35% after 18 minutes, against 60-70% at the same stage before #27, while
+  the 40 proxies scoring 50 or more had 93% success on their own record.
 - **The ranked tier lists** (`max_pool_size`, `top_tier_size`) are reporting
   and the input that later weighting change would use. They are not an
   eligibility gate and are not what `/get-proxy` reads.
@@ -330,9 +333,10 @@ seeds a stat for every pool member, because anything that can be handed out
 needs somewhere to record feedback, or a proxy served from the reserve could
 never earn its score.
 
-`allocate_proxy()` holds no pool logic: one dict lookup and one
-`random.choice`. Nothing in it scales with the size of the pool, and nothing in
-it can refuse. Its only `None` is an empty pool, which means an empty database.
+`allocate_proxy()` holds no pool logic: one dict lookup and one draw - uniform
+over the exploration slots, or a bisection over the ranked slots' cumulative
+weights, which the rebuild computes. Nothing in it scales beyond a logarithm
+of the pool size, and nothing in it can refuse. Its only `None` is an empty pool, which means an empty database.
 
 The pool is therefore allowed to be stale, and that staleness is bounded by
 `pool_refresh_seconds`. Nothing is repaired on the request thread - a rebuild

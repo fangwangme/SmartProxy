@@ -179,8 +179,13 @@ class ProxyManager:
         # get_active_proxies() cannot see a never-validated proxy.
         self.reserve_proxies: List[str] = []
         # source -> the N proxies this source serves; see
-        # _rebuild_candidate_pool(). A handout is a uniform pick from it.
+        # _rebuild_candidate_pool(). candidate_draws holds how a handout picks
+        # from them: (ranked slots, their cumulative weights or None for a
+        # uniform pick, exploration slots).
         self.candidate_pools: Dict[str, List[str]] = {}
+        self.candidate_draws: Dict[
+            str, Tuple[List[str], Optional[List[float]], List[str]]
+        ] = {}
         self.candidate_pool_built_at: Dict[str, float] = {}
         self.accepted_feedback_success_total = 0
         self.accepted_feedback_failure_total = 0
@@ -473,22 +478,23 @@ class ProxyManager:
         )
         # The candidate pool is the whole routing layer. It is refilled on a
         # timer to min(candidate_pool_size, everything the database holds), and
-        # a handout is a uniform pick from it. None of these three can empty
+        # a handout is a weighted pick from it. None of these three can empty
         # it: a parameter whose wrong value degrades performance is a tunable,
         # a parameter whose wrong value empties the servable set is a defect.
         self.candidate_pool_size = self._cfg_int(
-            "source_pool", "candidate_pool_size", 200, low=1
+            "source_pool", "candidate_pool_size", 300, low=1
         )
         self.pool_refresh_seconds = self._cfg_float(
             "source_pool", "pool_refresh_seconds", 60.0, low=0.001
         )
-        # Slots held back for proxies that have never been measured. Without
-        # them a pool filled entirely by proven proxies would never admit a
-        # newcomer, so tomorrow's better proxy would never be discovered. A
-        # floor, not a gate: unclaimed reserved slots go back to the ranking,
-        # and a value at or above candidate_pool_size still fills the pool.
+        # Slots rotated over the proxies the ranking left out. They also set
+        # the exploration share of traffic: exploration_slots /
+        # candidate_pool_size of handouts go to them, drawn uniformly, because
+        # under score weighting an untried proxy at the prior would almost
+        # never be drawn. A value at or above candidate_pool_size still fills
+        # the pool, all of it by rotation.
         self.exploration_slots = self._cfg_int(
-            "source_pool", "exploration_slots", 20, low=0
+            "source_pool", "exploration_slots", 30, low=0
         )
         # Leases are bookkeeping, not routing: nothing on the selection path
         # reads them. They exist so process_feedback can tell a first report
@@ -497,10 +503,9 @@ class ProxyManager:
         self.proxy_inflight_timeout_s = self._cfg_float(
             "source_pool", "proxy_inflight_timeout_seconds", 120.0, low=0.1
         )
-        # Weighting is dormant: the draw inside the pool is uniform, so these
-        # are parsed and validated but not consulted. Re-introducing weights on
-        # top of the pool is a later change; the keys stay so that change does
-        # not have to be a config migration as well.
+        # How a handout weights the ranked slots (see _selection_cum_weights()).
+        # Every weight is positive except tiered at 100%, so weighting decides
+        # how often a pool member is drawn, never whether the pool can serve.
         self.selection_weight_floor = self._cfg_float(
             "source_pool", "selection_weight_floor", 1.0, low=0.01
         )
@@ -872,6 +877,7 @@ class ProxyManager:
             # pool when it is filled, so a reload that left the pools standing
             # would not be authoritative until they aged out.
             self.candidate_pools.clear()
+            self.candidate_draws.clear()
             self.candidate_pool_built_at.clear()
 
             self.fetcher_jobs = new_fetcher_jobs
@@ -929,6 +935,7 @@ class ProxyManager:
                     self.available_proxies.pop(source, None)
                     self.outage_states.pop(source, None)
                     self.candidate_pools.pop(source, None)
+                    self.candidate_draws.pop(source, None)
                     self.candidate_pool_built_at.pop(source, None)
                     logger.info(
                         f"Cleaned up in-memory pool for removed source: {source}"
@@ -2534,12 +2541,14 @@ class ProxyManager:
         """
         Draw one proxy for a source and record the handout.
 
-        One dict lookup and one uniform pick. Every judgement - which proxies
-        are good enough to be in the pool at all, and how they rank - was made
-        by _rebuild_candidate_pool() on a timer. Nothing on this path is a
-        threshold, so nothing on it can refuse: the pool holds N proxies, or
-        everything the database has if that is fewer, and the only way to get
-        None back is a database with no proxies in it.
+        One dict lookup and one draw. Every judgement - which proxies are in
+        the pool, how they rank and how they are weighted - was made by
+        _rebuild_candidate_pool() on a timer. The exploration slots get their
+        share of handouts uniformly; the rest are drawn from the ranked slots
+        by weight. Nothing on this path is a threshold, so nothing on it can
+        refuse: the pool holds N proxies, or everything the database has if
+        that is fewer, and the only way to get None back is a database with no
+        proxies in it.
         """
         source = self._get_source_or_default(source)
 
@@ -2552,7 +2561,15 @@ class ProxyManager:
                     source,
                 )
                 return None
-            selected = random.choice(pool)
+            ranked, cum_weights, exploring = self.candidate_draws[source]
+            if exploring and (
+                not ranked or random.random() < self._exploration_share()
+            ):
+                selected = random.choice(exploring)
+            elif cum_weights is None:
+                selected = random.choice(ranked)
+            else:
+                selected = random.choices(ranked, cum_weights=cum_weights)[0]
             self._mark_proxy_handed_out(source, selected, time.time())
             return {"proxy": selected, "source": source}
 
@@ -2664,8 +2681,11 @@ class ProxyManager:
         ranked = sorted(position, key=by_score)
         capacity = self.candidate_pool_size
         reserved = min(self.exploration_slots, capacity)
-        pool = ranked[: capacity - reserved]
-        pool += heapq.nsmallest(reserved, ranked[capacity - reserved :], key=by_turn)
+        ranked_slots = ranked[: capacity - reserved]
+        exploring = heapq.nsmallest(
+            reserved, ranked[capacity - reserved :], key=by_turn
+        )
+        pool = ranked_slots + exploring
 
         # Anything that can be handed out needs somewhere to record feedback,
         # or a proxy served from the reserve could never earn its score.
@@ -2674,8 +2694,65 @@ class ProxyManager:
                 stats_pool[proxy_url] = self._get_new_proxy_stat(source)
 
         self.candidate_pools[source] = pool
+        self.candidate_draws[source] = (
+            ranked_slots,
+            self._selection_cum_weights(source, ranked_slots),
+            exploring,
+        )
         self.candidate_pool_built_at[source] = now_ts
         return pool
+
+    def _exploration_share(self) -> float:
+        """The share of handouts drawn from the exploration slots."""
+        return min(1.0, self.exploration_slots / self.candidate_pool_size)
+
+    def _selection_cum_weights(
+        self, source: str, candidates: List[str]
+    ) -> Optional[List[float]]:
+        """
+        Cumulative weights for the ranked slots, or None for a uniform draw.
+
+        Computed once per rebuild rather than once per request: softmax over a
+        few hundred proxies is a few hundred exp() calls, which is nothing on
+        a timer and everything on a hot path. The scores it reads are as stale
+        as the pool itself, bounded by pool_refresh_seconds.
+        """
+        if not candidates or self.selection_strategy == "uniform":
+            return None
+        stats = self.source_stats.get(source, {})
+        default_score = self._baseline_score(source)
+        scores = [
+            float(stats.get(proxy_url, {}).get("score", default_score))
+            for proxy_url in candidates
+        ]
+        if self.selection_strategy == "softmax":
+            top = max(scores)
+            weights = [
+                math.exp((score - top) / self.softmax_temperature) for score in scores
+            ]
+        elif self.selection_strategy == "tiered":
+            # The top tier collectively receives top_tier_load_percentage of
+            # the traffic, as a two-level weighting rather than its own path.
+            top_tier = set(self.available_proxies.get(source, {}).get("top_tier", []))
+            in_top = [url for url in candidates if url in top_tier]
+            share = self.top_tier_load_percentage / 100
+            if not in_top or len(in_top) == len(candidates):
+                weights = [1.0] * len(candidates)
+            else:
+                top_weight = share / len(in_top)
+                bottom_weight = (1 - share) / (len(candidates) - len(in_top))
+                weights = [
+                    top_weight if url in top_tier else bottom_weight
+                    for url in candidates
+                ]
+        else:
+            weights = [max(self.selection_weight_floor, score) for score in scores]
+
+        cumulative, running = [], 0.0
+        for weight in weights:
+            running += weight
+            cumulative.append(running)
+        return cumulative if running > 0 else None
 
     def _lease_count(self, stat: Dict, now_ts: float) -> int:
         """

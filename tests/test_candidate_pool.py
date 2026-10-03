@@ -972,3 +972,70 @@ class WinnerSwitchTests(ProxyManagerTestBase):
         self.assertGreater(
             len(set(self.manager.candidate_pools[self.SOURCE]) & new_winners), 15
         )
+
+
+class WeightedDrawTests(ProxyManagerTestBase):
+    """
+    Ranking decides who is in the pool; weighting decides how often each is drawn.
+
+    A real cold start drawing uniformly reached ~35% success after 18 minutes
+    while the 40 proxies scoring 50+ had 93% on their own record: a uniform
+    draw spreads traffic evenly over every slot, proven or not.
+    """
+
+    SOURCE = "source1"
+
+    def setUp(self):
+        super().setUp()
+        self.manager.candidate_pool_size = 100
+        self.manager.exploration_slots = 10
+        # The shipped default; the shared test config draws uniformly.
+        self.manager.selection_strategy = "softmax"
+        self.manager.softmax_temperature = 14.0
+        self.proven = urls(10, first_octet=100)
+        self.untried = urls(190, first_octet=110)
+        now = time.time()
+        for proxy_url in self.proven:
+            stat = self.manager._get_new_proxy_stat(self.SOURCE)
+            for index in range(20):
+                self.manager._update_reliability_state(stat, True, now - 20 + index)
+            stat["success_count"] = 20
+            self.manager.source_stats[self.SOURCE][proxy_url] = stat
+        self.mock_db_instance.get_active_proxies.return_value = set(
+            self.proven + self.untried
+        )
+        self.mock_db_instance.get_reserve_proxies.return_value = []
+        self.manager._sync_and_select_top_proxies()
+        random.seed(2710)
+
+    def draw(self, count=4000):
+        return [self.manager.allocate_proxy(self.SOURCE)["proxy"] for _ in range(count)]
+
+    def test_traffic_concentrates_on_the_proven_proxies(self):
+        handouts = self.draw()
+        proven_share = sum(url in set(self.proven) for url in handouts) / len(handouts)
+
+        # 10 of 100 slots: a uniform draw gives them 10%. Softmax at 14 over
+        # scores near 100 against the prior of 5 gives them nearly all of the
+        # ranked share, which is 90% of handouts.
+        self.assertGreater(proven_share, 0.8)
+
+    def test_exploration_slots_get_their_share_of_handouts(self):
+        exploring = set(self.manager.candidate_draws[self.SOURCE][2])
+        self.assertEqual(len(exploring), 10)
+
+        handouts = self.draw()
+        share = sum(url in exploring for url in handouts) / len(handouts)
+
+        # 10 / 100 slots -> 10% of handouts, though every one of them scores
+        # at the prior and would almost never win a softmax draw.
+        self.assertAlmostEqual(share, 0.10, delta=0.02)
+
+    def test_a_uniform_strategy_still_draws_uniformly(self):
+        self.manager.selection_strategy = "uniform"
+        self.manager.refresh_candidate_pools()
+
+        handouts = self.draw()
+        proven_share = sum(url in set(self.proven) for url in handouts) / len(handouts)
+
+        self.assertAlmostEqual(proven_share, 10 / 100, delta=0.03)

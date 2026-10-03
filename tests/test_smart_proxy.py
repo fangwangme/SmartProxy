@@ -1812,7 +1812,7 @@ class TestSecondReviewRegressions(ProxyManagerTestBase):
         del merged["source_pool"]["candidate_pool_size"]
         manager = ProxyManager(write_config_file(self.tmp_dir, merged, name="nokey.ini"))
 
-        self.assertEqual(manager.candidate_pool_size, 200)
+        self.assertEqual(manager.candidate_pool_size, 300)
 
     # --- Finding 2: the cap must not launder a live proxy over two syncs ---
 
@@ -2417,9 +2417,9 @@ class TestIssue23OnlineReliability(ProxyManagerTestBase):
         self.assertEqual(example_manager.reliability_prior, 0.05)
         self.assertEqual(example_manager.reliability_slow_alpha, 0.12)
         self.assertEqual(example_manager.reliability_fast_alpha, 0.30)
-        self.assertEqual(example_manager.candidate_pool_size, 200)
+        self.assertEqual(example_manager.candidate_pool_size, 300)
         self.assertEqual(example_manager.pool_refresh_seconds, 60.0)
-        self.assertEqual(example_manager.exploration_slots, 20)
+        self.assertEqual(example_manager.exploration_slots, 30)
 
 
 class TestIssue23AdaptiveExplorationAndProbation(ProxyManagerTestBase):
