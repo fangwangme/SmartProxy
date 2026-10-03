@@ -1,7 +1,9 @@
 ## Development Environment
 
 - Python: **3.14**, managed by **uv**. `uv sync --locked` then run tools through `.venv/bin/...`
-- Node.js: `cd dashboard && bun install`
+- Node.js: `cd dashboard && bun install`, then `bun run build` — the server
+  serves the dashboard from `.local/dist` (git-ignored, per checkout), and `/`
+  answers 404 until that build exists.
 
 ### Creating the Python `.venv`
 
@@ -67,8 +69,8 @@ that has shipped so far came in through a pull request.
   use: `feat`, `fix`, `perf`, `chore`, `docs`.
 - Work in a git worktree under `.worktrees/<branch-name>`, not by switching
   branches in the main checkout. Each worktree needs its own `.venv`
-  (`uv sync --locked`) and its own `dashboard/node_modules` (`bun install`) —
-  see the Development Environment section above.
+  (`uv sync --locked`) its own `dashboard/node_modules` (`bun install`) and
+  its own dashboard build (`bun run build`) — see the Development Environment section above.
 - Open a pull request against `main` with `Closes #<issue>` in the body, and
   record the verification you actually ran.
 - **Changelog Policy**: Never add an `Unreleased` section to `CHANGELOG.md` in feature branches or PRs.
