@@ -18,7 +18,7 @@ SmartProxy is a sophisticated proxy management system designed to provide reliab
 1. **Fetch**: The service periodically fetches proxy lists from various sources defined in config.ini.  
 2. **Validate**: A validation cycle runs regularly. It prioritizes new and previously successful proxies. To avoid overwhelming unreliable proxies, it supplements the validation queue with failed proxies that have not been tested more than a configured number of times within a specific time window (e.g., 5 times in 30 minutes).  
 3. **Score**: Each source keeps independent slow and fast reliability estimates. Both start at `reliability_prior` (5% by default), update on every feedback event, and expose `score = 100 × min(slow, fast)`. The slow estimator limits one-hit promotion; the fast estimator reacts quickly to deterioration. Old state decays toward the same fixed prior. Latency is observable but never enters reliability or selection order; it is recorded as `avg_latency_ms` and nothing more.
-4. **Select**: Each source keeps a fixed-size candidate pool, rebuilt every `pool_refresh_seconds` and filled best-first from three tiers - proxies with successful feedback on record, then proxies that passed validation, then everything else the database holds including never-validated rows. `/get-proxy` is a uniform random pick from that pool. Score decides who makes the cut and in what order; it never decides whether a proxy may serve, and there is no threshold anywhere on the routing path. Because the pool is always filled to `min(candidate_pool_size, everything available)`, the service can only fail to answer when the database holds no proxies at all - a cold start, a lost reputation snapshot, and a new source all serve immediately. `exploration_slots` of the slots are reserved for never-measured proxies so a pool saturated by today's best still admits tomorrow's better one.
+4. **Select**: Each source keeps a fixed-size candidate pool, rebuilt every `pool_refresh_seconds` from every proxy the router can see - the validated set, a page of never-validated and failed rows, and the rows with the best feedback records. Most slots go by current score, with validation only breaking ties; `exploration_slots` rotate over everyone else, newcomers first and then whoever was tried longest ago, so a proxy that failed and has since recovered gets tried again. `/get-proxy` is a uniform random pick from that pool. Score decides who makes the cut; it never decides whether a proxy may serve, and there is no threshold anywhere on the routing path. Because the pool is always filled to `min(candidate_pool_size, everything available)`, the service can only fail to answer when the database holds no proxies at all - a cold start, a lost reputation snapshot, and a new source all serve immediately.
 5. **Adapt**: Through continuous validation and feedback, low-quality proxies are phased out, and high-performing ones are prioritized, ensuring the overall quality of the pool constantly improves.
 
 ## **Project Structure**
@@ -83,7 +83,8 @@ SmartProxy is a sophisticated proxy management system designed to provide reliab
    Rerunning it discards all stored proxies and minute aggregates. That is the
    intended upgrade path: proxy rows are rediscovered by the fetchers within one
    source-refresh interval, and proxy reputation lives in the JSON backup rather
-   than the database, so it survives the rebuild and is restored on startup.
+   than the database, so it survives the rebuild and is restored on startup if
+   the backup is at most `stats_restore_max_age_hours` (12) old.
    Back up `source_stats_by_minute` first if you need the historical dashboard
    series.
 
@@ -167,7 +168,7 @@ The service is configured via the config.ini file.
   * production\_threads / background\_workers: Thread counts for the single-process WSGI server and tracked background work.
   * connection\_limit: Maximum simultaneously open connections (default `1000`). Waitress defaults this to `100`; a client that retries without backoff exhausts that in seconds and turns any slow answer into a connection-level outage. The server loop runs on `poll()` rather than waitress's default `select()`, which cannot watch descriptors numbered 1024 or above and would crash the loop once connections plus the database pool reach that line. Restart-only.
   * shutdown\_deadline\_seconds: Deadline for stopping scheduling, draining or cancelling tracked work, flushing current feedback, and writing the final backup. Size it above normal drain/flush time plus the observed `smartproxy_backup_duration_seconds`; the launcher enforces the outer cutoff and backup replacement is atomic.
-  * readiness\_*: Maximum dependency ages and minimum usable-pool threshold for `/ready`.
+  * readiness\_*: Maximum dependency ages and minimum usable-pool threshold for `/ready`. The usable pool counts everything `/get-proxy` can hand out, fallback included. `readiness_validation_max_age_seconds` (default `2400`) must exceed `validation_window_minutes` plus `validation_interval_seconds`: once every proxy has been checked nothing is due for a whole window, and the service warns at startup when it is shorter.
   * allowed\_ips: Comma-separated remote IP allowlist for external APIs and dashboard pages.
   * trust\_proxy\_headers / trusted\_proxy\_ips: Only trust X-Forwarded-For when the direct peer is explicitly trusted. The server passes forwarding headers through to the application, so this list is the one authority on them (waitress's own `trusted_proxy` accepts only a single address).
   * localhost (including IPv4-mapped loopback) is always allowed automatically.
@@ -176,7 +177,7 @@ The service is configured via the config.ini file.
   * log\_dir: Log directory. Relative paths are resolved from the project root. Defaults to `./.local/logs`.
 * **\[validator\]**:  
   * validation\_target / validation\_targets: URL(s) used to test proxy connectivity and anonymity. Every target must return JSON with a `headers` mapping. Production deployments should configure multiple independently operated targets; do not copy the same endpoint under several URLs merely to meet the count.
-  * validation\_success\_threshold / validation\_target\_min\_samples: Proxy pass threshold and target-health evidence threshold. If target quorum is unavailable, existing active proxies keep their last-known-good liveness. Never-validated candidates are recorded as failed so an oldest bad batch cannot starve newer discoveries; the ordinary failed-proxy retry window reconsiders them after recovery.
+  * validation\_success\_threshold / validation\_target\_min\_samples: Proxy pass threshold and target-health evidence threshold. Target health is a diagnostic (log and `/ready`): every completed check is recorded as measured even when no target looks reachable, so the oldest rows always move to the back of the queue. An unreachable target therefore deactivates what it checked until the oldest-first failed-proxy queue reaches those rows again - hours on a large table. `/get-proxy` keeps serving throughout, since it never depends on `is_active` and keeps proxies with good feedback records in the pool; `/get-premium-proxy`, which requires `is_active`, has fewer or none to offer meanwhile. Each batch reads targets, threshold, timeout and concurrency once when it starts; a reload applies from the next batch.
   * validation\_workers: Number of concurrent threads for validation.  
   * validation\_batch\_limit: Maximum proxies pulled into one validation cycle.  
   * validation\_new\_proxy\_ratio: Share of that budget reserved for never-validated proxies; the rest re-checks proxies that are currently alive. Unused budget is donated to the other side. Defaults to `0.5`.
@@ -193,7 +194,7 @@ The service is configured via the config.ini file.
   * predefined\_sources: A comma-separated list of logical names for your proxy pools (e.g., google\_search, web\_scraping).  
   * default\_source: The pool to use if a requested source doesn't exist.  
 * **\[source\_pool\]**: Parameters for the scoring and selection algorithm.
-  * candidate\_pool\_size / pool\_refresh\_seconds / exploration\_slots: The whole routing layer (defaults `200`, `60`, `20`). How many slots the pool holds, how often it is refilled, and how many slots are reserved for never-measured proxies. **None of the three can empty the pool at any accepted value** - that is the design rule, not a coincidence: a parameter whose wrong value degrades performance is a tunable, a parameter whose wrong value empties the servable set is a defect. `exploration_slots = 0` disables the reservation; a value above `candidate_pool_size` still fills the pool.
+  * candidate\_pool\_size / pool\_refresh\_seconds / exploration\_slots: The whole routing layer (defaults `200`, `60`, `20`). How many slots the pool holds, how often it is refilled, and how many slots rotate over the proxies the ranking left out. **None of the three can empty the pool at any accepted value** - that is the design rule, not a coincidence: a parameter whose wrong value degrades performance is a tunable, a parameter whose wrong value empties the servable set is a defect. `exploration_slots = 0` disables the rotation; a value above `candidate_pool_size` still fills the pool.
   * proxy\_inflight\_timeout\_seconds: The outstanding-handout lease. It is bookkeeping only - nothing on the selection path reads it - and exists so feedback can be told apart from a duplicate or a late report. It releases a slot the client never reported. Restart-only so the lease list stays sorted by expiry.
   * selection\_strategy / softmax\_temperature / selection\_weight\_floor / top\_tier\_load\_percentage: **Dormant.** The draw inside the pool is uniform, so these are parsed and validated but not consulted. They remain so that re-introducing weights on top of the pool is a code change rather than a config migration.
   * reliability\_prior / reliability\_slow\_alpha / reliability\_fast\_alpha: Fixed prior and two online update speeds (defaults `0.05`, `0.12`, `0.30`).
@@ -201,8 +202,9 @@ The service is configured via the config.ini file.
   * outage\_guard\_*: Requires a healthy completed window before a broad distinct-proxy failure spike can pause and roll back proxy-level reputation updates. Aggregate traffic metrics continue, and a completed recovery window resumes learning.
   * max\_feedback\_latency\_ms: Input-safety boundary for diagnostic latency. Latency never affects reliability or ordering.
   * Online reputation stays source-local in the manager and is included in the existing JSON backup. If no backup is restored, proxies start from the fixed prior and relearn through normal traffic; there is no reputation database migration or double-write path.
+  * `[backup] stats_restore_max_age_hours` (default `12`): startup restores the backup only if the generation timestamp recorded inside it is at most this old - the file's mtime is never consulted. An older snapshot, or one without a readable timestamp, is skipped with a warning. It bounds the restore only: running scores and feedback are never aged out.
   * max\_pool\_size / top\_tier\_size: Bound the ranked tier lists, which are reporting and the input a later weighting change would use. They are not an eligibility gate and are not what `/get-proxy` reads.
-  * max\_pool\_size x stats\_pool\_max\_multiplier: The cap on retained **dead** proxy history - not on total memory. Proxies the pool can serve - those that passed the latest validation and those in the reserve page - are never evicted, because the pool would re-seed a blank record for one on the next sync and launder its failure history, so the stats pool grows with the servable set. If the servable set alone reaches the cap, all other history is dropped and a warning is logged.
+  * max\_pool\_size x stats\_pool\_max\_multiplier: The cap on retained **dead** proxy history - not on total memory. Proxies the pool can serve - those that passed the latest validation and those in the reserve - are never evicted, because the pool would re-seed a blank record for one on the next sync and launder its failure history, so the stats pool grows with the servable set. If the servable set alone reaches the cap, all other history is dropped and a warning is logged.
 * **\[proxy\_source\_\*\]**: Define your proxy sources here. Each source should have its own section (e.g., \[proxy\_source\_freeproxies\]).  
   * url: The URL to fetch the proxy list from.  
   * update\_interval\_minutes: How often to fetch from this source.  
@@ -368,9 +370,13 @@ curl http://127.0.0.1:6942/get-premium-proxy
 {"status": "live", "serving": true}
 ```
 
-`/ready` checks the database, scheduler, age of the last healthy validation
-quorum, age of the last successful feedback flush, and minimum usable pool. It
-returns `200` when ready or `503` otherwise:
+`/ready` checks the database, scheduler, age of the last recorded validation
+batch, age of the last successful feedback flush, and minimum usable pool. The
+usable pool is everything `/get-proxy` can hand out, never-validated and failed
+fallback included, so `active_proxies: 0` alone does not make the service
+unready. Whether the last batch reached its target quorum is reported as
+`validation_quorum_healthy` but not required. It returns `200` when ready or
+`503` otherwise:
 
 ```json
 {
@@ -384,7 +390,9 @@ returns `200` when ready or `503` otherwise:
     "usable_pool": true
   },
   "usable_proxies": 10,
-  "minimum_usable_proxies": 1
+  "minimum_usable_proxies": 1,
+  "active_proxies": 4,
+  "validation_quorum_healthy": true
 }
 ```
 

@@ -100,6 +100,59 @@ class LauncherSafetyTests(unittest.TestCase):
         self.assertEqual(capture.read_text(encoding="utf-8"), "http://localhost:7123/backup-stats")
         self.assertEqual(list((self.project / "tmp").iterdir()), [])
 
+    def test_stop_still_signals_the_service_when_the_backup_request_times_out(self):
+        """
+        A service that accepts the pre-stop backup request and never answers
+        must not keep stop from reaching the signal. The request has a finite
+        budget; running out of it carries on with the controlled shutdown.
+        """
+        (self.project / ".venv" / "bin" / "python").write_text(
+            "#!/bin/bash\n"
+            "if [ \"$1\" = \"-c\" ]; then\n"
+            "  case \"$2\" in *shutdown_deadline*) echo 3 ;; *) echo 7123 ;; esac\n"
+            "  exit 0\n"
+            "fi\n"
+            "while true; do sleep 0.1; done\n",
+            encoding="utf-8",
+        )
+        tools = self.project / "tools"
+        tools.mkdir()
+        capture = self.project / "curl-args.txt"
+        curl = tools / "curl"
+        # curl's own exit status for "operation timed out".
+        curl.write_text(
+            "#!/bin/bash\nprintf '%s\\n' \"$@\" > \"$CURL_CAPTURE\"\nexit 28\n",
+            encoding="utf-8",
+        )
+        curl.chmod(0o755)
+        self.env["PATH"] = f"{tools}:{self.env['PATH']}"
+        self.env["CURL_CAPTURE"] = str(capture)
+
+        started = self._run("start")
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        pid = int((self.project / ".smart_proxy.pid").read_text(encoding="utf-8"))
+        self.addCleanup(self._kill_if_ours, pid)
+
+        stopped = self._run("stop")
+
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertIn("timed out", stopped.stdout)
+        self.assertIn("SmartProxy stopped.", stopped.stdout)
+        self.assertFalse((self.project / ".smart_proxy.pid").exists())
+        args = capture.read_text(encoding="utf-8").split()
+        for option in ("--connect-timeout", "--max-time"):
+            self.assertIn(option, args)
+            self.assertGreater(float(args[args.index(option) + 1]), 0)
+
+    def _kill_if_ours(self, pid):
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as cmdline:
+                if str(self.project).encode() not in cmdline.read():
+                    return
+            os.kill(pid, signal.SIGKILL)
+        except (FileNotFoundError, ProcessLookupError):
+            pass
+
     @staticmethod
     def _terminate(process):
         if process.poll() is None:

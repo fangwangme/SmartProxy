@@ -340,7 +340,7 @@ class DatabaseManager:
         minutes after a restart - leaves the router unable to see a single
         proxy. These are the rows it would otherwise never reach.
 
-        Ordering is the tier-3 preference: never-validated rows first, because
+        Ordering is the fallback preference: never-validated rows first, because
         an unmeasured proxy is a better guess than one that has already failed
         a check, then the failures whose last check is oldest. Returned in that
         order and bounded by `limit` - the table holds far more dead rows than
@@ -359,6 +359,40 @@ class DatabaseManager:
         if rows is None:
             return None
         return [f"{row['protocol']}://{row['ip']}:{row['port']}" for row in rows]
+
+    def get_existing_proxies(self, proxy_urls: List[str]) -> Optional[Set[str]]:
+        """
+        Which of these proxy URLs are still rows in the table.
+
+        The router keeps feedback records in memory, and a record can outlive
+        its row - a rebuilt database, then a restored backup. One bounded
+        lookup against the (protocol, ip, port) unique index keeps such history
+        from being served.
+        """
+        keys = {}
+        for proxy_url in proxy_urls:
+            protocol, _, address = proxy_url.partition("://")
+            ip, _, port = address.rpartition(":")
+            if protocol and ip and port.isdigit():
+                keys[(protocol, ip, int(port))] = None
+        if not keys:
+            return set()
+        query = """
+            SELECT protocol, ip, port
+            FROM proxies
+            JOIN unnest(%(protocols)s::varchar[], %(ips)s::varchar[], %(ports)s::int[])
+                AS wanted(protocol, ip, port)
+            USING (protocol, ip, port);
+        """
+        protocols, ips, ports = (list(column) for column in zip(*keys))
+        rows = self._execute(
+            query,
+            {"protocols": protocols, "ips": ips, "ports": ports},
+            fetch="all",
+        )
+        if rows is None:
+            return None
+        return {f"{row['protocol']}://{row['ip']}:{row['port']}" for row in rows}
 
     def get_source_backoff_states(self) -> Optional[Dict[str, Dict]]:
         rows = self._execute(

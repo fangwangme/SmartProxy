@@ -2,7 +2,9 @@ import asyncio
 import copy
 import importlib
 import json
+import os
 import sys
+import threading
 import time
 import unittest
 import socket
@@ -121,24 +123,23 @@ class ValidationOutageContractTests(ProxyManagerTestBase):
         self.assertEqual(metadata["healthy_targets"], [True, True])
         self.assertEqual(([row["id"] for row in successes], failures), ([1], []))
 
-    def test_cycle_preserves_revalidation_and_advances_new_candidate(self):
-        old_proxy = "http://192.0.2.10:80"
-        self.manager.active_proxies = {old_proxy}
+    def test_an_all_failure_batch_is_recorded_like_any_other(self):
+        """
+        Every completed check is written, however the batch as a whole went.
+
+        Withholding the results of a batch in which nothing passed - on the
+        theory that the validation target must be down - left the timestamps
+        and attempt counts of the oldest rows untouched, so the oldest-first
+        queues handed the same rows to every following cycle: a batch of dead
+        proxies at the head of the queue kept every row behind it from ever
+        being checked, and a live proxy that died stayed active. Serving does
+        not depend on is_active any more, so an unreachable target costs
+        ranking signal - until the failed-proxy queue reaches those rows
+        again - never supply.
+        """
         batch = [
-            {
-                "id": 1,
-                "protocol": "http",
-                "ip": "192.0.2.11",
-                "port": 80,
-                "_validation_origin": "new",
-            },
-            {
-                "id": 2,
-                "protocol": "http",
-                "ip": "192.0.2.10",
-                "port": 80,
-                "_validation_origin": "active",
-            },
+            {"id": 1, "protocol": "http", "ip": "192.0.2.11", "port": 80},
+            {"id": 2, "protocol": "http", "ip": "192.0.2.10", "port": 80},
         ]
         self.manager.validation_supplement_threshold = 0
 
@@ -150,7 +151,7 @@ class ValidationOutageContractTests(ProxyManagerTestBase):
                 AsyncMock(
                     return_value=(
                         [],
-                        [],
+                        [1, 2],
                         {"quorum_healthy": False, "healthy_targets": [False]},
                     )
                 ),
@@ -160,11 +161,12 @@ class ValidationOutageContractTests(ProxyManagerTestBase):
             self.manager._run_validation_cycle()
 
         self.mock_db_instance.batch_update_proxy_results.assert_called_once_with(
-            [], [1], self.manager.validation_window_minutes
+            [], [1, 2], self.manager.validation_window_minutes
         )
-        sync.assert_not_called()
-        self.assertEqual(self.manager.active_proxies, {old_proxy})
-        self.assertIsNone(self.manager.last_validation_success_ts)
+        sync.assert_called_once()
+        self.assertIsNotNone(self.manager.last_validation_success_ts)
+        self.assertFalse(self.manager.last_validation_quorum_healthy)
+        self.assertFalse(self.manager.is_validating)
 
         self.mock_db_instance.batch_update_proxy_results.reset_mock()
         recovered = [
@@ -193,6 +195,101 @@ class ValidationOutageContractTests(ProxyManagerTestBase):
         )
         sync.assert_called_once()
         self.assertIsNotNone(self.manager.last_validation_success_ts)
+
+    def test_a_task_that_ends_without_a_verdict_is_not_recorded(self):
+        """
+        Only a finished check is a result. A task that raised - cancelled, or
+        broken past the per-proxy handlers - stays queued for a later cycle
+        instead of being written as a failure it never measured.
+        """
+        finished = {
+            "id": 1,
+            "success": True,
+            "latency": 10,
+            "anonymity": "elite",
+            "target_results": [{"target_index": 0, "success": True}],
+        }
+        for unfinished in (RuntimeError("injected"), asyncio.CancelledError()):
+            with self.subTest(unfinished=type(unfinished).__name__):
+                successes, failures, metadata = self._batch(
+                    [finished, unfinished],
+                    ["https://validation.invalid/echo"],
+                    1,
+                )
+
+                self.assertEqual([row["id"] for row in successes], [1])
+                self.assertEqual(failures, [])
+                self.assertTrue(metadata["quorum_healthy"])
+
+    def test_a_batch_in_which_no_check_finished_is_not_reported_as_validated(self):
+        """Nothing recorded is not a validation: readiness must not count it."""
+        batch = [{"id": 1, "protocol": "http", "ip": "192.0.2.12", "port": 80}]
+        self.manager.validation_supplement_threshold = 0
+
+        with (
+            patch.object(self.manager, "_collect_validation_batch", return_value=batch),
+            patch.object(
+                self.manager,
+                "_validate_proxy_async",
+                AsyncMock(side_effect=asyncio.CancelledError()),
+            ),
+            patch.object(self.manager, "_sync_and_select_top_proxies"),
+        ):
+            self.manager._run_validation_cycle()
+
+        self.mock_db_instance.batch_update_proxy_results.assert_not_called()
+        self.assertIsNone(self.manager.last_validation_success_ts)
+        self.assertFalse(self.manager.is_validating)
+
+    def test_a_reload_mid_batch_applies_from_the_next_batch(self):
+        """
+        The requests and the summary of their results share one config copy.
+
+        A reload that shortened the target list while tasks were still
+        reporting results against the old one raised IndexError in the
+        summary, and the whole batch went unrecorded.
+        """
+        two_targets = {
+            "validator": {
+                "validation_targets": "https://one.invalid/get,https://two.invalid/get",
+                "validation_success_threshold": "2",
+            }
+        }
+        manager = self.make_manager(two_targets, name="two-targets.ini")
+        one_target = {
+            section: dict(options) for section, options in self.config_dict.items()
+        }
+        one_target["validator"]["validation_targets"] = "https://one.invalid/get"
+        both_passed = [
+            {"target_index": 0, "success": True},
+            {"target_index": 1, "success": True},
+        ]
+
+        async def validate_while_reloading(session, proxy_id, proxy_url, semaphore, settings):
+            write_config_file(self.tmp_dir, one_target, name="two-targets.ini")
+            manager.reload_sources()
+            return {
+                "id": proxy_id,
+                "success": True,
+                "latency": 10,
+                "anonymity": "elite",
+                "target_results": both_passed,
+            }
+
+        proxies = [{"id": 1, "protocol": "http", "ip": "192.0.2.5", "port": 80}]
+        with patch.object(
+            manager, "_validate_proxy_async", side_effect=validate_while_reloading
+        ):
+            successes, failures, metadata = asyncio.run(
+                manager._validate_proxies_batch_async(proxies)
+            )
+
+        self.assertEqual(([row["id"] for row in successes], failures), ([1], []))
+        self.assertEqual(metadata["successes_by_target"], [1, 1])
+        self.assertEqual(manager.validation_targets, ["https://one.invalid/get"])
+        self.assertEqual(
+            manager._validation_settings().targets, ("https://one.invalid/get",)
+        )
 
     def test_failed_validation_write_is_not_reported_as_success(self):
         batch = [{"id": 1, "protocol": "http", "ip": "192.0.2.20", "port": 80}]
@@ -367,7 +464,7 @@ class TestPersistenceAndTransactions(ProxyManagerTestBase):
             json.dumps(
                 {
                     "scoring_version": 2,
-                    "timestamp": "2026-01-01T00:00:00+00:00",
+                    "timestamp": datetime.now().astimezone().isoformat(),
                     "source_stats": {
                         "source1": {
                             proxy: {
@@ -900,6 +997,80 @@ class TestApiAndLifecycleContracts(ProxyManagerTestBase):
         self.assertEqual(recovered_health.get_json()["status"], "healthy")
         self.assertEqual(recovered_ready.get_json(), ready)
 
+    def _serving_normally(self):
+        """A manager whose scheduler runs, database answers and flushes land."""
+        stop = threading.Event()
+        self.manager.scheduler_thread = threading.Thread(target=stop.wait, daemon=True)
+        self.manager.scheduler_thread.start()
+        self.addCleanup(stop.set)
+        self.mock_db_instance.ping.return_value = True
+        self.manager.last_flush_success_ts = time.time()
+
+    def test_readiness_waits_out_a_revalidation_window_without_failing(self):
+        """
+        Once every proxy has been checked, nothing is due again for a whole
+        validation window, and an empty batch records nothing - honestly, it
+        validated nothing. The freshness limit has to cover that wait; at 600s
+        it reported a healthy, idle service unready for most of every window.
+        """
+        self._serving_normally()
+        self.mock_db_instance.get_active_proxies.return_value = {"http://192.0.2.70:80"}
+        self.manager._sync_and_select_top_proxies()
+        recorded_at = time.time() - 20 * 60
+        self.manager.last_validation_success_ts = recorded_at
+        self.mock_db_instance.get_new_proxies_to_validate.return_value = []
+        self.mock_db_instance.get_active_proxies_to_revalidate.return_value = []
+        self.mock_db_instance.get_eligible_failed_proxies.return_value = []
+
+        self.manager._run_validation_cycle()
+
+        self.assertEqual(self.manager.last_validation_success_ts, recorded_at)
+        self.assertTrue(self.manager.readiness_status()["ready"])
+        self.manager.last_validation_success_ts = (
+            time.time() - self.manager.readiness_validation_max_age_s - 1
+        )
+        self.assertFalse(self.manager.readiness_status()["dependencies"]["validation"])
+
+    def test_readiness_counts_the_fallback_and_reports_quorum_as_a_diagnostic(self):
+        """
+        /get-proxy serves never-validated and failed rows when nothing is
+        active, so a pool of them is a usable pool. What the last checks said
+        is reported, not required; an empty table is still unready.
+        """
+        self._serving_normally()
+        self.manager.last_validation_success_ts = time.time()
+        self.manager.last_validation_quorum_healthy = False
+        self.mock_db_instance.get_active_proxies.return_value = set()
+        self.mock_db_instance.get_reserve_proxies.return_value = [
+            f"http://192.0.2.{index}:80" for index in range(71, 76)
+        ]
+        self.manager._sync_and_select_top_proxies()
+
+        status = self.manager.readiness_status()
+
+        self.assertTrue(status["ready"], status)
+        self.assertEqual(status["usable_proxies"], 5)
+        self.assertEqual(status["active_proxies"], 0)
+        self.assertFalse(status["validation_quorum_healthy"])
+
+        self.mock_db_instance.get_reserve_proxies.return_value = []
+        self.manager._sync_and_select_top_proxies()
+        status = self.manager.readiness_status()
+        self.assertFalse(status["dependencies"]["usable_pool"])
+        self.assertIsNone(self.manager.allocate_proxy("source1"))
+
+    def test_a_freshness_limit_shorter_than_the_revalidation_window_warns(self):
+        with patch("src.core.proxy_manager.logger.warning") as warn:
+            self.make_manager(
+                {"server": {"readiness_validation_max_age_seconds": "600"}},
+                name="short-readiness.ini",
+            )
+        self.assertIn("one revalidation window", str(warn.call_args_list))
+
+        with patch("src.core.proxy_manager.logger.warning") as warn:
+            self.make_manager({}, name="default-readiness.ini")
+        self.assertNotIn("one revalidation window", str(warn.call_args_list))
+
     def test_stats_validate_before_database_and_backend_failures_are_503(self):
         invalid_requests = [
             ("/api/stats/daily?source=source1&date=bad", "get_daily_stats"),
@@ -1057,6 +1228,72 @@ class TestApiAndLifecycleContracts(ProxyManagerTestBase):
 
         validate.assert_called_once_with()
 
+    def test_a_slow_source_does_not_hold_back_a_fast_one(self):
+        """
+        Each source's rows commit when its own fetch returns. Waiting for every
+        fetch first let one source spending its whole curl retry budget - about
+        three minutes by default - keep a cold install from serving anything
+        the fast sources had already found.
+        """
+        fast_row = ("http", "192.0.2.61", 80)
+        table = []
+        self.mock_db_instance.insert_proxies.side_effect = (
+            lambda rows: table.extend(tuple(row) for row in rows)
+        )
+        self.mock_db_instance.get_reserve_proxies.side_effect = lambda _limit: [
+            f"{protocol}://{ip}:{port}" for protocol, ip, port in table
+        ]
+        fast, slow = Future(), Future()
+        fast.set_result([fast_row, fast_row])
+        validate = self.enterContext(
+            patch.object(self.manager, "_run_validation_cycle")
+        )
+        worker = threading.Thread(
+            target=self.manager._handle_fetch_results,
+            args=([fast, slow], True),
+            daemon=True,
+        )
+        worker.start()
+        # However the test ends, the slow fetch completes and the worker exits
+        # while the patch still stands: a failed assertion must not leave it
+        # blocked on the future for good.
+        self.addCleanup(worker.join, 5)
+        self.addCleanup(lambda: slow.done() or slow.set_result([]))
+
+        deadline = time.monotonic() + 5
+        while not table and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        self.assertEqual(table, [fast_row])
+        self.assertEqual(
+            self.manager.allocate_proxy("source1")["proxy"], "http://192.0.2.61:80"
+        )
+        validate.assert_not_called()
+
+        slow.set_result([("http", "192.0.2.62", 80)])
+        worker.join(timeout=5)
+
+        self.assertEqual(len(table), 2)
+        validate.assert_called_once_with()
+
+    def test_one_source_failing_to_commit_keeps_the_others(self):
+        committed = []
+
+        def insert(rows):
+            if rows == [["http", "192.0.2.63", 80]]:
+                raise DatabaseWriteError("insert_proxies", RuntimeError("injected"))
+            committed.extend(rows)
+
+        self.mock_db_instance.insert_proxies.side_effect = insert
+        failing, broken, good = Future(), Future(), Future()
+        failing.set_result([("http", "192.0.2.63", 80)])
+        broken.set_exception(RuntimeError("fetch failed"))
+        good.set_result([("http", "192.0.2.64", 80)])
+
+        self.manager._handle_fetch_results([failing, broken, good])
+
+        self.assertEqual(committed, [["http", "192.0.2.64", 80]])
+
     def test_production_entry_uses_single_process_waitress(self):
         import src.main as main_module
 
@@ -1102,6 +1339,121 @@ class TestApiAndLifecycleContracts(ProxyManagerTestBase):
         with patch.object(logger_module.logger, "add") as add:
             importlib.reload(logger_module)
         add.assert_not_called()
+
+
+class RestoreAgeTests(ProxyManagerTestBase):
+    """
+    Startup restores a snapshot only while it is at most 12 hours old.
+
+    The age is the generation time recorded inside the snapshot, never the
+    file's mtime, and it is the snapshot's age alone: a fresh snapshot brings
+    back every record in it, however old the feedback behind that record.
+    """
+
+    NOW = 1_800_000_000.0
+    PROXY = "http://192.0.2.80:80"
+
+    def write_snapshot(self, timestamp, results=None):
+        results = results or [[self.NOW - 3 * 86400, True, 120]]
+        path = Path(self.tmp_dir) / "stats.json"
+        snapshot = {
+            "scoring_version": 2,
+            "source_stats": {
+                "source1": {
+                    self.PROXY: {
+                        "success_count": sum(1 for result in results if result[1]),
+                        "failure_count": sum(1 for result in results if not result[1]),
+                        "recent_results": results,
+                        "last_feedback_ts": results[-1][0],
+                    }
+                }
+            },
+        }
+        if timestamp is not None:
+            snapshot["timestamp"] = timestamp
+        path.write_text(json.dumps(snapshot), encoding="utf-8")
+        self.manager.stats_backup_path = path
+        return path
+
+    def restore_at(self, now):
+        with patch("src.core.proxy_manager.time.time", return_value=now):
+            return self.manager.restore_stats()
+
+    def generated(self, hours_ago):
+        return datetime.fromtimestamp(self.NOW - hours_ago * 3600).astimezone().isoformat()
+
+    def test_a_snapshot_up_to_twelve_hours_old_is_restored(self):
+        for hours_ago in (0, 11 + 59 / 60, 12):
+            with self.subTest(hours_ago=hours_ago):
+                self.manager.source_stats["source1"] = {}
+                self.write_snapshot(self.generated(hours_ago))
+
+                self.assertEqual(self.restore_at(self.NOW)["status"], "success")
+                self.assertIn(self.PROXY, self.manager.source_stats["source1"])
+
+    def test_an_older_snapshot_is_skipped_however_new_the_file_looks(self):
+        path = self.write_snapshot(self.generated(12 + 1 / 3600))
+        # A copy made just now: the mtime says new, the snapshot says old.
+        copied_at = time.time()
+        os.utime(path, (copied_at, copied_at))
+
+        result = self.restore_at(self.NOW)
+
+        self.assertEqual(result["status"], "skipped")
+        self.assertNotIn(self.PROXY, self.manager.source_stats["source1"])
+
+    def test_a_timestamp_without_an_offset_is_local_time(self):
+        """How backups were written before offsets were: naive local time."""
+        naive_local = datetime.fromtimestamp(self.NOW - 3600).isoformat()
+        self.write_snapshot(naive_local)
+
+        self.assertEqual(self.restore_at(self.NOW)["status"], "success")
+
+        self.manager.source_stats["source1"] = {}
+        self.write_snapshot(datetime.fromtimestamp(self.NOW - 13 * 3600).isoformat())
+        self.assertEqual(self.restore_at(self.NOW)["status"], "skipped")
+
+    def test_a_missing_or_unreadable_timestamp_skips_the_restore(self):
+        for timestamp in (None, "fixture", 1_799_999_000):
+            with self.subTest(timestamp=timestamp):
+                self.write_snapshot(timestamp)
+
+                result = self.restore_at(self.NOW)
+
+                self.assertEqual(result["status"], "skipped")
+                self.assertNotIn(self.PROXY, self.manager.source_stats["source1"])
+
+    def test_a_fresh_snapshot_keeps_its_older_feedback(self):
+        results = [
+            [self.NOW - 3 * 86400, True, 100],
+            [self.NOW - 2 * 86400, False, None],
+            [self.NOW - 13 * 3600, True, 90],
+        ]
+        self.write_snapshot(self.generated(1), results=results)
+
+        self.assertEqual(self.restore_at(self.NOW)["status"], "success")
+
+        stat = self.manager.source_stats["source1"][self.PROXY]
+        self.assertEqual([result[0] for result in stat["recent_results"]], [r[0] for r in results])
+        self.assertEqual((stat["success_count"], stat["failure_count"]), (2, 1))
+
+    def test_a_skipped_restore_still_serves_from_the_database(self):
+        self.write_snapshot(self.generated(24))
+        self.assertEqual(self.restore_at(self.NOW)["status"], "skipped")
+
+        self.mock_db_instance.get_active_proxies.return_value = set()
+        self.mock_db_instance.get_reserve_proxies.return_value = [self.PROXY]
+        self.manager._sync_and_select_top_proxies()
+
+        self.assertEqual(self.manager.allocate_proxy("source1")["proxy"], self.PROXY)
+
+    def test_the_backup_records_its_generation_time_with_an_offset(self):
+        self.manager.stats_backup_path = Path(self.tmp_dir) / "written.json"
+        self.manager.backup_stats()
+
+        written = json.loads(self.manager.stats_backup_path.read_text(encoding="utf-8"))
+        self.assertIsNotNone(datetime.fromisoformat(written["timestamp"]).utcoffset())
+        self.assertEqual(self.manager.restore_stats()["status"], "success")
 
 
 if __name__ == "__main__":

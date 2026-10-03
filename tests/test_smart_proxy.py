@@ -116,6 +116,9 @@ class ProxyManagerTestBase(unittest.TestCase):
         # set their own rows. It must be a real value rather than a MagicMock
         # so the sync stores a list, not a mock, as the reserve.
         self.mock_db_instance.get_reserve_proxies.return_value = []
+        # No retained record outlives the rows the test reported unless the
+        # test says so; like the reserve, a real value rather than a mock.
+        self.mock_db_instance.get_existing_proxies.return_value = set()
 
     def make_manager(self, overrides: dict, name: str = "override.ini") -> ProxyManager:
         """Build a second manager from a real ini file with merged overrides."""
@@ -1025,7 +1028,7 @@ class TestIssue13PoolQuality(ProxyManagerTestBase):
         backup_path.write_text(
             json.dumps(
                 {
-                    "timestamp": "2026-08-30T00:00:00",
+                    "timestamp": datetime.now().astimezone().isoformat(),
                     "source_stats": {
                         "source1": {"http://poisoned:80": poisoned}
                     },
@@ -1059,7 +1062,7 @@ class TestIssue13PoolQuality(ProxyManagerTestBase):
         backup_path.write_text(
             json.dumps(
                 {
-                    "timestamp": "2026-08-30T00:00:00",
+                    "timestamp": datetime.now().astimezone().isoformat(),
                     "source_stats": {
                         "source1": {
                             "http://valid:80": self.manager._get_new_proxy_stat()
@@ -2503,7 +2506,7 @@ class TestIssue23PersistenceAndRuntimeModes(ProxyManagerTestBase):
             json.dumps(
                 {
                     "scoring_version": 1,
-                    "timestamp": "fixture",
+                    "timestamp": datetime.now().astimezone().isoformat(),
                     "source_stats": {
                         "source1": {
                             "http://replay:80": {
@@ -2544,7 +2547,7 @@ class TestIssue23PersistenceAndRuntimeModes(ProxyManagerTestBase):
             json.dumps(
                 {
                     "scoring_version": SCORING_VERSION,
-                    "timestamp": "fixture",
+                    "timestamp": datetime.now().astimezone().isoformat(),
                     "source_stats": {
                         "source1": {
                             "http://matching:80": {

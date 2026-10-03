@@ -2,6 +2,7 @@
 import os
 import configparser
 import copy
+import heapq
 import ipaddress
 import json
 import math
@@ -134,6 +135,22 @@ class ValidationBatchResult(NamedTuple):
     metadata: Dict[str, object]
 
 
+class ValidationSettings(NamedTuple):
+    """
+    One batch's validation config, read once when the batch starts.
+
+    The requests and the summary of their results use this copy, never the
+    live attributes: a reload that lands mid-batch otherwise hands the summary
+    a target list the requests were not made against.
+    """
+
+    targets: Tuple[str, ...]
+    success_threshold: int
+    target_min_samples: int
+    timeout_s: float
+    workers: int
+
+
 class ProxyManager:
     """Manages the proxy lifecycle, state, and business logic."""
 
@@ -156,9 +173,10 @@ class ProxyManager:
         self.premium_proxies: List[str] = []  # High-quality proxies for Playwright
         self.premium_sources: Dict[str, str] = {}
         self.outage_states: Dict[str, Dict] = {}
-        # Non-active rows the router may still serve, in database order. This
-        # is what tier 3 is drawn from, and it is the whole pool on a cold
-        # start: get_active_proxies() cannot see a never-validated proxy.
+        # Non-active rows the router may still serve: the first page in
+        # database order, then the rows with the best feedback records (see
+        # _refresh_reserve_proxies()). It is the whole pool on a cold start:
+        # get_active_proxies() cannot see a never-validated proxy.
         self.reserve_proxies: List[str] = []
         # source -> the N proxies this source serves; see
         # _rebuild_candidate_pool(). A handout is a uniform pick from it.
@@ -172,6 +190,8 @@ class ProxyManager:
         # it, so it is the one number that says whether they happen here.
         self.unmatched_feedback_total = 0
         self.validation_target_failures = defaultdict(int)
+        # When a validation batch's results were last committed, whatever
+        # they said. An empty batch commits nothing and does not move it.
         self.last_validation_success_ts: Optional[float] = None
         self.last_flush_success_ts: Optional[float] = None
         self.last_validation_quorum_healthy = False
@@ -264,8 +284,11 @@ class ProxyManager:
         self.readiness_min_usable_pool = self._cfg_int(
             "server", "readiness_min_usable_pool", 1, low=0
         )
+        # Must cover one revalidation window: once every proxy has been
+        # checked, nothing is due again until validation_window_minutes have
+        # passed, and an empty batch records nothing.
         self.readiness_validation_max_age_s = self._cfg_float(
-            "server", "readiness_validation_max_age_seconds", 600.0, low=1.0
+            "server", "readiness_validation_max_age_seconds", 2400.0, low=1.0
         )
         self.readiness_flush_max_age_s = self._cfg_float(
             "server", "readiness_flush_max_age_seconds", 180.0, low=1.0
@@ -393,6 +416,18 @@ class ProxyManager:
         self.source_refresh_interval_s = self._cfg_float(
             "scheduler", "source_refresh_interval_seconds", 300.0, low=0.001
         )
+        idle_revalidation_gap_s = (
+            self.validation_window_minutes * 60 + self.validation_interval_s
+        )
+        if self.readiness_validation_max_age_s < idle_revalidation_gap_s:
+            logger.warning(
+                "[server] readiness_validation_max_age_seconds ({:.0f}s) is shorter "
+                "than one revalidation window plus a validation interval ({:.0f}s): "
+                "a fully validated pool has nothing due for that long, so /ready "
+                "will report not_ready while the service is healthy and idle.",
+                self.readiness_validation_max_age_s,
+                idle_revalidation_gap_s,
+            )
         sources_str = self.config.get(
             "sources", "predefined_sources", fallback="default"
         )
@@ -538,6 +573,12 @@ class ProxyManager:
         )
         self.stats_backup_path = self._isolated_backup_path(
             normal_stats_backup_path, self.restore_mode
+        )
+        # Startup restores a snapshot only while it is this fresh, judged by
+        # the generation time recorded inside it. It bounds the restore and
+        # nothing else: running scores and feedback carry no age limit.
+        self.stats_restore_max_age_s = 3600.0 * self._cfg_float(
+            "backup", "stats_restore_max_age_hours", 12.0, low=0.0
         )
 
         # Two-speed online reliability. Latency never enters this score.
@@ -1149,50 +1190,48 @@ class ProxyManager:
         self, futures: List, validate_after_insert: bool = False
     ):
         """
-        DEADLOCK FIX: New method to consolidate results from all fetchers and insert in a single batch.
+        Commit each source's proxies as soon as its own fetch completes.
+
+        One source at a time, on this one thread: the fetchers only return
+        rows, so the database sees one insert at a time rather than one per
+        fetcher thread. A fast source does not wait for a slow one - a source
+        that burns its whole curl retry budget holds back nothing but itself -
+        and a failed source or a failed insert costs only its own rows.
+        Duplicates across sources are the insert's ON CONFLICT DO NOTHING.
         """
-        all_new_proxies = []
+        committed = 0
         for future in as_completed(futures):
             try:
                 proxies = future.result()
-                if proxies:
-                    all_new_proxies.extend(proxies)
             except Exception as e:
                 logger.error(
                     "A fetcher job raised {}.",
                     type(e).__name__,
                 )
-
-        if not all_new_proxies:
-            logger.info("No new proxies were fetched in this cycle.")
-            if validate_after_insert:
-                self._run_validation_cycle()
-            return
-
-        unique_proxies_set = {tuple(p) for p in all_new_proxies}
-        unique_proxies_list = [list(p) for p in unique_proxies_set]
-
-        logger.info(
-            f"Consolidated {len(unique_proxies_list)} unique proxies from all sources for insertion."
-        )
-        try:
-            self.db.insert_proxies(unique_proxies_list)
+                continue
+            if not proxies:
+                continue
+            unique_proxies = [list(row) for row in {tuple(row) for row in proxies}]
+            try:
+                self.db.insert_proxies(unique_proxies)
+            except DatabaseWriteError:
+                logger.exception(
+                    "{} fetched proxies were not inserted.", len(unique_proxies)
+                )
+                continue
+            committed += len(unique_proxies)
             # "Serves continuously from the first fetch onward" is the
             # contract, and the first fetch of a cold install is followed by a
             # validation cycle that may take minutes or fail outright. The
             # rows are committed and therefore servable now.
             self._publish_reserve_pool()
-        except DatabaseWriteError:
-            # The scheduler has already advanced this cycle's validation
-            # timestamp. Validate rows that were committed by earlier cycles
-            # instead of making a transient insert failure delay recovery for
-            # a full validation interval.
-            logger.exception(
-                "Fetched proxies were not inserted; validating existing rows."
-            )
-            if validate_after_insert:
-                self._run_validation_cycle()
-            return
+
+        if not committed:
+            logger.info("No new proxies were committed in this cycle.")
+        # The scheduler has already advanced this cycle's validation timestamp,
+        # so this runs whatever was committed - including rows from earlier
+        # cycles when nothing new arrived or an insert failed - rather than
+        # making a bad fetch delay validation for a full interval.
         if validate_after_insert:
             self._run_validation_cycle()
 
@@ -1202,6 +1241,7 @@ class ProxyManager:
         proxy_id: int,
         proxy_url: str,
         semaphore: asyncio.Semaphore,
+        settings: ValidationSettings,
     ) -> Dict:
         """
         Async version of proxy validation using aiohttp for better performance.
@@ -1209,12 +1249,14 @@ class ProxyManager:
         """
         protocol = proxy_url.split("://", 1)[0].lower() if "://" in proxy_url else "http"
         if protocol.startswith("socks"):
-            return await self._validate_socks_proxy_async(proxy_id, proxy_url, semaphore)
+            return await self._validate_socks_proxy_async(
+                proxy_id, proxy_url, semaphore, settings
+            )
 
         async with semaphore:
             try:
                 return await self._validate_http_proxy_with_session(
-                    session, proxy_id, proxy_url
+                    session, proxy_id, proxy_url, settings
                 )
             except aiohttp.ClientProxyConnectionError as e:
                 # Proxy connection refused/unreachable
@@ -1229,7 +1271,7 @@ class ProxyManager:
                     logger.debug(
                         "Proxy ID {} timed out after {}s",
                         proxy_id,
-                        self.validation_timeout_s,
+                        settings.timeout_s,
                     )
                 return {"id": proxy_id, "success": False}
             except Exception as e:
@@ -1239,7 +1281,11 @@ class ProxyManager:
                 return {"id": proxy_id, "success": False}
 
     async def _validate_http_proxy_with_session(
-        self, session: aiohttp.ClientSession, proxy_id: int, proxy_url: str
+        self,
+        session: aiohttp.ClientSession,
+        proxy_id: int,
+        proxy_url: str,
+        settings: ValidationSettings,
     ) -> Dict:
         return await self._validate_against_targets(
             proxy_id,
@@ -1247,12 +1293,17 @@ class ProxyManager:
             lambda target: session.get(
                 target,
                 proxy=proxy_url,
-                timeout=aiohttp.ClientTimeout(total=self.validation_timeout_s),
+                timeout=aiohttp.ClientTimeout(total=settings.timeout_s),
             ),
+            settings,
         )
 
     async def _validate_socks_proxy_async(
-        self, proxy_id: int, proxy_url: str, semaphore: asyncio.Semaphore
+        self,
+        proxy_id: int,
+        proxy_url: str,
+        semaphore: asyncio.Semaphore,
+        settings: ValidationSettings,
     ) -> Dict:
         async with semaphore:
             if ProxyConnector is None:
@@ -1270,10 +1321,9 @@ class ProxyManager:
                         proxy_url,
                         lambda target: socks_session.get(
                             target,
-                            timeout=aiohttp.ClientTimeout(
-                                total=self.validation_timeout_s
-                            ),
+                            timeout=aiohttp.ClientTimeout(total=settings.timeout_s),
                         ),
+                        settings,
                     )
             except aiohttp.ClientProxyConnectionError as e:
                 if self.debug_mode:
@@ -1287,7 +1337,7 @@ class ProxyManager:
                     logger.debug(
                         "Proxy ID {} timed out after {}s",
                         proxy_id,
-                        self.validation_timeout_s,
+                        settings.timeout_s,
                     )
                 return {"id": proxy_id, "success": False}
             except Exception as e:
@@ -1296,13 +1346,19 @@ class ProxyManager:
                     logger.debug("Proxy ID {} failed: {}", proxy_id, type(e).__name__)
                 return {"id": proxy_id, "success": False}
 
-    async def _validate_against_targets(self, proxy_id: int, proxy_url: str, request_factory) -> Dict:
+    async def _validate_against_targets(
+        self,
+        proxy_id: int,
+        proxy_url: str,
+        request_factory,
+        settings: ValidationSettings,
+    ) -> Dict:
         successes = 0
         latencies = []
         anonymity_levels = []
         target_results = []
 
-        for target_index, target in enumerate(self.validation_targets):
+        for target_index, target in enumerate(settings.targets):
             start_time = time.time()
             try:
                 async with request_factory(target) as response:
@@ -1333,7 +1389,7 @@ class ProxyManager:
                         failure_kind,
                     )
 
-        if successes < self.validation_success_threshold:
+        if successes < settings.success_threshold:
             return {
                 "id": proxy_id,
                 "success": False,
@@ -1396,13 +1452,31 @@ class ProxyManager:
             return "elite"
         return "unknown"
 
+    def _validation_settings(self) -> ValidationSettings:
+        # Read under the lock: reload_sources() applies a new file under it,
+        # so the copy is all old config or all new, never half of each.
+        with self.lock:
+            return ValidationSettings(
+                targets=tuple(self.validation_targets),
+                success_threshold=self.validation_success_threshold,
+                target_min_samples=self.validation_target_min_samples,
+                timeout_s=self.validation_timeout_s,
+                workers=self.validation_workers,
+            )
+
     async def _validate_proxies_batch_async(
         self, proxies_to_validate: List[Dict]
     ) -> ValidationBatchResult:
         """
         Validate a batch of proxies concurrently using aiohttp.
-        Returns (success_proxies, failure_proxy_ids).
+
+        The batch runs on one ValidationSettings copy taken here; a reload
+        applies from the next batch. A task that raised - cancelled, or broken
+        in a way the per-proxy handlers did not anticipate - produced no
+        verdict, so it is in neither returned list: recording it as a failure
+        would claim a check that never finished.
         """
+        settings = self._validation_settings()
         # No session-level timeout - each request has its own timeout
         # limit controls max concurrent connections at session level,
         # but we also need a semaphore to control task execution start time.
@@ -1411,8 +1485,8 @@ class ProxyManager:
             limit=0, # Unlimited at connector level, controlled by semaphore
             force_close=True,
         )
-        
-        semaphore = asyncio.Semaphore(self.validation_workers)
+
+        semaphore = asyncio.Semaphore(settings.workers)
 
         async with aiohttp.ClientSession(connector=connector) as session:
             tasks = [
@@ -1420,44 +1494,43 @@ class ProxyManager:
                     session,
                     p["id"],
                     f"{p['protocol']}://{p['ip']}:{p['port']}",
-                    semaphore
+                    semaphore,
+                    settings,
                 )
                 for p in proxies_to_validate
             ]
             results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        normalized_results = []
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                normalized_results.append(
-                    {"id": proxies_to_validate[i]["id"], "success": False, "target_results": []}
-                )
-            else:
-                normalized_results.append(result)
 
-        successes_by_target = [0] * len(self.validation_targets)
-        for result in normalized_results:
+        completed = [
+            result for result in results if not isinstance(result, BaseException)
+        ]
+        if len(completed) < len(results):
+            logger.warning(
+                "{} validation task(s) ended without a verdict; they stay queued "
+                "for a later cycle.",
+                len(results) - len(completed),
+            )
+
+        successes_by_target = [0] * len(settings.targets)
+        for result in completed:
             for target_result in result.get("target_results", []):
                 if target_result.get("success"):
                     successes_by_target[target_result["target_index"]] += 1
         healthy_targets = [
-            count >= self.validation_target_min_samples
-            for count in successes_by_target
+            count >= settings.target_min_samples for count in successes_by_target
         ]
         quorum_healthy = (
             sum(1 for healthy in healthy_targets if healthy)
-            >= self.validation_success_threshold
+            >= settings.success_threshold
         )
         metadata = {
             "quorum_healthy": quorum_healthy,
             "healthy_targets": healthy_targets,
             "successes_by_target": successes_by_target,
         }
-        success_proxies = [
-            result for result in normalized_results if result.get("success")
-        ]
+        success_proxies = [result for result in completed if result.get("success")]
         failure_proxy_ids = [
-            result["id"] for result in normalized_results if not result.get("success")
+            result["id"] for result in completed if not result.get("success")
         ]
         return ValidationBatchResult(success_proxies, failure_proxy_ids, metadata)
 
@@ -1511,16 +1584,11 @@ class ProxyManager:
 
         batch: List[Dict] = []
         seen_ids = set()
-        candidates = [
-            (proxy, "new") for proxy in new_proxies
-        ] + [
-            (proxy, "active") for proxy in revalidate_proxies
-        ]
-        for proxy, origin in candidates:
+        for proxy in new_proxies + revalidate_proxies:
             if proxy["id"] in seen_ids:
                 continue
             seen_ids.add(proxy["id"])
-            batch.append(dict(proxy, _validation_origin=origin))
+            batch.append(dict(proxy))
         return batch
 
     def _run_validation_cycle(self):
@@ -1552,9 +1620,7 @@ class ProxyManager:
                 )
                 for p in eligible_failed:
                     if p["id"] not in existing_ids:
-                        proxies_to_validate.append(
-                            dict(p, _validation_origin="failed")
-                        )
+                        proxies_to_validate.append(dict(p))
 
             if not proxies_to_validate:
                 # The in-memory pool must still be refreshed: an empty batch is
@@ -1592,52 +1658,33 @@ class ProxyManager:
             )
 
             with self.lock:
-                # Only the quorum verdict is retained: readiness consumes it.
-                # Per-target health is already observable as the failure log
-                # below and smartproxy_validation_target_failures_total.
+                # A diagnostic, reported by /ready and the log below. Nothing
+                # withholds a result because of it.
                 self.last_validation_quorum_healthy = bool(
                     validation_metadata["quorum_healthy"]
                 )
-
             if not validation_metadata["quorum_healthy"]:
-                never_validated_ids = sorted(
-                    {
-                        int(proxy["id"])
-                        for proxy in proxies_to_validate
-                        if proxy.get("_validation_origin") == "new"
-                    }
-                )
-                if never_validated_ids:
-                    # Preserve last-known-good liveness, but advance the
-                    # oldest-first never-validated cursor. Otherwise one bad
-                    # batch can permanently hide every proxy fetched later.
-                    # These rows remain eligible for the ordinary failed-proxy
-                    # retry window once target health recovers.
-                    self.db.batch_update_proxy_results(
-                        [],
-                        never_validated_ids,
-                        self.validation_window_minutes,
-                    )
-                logger.error(
-                    "Validation target quorum unavailable; preserving last-known-good "
-                    "liveness; deferred candidates remain retryable. target_health={}",
+                logger.warning(
+                    "No validation target reached its success quorum this batch "
+                    "(target_health={}). The results are recorded as measured: "
+                    "the pool keeps serving on feedback, and later checks "
+                    "re-activate whatever recovers.",
                     validation_metadata["healthy_targets"],
                 )
-                # Liveness stays last-known-good - that is why this returns
-                # without a pool sync - but tier 3 must still be published, or
-                # a validation target that stays down leaves the router blind
-                # to every row in the table, which on a cold pool is all of
-                # them and is the one case it has nothing else to serve.
-                self._publish_reserve_pool()
-                return
 
-            self.db.batch_update_proxy_results(
-                success_proxies,
-                failure_proxy_ids,
-                self.validation_window_minutes,
-            )
-            with self.lock:
-                self.last_validation_success_ts = time.time()
+            # Every completed check is recorded, pass or fail. Its timestamp
+            # and attempt count are what move a proxy to the back of its
+            # queue; withholding them whenever the whole batch failed handed
+            # the same oldest rows to every following cycle. A batch in which
+            # no check finished recorded nothing, so it does not count as one.
+            if success_proxies or failure_proxy_ids:
+                self.db.batch_update_proxy_results(
+                    success_proxies,
+                    failure_proxy_ids,
+                    self.validation_window_minutes,
+                )
+                with self.lock:
+                    self.last_validation_success_ts = time.time()
 
             self._sync_and_select_top_proxies()
         finally:
@@ -1645,38 +1692,88 @@ class ProxyManager:
                 self.is_validating = False
             logger.info("Validation cycle lock released.")
 
-    def _refresh_reserve_proxies(self) -> bool:
+    def _refresh_reserve_proxies(
+        self, active_proxies: Optional[Set[str]] = None
+    ) -> bool:
         """
-        Reload the bounded reserve that tier 3 serves from. Do not hold the lock.
+        Reload the non-active rows the router can see. Do not hold the lock.
+
+        Two bounded parts. The first page of the table in fallback order -
+        never-validated rows first, then the stalest failed checks - is what
+        carries a cold start. After it come the rows whose feedback record
+        ranks best, however recently they failed a check: a failed check
+        stamps the row newest, which pushes it off that page, and it must not
+        lose its ranking - and all of its traffic - for that alone. Each
+        source contributes at most candidate_pool_size of them, because no
+        record below that many better ones can win a slot anyway, and every
+        one is checked against the table so retained history that is no
+        longer a row is never served.
 
         Deliberately not on the pool-refresh timer: a rebuild is lock-only so
         it can run often, and a database blip must never be able to empty
-        tier 3 - the one tier that carries a cold start. A failed query keeps
-        the previous list instead of clearing it.
+        the fallback that carries a cold start. A failed query keeps the
+        previous list instead of clearing it.
 
         It must equally not depend on a validation cycle *succeeding*. Fetched
         rows are servable the moment they are committed, whatever the
         validator later makes of them, so every path that learns the table has
         grown publishes the reserve.
         """
-        reserve = self.db.get_reserve_proxies(self.candidate_pool_size)
-        if reserve is None:
+        page = self.db.get_reserve_proxies(self.candidate_pool_size)
+        if page is None:
             logger.warning(
                 "Reserve proxy query failed. Keeping the previous reserve list."
             )
             return False
         with self.lock:
-            self.reserve_proxies = reserve
+            covered = set(
+                self.active_proxies if active_proxies is None else active_proxies
+            )
+            covered.update(page)
+            wanted = self._best_records_outside(covered)
+        retained = []
+        if wanted:
+            existing = self.db.get_existing_proxies(wanted)
+            if existing is None:
+                logger.warning(
+                    "Retained proxy lookup failed. Keeping the previous reserve list."
+                )
+                return False
+            retained = [proxy_url for proxy_url in wanted if proxy_url in existing]
+        with self.lock:
+            self.reserve_proxies = page + retained
         return True
+
+    def _best_records_outside(self, covered: Set[str]) -> List[str]:
+        """
+        Per source, the best-scored feedback records `covered` leaves out.
+
+        Caller holds the lock. Only records carrying feedback count: a stat
+        nobody has reported on holds no evidence, and its row comes back
+        through the live set or the reserve page like any other.
+        """
+        wanted: Dict[str, None] = {}
+        for stats_pool in self.source_stats.values():
+            best = heapq.nlargest(
+                self.candidate_pool_size,
+                (
+                    proxy_url
+                    for proxy_url, stat in stats_pool.items()
+                    if proxy_url not in covered
+                    and stat.get("last_feedback_ts") is not None
+                ),
+                key=lambda proxy_url: float(stats_pool[proxy_url].get("score", 0.0)),
+            )
+            wanted.update(dict.fromkeys(best))
+        return list(wanted)
 
     def _publish_reserve_pool(self):
         """
         Make committed rows servable now, without touching liveness.
 
-        Deliberately narrower than a pool sync: it republishes tier 3 and
-        rebuilds, and never reads or rewrites `active_proxies`. That is what
-        lets it run on paths where a validation batch has just failed, where
-        preserving last-known-good liveness is the standing contract.
+        Deliberately narrower than a pool sync: it republishes the reserve
+        and rebuilds, and never reads or rewrites `active_proxies`, so a fetch
+        can run it the moment its rows commit.
         """
         if self._refresh_reserve_proxies():
             self.refresh_candidate_pools()
@@ -1685,10 +1782,10 @@ class ProxyManager:
         """
         Publish the database's view of the pool and refill every source.
 
-        Two queries, not one: the live set, and a bounded reserve of everything
-        else. The reserve is what tier 3 serves from, and it is the entire pool
-        during a cold start - `is_active = true` cannot describe a proxy nobody
-        has validated yet, which on a fresh install is all of them.
+        Two reads, not one: the live set, and a bounded reserve of everything
+        else. The reserve is the fallback, and it is the entire pool during a
+        cold start - `is_active = true` cannot describe a proxy nobody has
+        validated yet, which on a fresh install is all of them.
         """
         logger.info("Syncing and selecting proxies for all sources...")
         newly_active_proxies = self.db.get_active_proxies()
@@ -1697,7 +1794,7 @@ class ProxyManager:
                 "Skipping proxy sync because active proxy query failed. Keeping previous in-memory pools."
             )
             return
-        self._refresh_reserve_proxies()
+        self._refresh_reserve_proxies(newly_active_proxies)
 
         with self.lock:
             self.active_proxies = newly_active_proxies
@@ -1862,13 +1959,13 @@ class ProxyManager:
         waiting two syncs - which is the failure this pool exists to prevent.
 
         So servable proxies do not participate in the cap. Since #27 that is
-        the live set *and* the reserve page: a reserve proxy is handed out like
-        any other pool member, and its record is as much reputation as a live
+        the live set *and* the reserve: a reserve proxy is handed out like any
+        other pool member, and its record is as much reputation as a live
         one's. The cap applies to the rest, oldest feedback first - history
         nothing is serving, which re-enters as a newcomer at the prior if the
         database reports it again. It therefore bounds retained history, not
-        total memory: the servable half tracks the live set plus one reserve
-        page, and the pool logs a warning when that alone exceeds the
+        total memory: the servable half tracks the live set plus the bounded
+        reserve, and the pool logs a warning when that alone exceeds the
         configured size so the operator can raise it or lower max_pool_size.
         """
         max_stats_size = self.max_pool_size * self.stats_pool_max_multiplier
@@ -2146,7 +2243,8 @@ class ProxyManager:
                         self._apply_stat_snapshot(tentative, committed)
             stats_snapshot = {
                 "scoring_version": SCORING_VERSION,
-                "timestamp": datetime.now().isoformat(),
+                # With its UTC offset, so restore_stats() can age it exactly.
+                "timestamp": datetime.now().astimezone().isoformat(),
                 "source_stats": source_stats_snapshot,
             }
         self.last_manager_lock_hold_s = time.monotonic() - lock_started
@@ -2236,6 +2334,31 @@ class ProxyManager:
 
             if not isinstance(snapshot, dict):
                 raise ValueError("Backup root must be a JSON object")
+
+            # The age is read from the generation time the snapshot records,
+            # never from the file's mtime: copying or restoring a file from
+            # elsewhere must not make an old snapshot look new. Only the
+            # snapshot as a whole is aged - a fresh one restores every record
+            # in it, however old the feedback behind that record.
+            backup_time = snapshot.get("timestamp")
+            backup_age_s = self._snapshot_age_seconds(backup_time)
+            if backup_age_s is None or backup_age_s > self.stats_restore_max_age_s:
+                reason = "no usable timestamp" if backup_age_s is None else "too old"
+                logger.warning(
+                    "Stats backup at {} not restored ({}: timestamp {!r}, limit "
+                    "{:.1f}h) - starting with fresh scores.",
+                    backup_path,
+                    reason,
+                    backup_time,
+                    self.stats_restore_max_age_s / 3600,
+                )
+                return {
+                    "status": "skipped",
+                    "message": f"Backup not restored: {reason}",
+                    "timestamp": backup_time,
+                    "path": str(backup_path),
+                }
+
             source_stats = snapshot.get("source_stats", {})
             if not isinstance(source_stats, dict):
                 raise ValueError("Backup source_stats must be a JSON object")
@@ -2250,11 +2373,12 @@ class ProxyManager:
                 )
 
             # Log backup metadata
-            backup_time = snapshot.get("timestamp", "unknown")
             total_sources_in_file = len(source_stats)
             logger.info(
-                "Backup file parsed successfully. Timestamp: {}, Sources in file: {}",
+                "Backup file parsed successfully. Timestamp: {} ({:.1f}h old), "
+                "Sources in file: {}",
                 backup_time,
+                backup_age_s / 3600,
                 total_sources_in_file,
             )
 
@@ -2334,6 +2458,22 @@ class ProxyManager:
             logger.error(f"Failed to restore stats: {e}")
             return {"status": "error", "message": str(e)}
 
+    @staticmethod
+    def _snapshot_age_seconds(timestamp) -> Optional[float]:
+        """
+        Seconds since a snapshot's recorded generation time, or None.
+
+        A timestamp without a UTC offset is local time: that is how earlier
+        backups wrote it, and a naive datetime's timestamp() reads it so.
+        """
+        if not isinstance(timestamp, str):
+            return None
+        try:
+            generated_ts = datetime.fromisoformat(timestamp).timestamp()
+        except (ValueError, OverflowError, OSError):
+            return None
+        return time.time() - generated_ts
+
     def _get_source_or_default(self, source: str) -> str:
         with self.lock:
             is_defined = source in self.predefined_sources
@@ -2354,9 +2494,12 @@ class ProxyManager:
                 and self.scheduler_thread.is_alive()
                 and not self.stop_scheduler_event.is_set()
             )
+            # Whether validation results are still being recorded, not what
+            # they said: a batch in which nothing passed is recorded like any
+            # other, and serving never depended on it. The quorum verdict is
+            # reported alongside as a diagnostic only.
             validation_ready = bool(
-                self.last_validation_quorum_healthy
-                and self.last_validation_success_ts is not None
+                self.last_validation_success_ts is not None
                 and now_ts - self.last_validation_success_ts
                 <= self.readiness_validation_max_age_s
             )
@@ -2364,8 +2507,11 @@ class ProxyManager:
                 self.last_flush_success_ts is not None
                 and now_ts - self.last_flush_success_ts <= self.readiness_flush_max_age_s
             )
-            usable_pool = len(self.active_proxies)
+            # What /get-proxy can hand out: the live set and the reserve alike.
+            usable_pool = len(self.active_proxies.union(self.reserve_proxies))
+            active_count = len(self.active_proxies)
             pool_ready = usable_pool >= self.readiness_min_usable_pool
+            quorum_healthy = self.last_validation_quorum_healthy
         dependencies = {
             "database": database_ready,
             "scheduler": scheduler_ready,
@@ -2379,6 +2525,8 @@ class ProxyManager:
             "dependencies": dependencies,
             "usable_proxies": usable_pool,
             "minimum_usable_proxies": self.readiness_min_usable_pool,
+            "active_proxies": active_count,
+            "validation_quorum_healthy": quorum_healthy,
         }
 
     def get_proxy(self, source: str) -> Optional[str]:
@@ -2435,24 +2583,6 @@ class ProxyManager:
             return self._rebuild_candidate_pool(source)
         return pool
 
-    @staticmethod
-    def _has_succeeded(stat: Optional[Dict]) -> bool:
-        """Whether this proxy has any successful client feedback on record."""
-        return stat is not None and bool(
-            nonnegative_int(stat.get("success_count", 0))
-        )
-
-    @staticmethod
-    def _has_been_measured(stat: Optional[Dict]) -> bool:
-        """Whether any feedback has ever been recorded against this proxy."""
-        if stat is None:
-            return False
-        return bool(
-            stat.get("recent_results")
-            or nonnegative_int(stat.get("success_count", 0))
-            or nonnegative_int(stat.get("failure_count", 0))
-        )
-
     def refresh_candidate_pools(self):
         """Rebuild every source's pool; called by the scheduler, off-path."""
         started = time.monotonic()
@@ -2465,21 +2595,36 @@ class ProxyManager:
         self, source: str, now_ts: Optional[float] = None
     ) -> List[str]:
         """
-        Refill this source's candidate pool, best first. Caller holds the lock.
+        Refill this source's candidate pool. Caller holds the lock.
 
-        Three tiers, filled in priority order:
+        The candidates are every proxy the router can see: the live set and
+        the reserve (4.1). Two kinds of slot:
 
-            tier 1  proxies with successful feedback on record for this source
-            tier 2  proxies that passed the last validation
-            tier 3  everything else the database holds, never-validated included
+            ranked       candidate_pool_size - exploration_slots slots, by
+                         current score
+            exploration  exploration_slots slots, rotated over everyone the
+                         ranking left out
 
-        Score orders within a tier and decides who makes the cut. It never
-        decides whether a proxy may serve: the pool is filled to N slots, or to
-        everything available when that is fewer, so an empty pool is a property
-        of an empty database rather than of a threshold someone tuned. A cold
-        pool runs this same code - with nothing validated and nothing scored,
-        tier 3 fills every slot, and validation and feedback then promote
-        proxies into tiers 2 and 1 while the service keeps serving.
+        The ranking is the score and nothing else that feedback wrote: a
+        success long ago buys no slot once later failures have taken the score
+        down. Validation only breaks ties, which in practice means ordering
+        proxies no feedback has reached yet - there it is the best evidence
+        available, so the live set goes before the reserve.
+
+        Exploration is how anything the ranking passes over gets tried again:
+        a newcomer, or a proxy that failed and may since have recovered. It
+        goes to whoever was tried longest ago - the later of its last handout
+        and its last feedback, never counting as longest - taking the live set
+        first, so each trial moves a proxy to the back of the line and nothing
+        is locked out for good. The failure record is kept throughout; the
+        retrial is what earns a proxy its slot back.
+
+        Neither kind of slot is a gate. The pool is filled to N slots, or to
+        everything available when that is fewer, so an empty pool is a
+        property of an empty database rather than of a threshold someone
+        tuned. A cold pool runs this same code - with nothing validated and
+        nothing scored, the reserve fills every slot, and validation and
+        feedback then reorder the pool while the service keeps serving.
         """
         if source not in self.available_proxies:
             return []
@@ -2487,76 +2632,46 @@ class ProxyManager:
         stats_pool = self.source_stats.setdefault(source, {})
         baseline = self._baseline_score(source)
 
-        def by_score(proxy_url: str) -> Tuple[float, str]:
+        # 0 for the live set, then the reserve's own order: never-validated
+        # first, then the stalest failed checks, then retained records.
+        position = dict.fromkeys(self.active_proxies, 0)
+        for index, proxy_url in enumerate(self.reserve_proxies, start=1):
+            position.setdefault(proxy_url, index)
+
+        def last_tried(proxy_url: str) -> float:
+            # A handout is a trial, and so is anything feedback reports on:
+            # a restored record can carry results but no handout time.
+            stat = stats_pool.get(proxy_url)
+            if stat is None:
+                return 0.0
+            return max(
+                stat.get("last_handed_out_ts") or 0.0,
+                stat.get("last_feedback_ts") or 0.0,
+            )
+
+        def by_score(proxy_url: str) -> Tuple:
             stat = stats_pool.get(proxy_url)
             score = baseline if stat is None else float(stat.get("score", baseline))
-            return (-score, proxy_url)
+            # The URL makes two rebuilds over the same state agree:
+            # active_proxies is a set and iterates in no reproducible order.
+            return (-score, position[proxy_url], last_tried(proxy_url), proxy_url)
 
-        # Tier 1 is defined by feedback and nothing else. Requiring is_active
-        # here would put validation back in front of the ranking as an
-        # admission test - the gate this issue removed - and would demote the
-        # best evidence the pool has: a proxy the validator cannot reach but
-        # that real client traffic keeps succeeding on.
-        proven = [
-            proxy_url
-            for proxy_url in (*self.active_proxies, *self.reserve_proxies)
-            if self._has_succeeded(stats_pool.get(proxy_url))
-        ]
-        promoted = set(proven)
-        validated = [
-            proxy_url
-            for proxy_url in self.active_proxies
-            if proxy_url not in promoted
-        ]
-        # active_proxies is a set, so its iteration order is not reproducible;
-        # the sort is what makes two rebuilds over the same state agree. It
-        # also de-duplicates tier 1, which the two source lists can overlap in.
-        proven = sorted(set(proven), key=by_score)
-        validated.sort(key=by_score)
-        # Tier 3 keeps the order the database returned - never-validated first,
-        # then the stalest failures. Sorting it by score would be sorting a
-        # column holding the untouched prior for very nearly every row in it.
-        unvalidated = [
-            proxy_url
-            for proxy_url in self.reserve_proxies
-            if proxy_url not in self.active_proxies and proxy_url not in promoted
-        ]
-        ranked = proven + validated + unvalidated
+        def by_turn(proxy_url: str) -> Tuple:
+            return (
+                position[proxy_url] > 0,
+                last_tried(proxy_url),
+                position[proxy_url],
+                proxy_url,
+            )
 
+        ranked = sorted(position, key=by_score)
         capacity = self.candidate_pool_size
         reserved = min(self.exploration_slots, capacity)
-        pool, members = [], set()
-
-        def take(proxy_url: str):
-            pool.append(proxy_url)
-            members.add(proxy_url)
-
-        for proxy_url in ranked:
-            if len(pool) >= capacity - reserved:
-                break
-            if proxy_url not in members:
-                take(proxy_url)
-        # The reserved slots are the only reason a pool saturated by tier 1
-        # ever admits a newcomer: without them today's best hold their slots
-        # indefinitely and tomorrow's better proxy is never discovered.
-        for proxy_url in ranked:
-            if len(pool) >= capacity:
-                break
-            if proxy_url in members or self._has_been_measured(
-                stats_pool.get(proxy_url)
-            ):
-                continue
-            take(proxy_url)
-        # A floor, not a gate. Reserved slots that no newcomer claimed go back
-        # to the ranking rather than being left empty.
-        for proxy_url in ranked:
-            if len(pool) >= capacity:
-                break
-            if proxy_url not in members:
-                take(proxy_url)
+        pool = ranked[: capacity - reserved]
+        pool += heapq.nsmallest(reserved, ranked[capacity - reserved :], key=by_turn)
 
         # Anything that can be handed out needs somewhere to record feedback,
-        # or a tier-3 proxy could never earn its way up into tier 1.
+        # or a proxy served from the reserve could never earn its score.
         for proxy_url in pool:
             if proxy_url not in stats_pool:
                 stats_pool[proxy_url] = self._get_new_proxy_stat(source)

@@ -16,9 +16,34 @@ Validation owns only the `is_active` liveness signal. Real client feedback owns
 reliability and traffic allocation. Validator latency, anonymity, and pass/fail
 observations must never enter the reliability score.
 
-`is_active` is a *signal*, not an admission test. It is the ordering boundary
-between tier 2 and tier 3 of the candidate pool (section 4); a proxy that has
-never been validated is still servable.
+`is_active` is a *signal*, not an admission test. It breaks ties in the
+candidate pool's ranking and orders its exploration rotation (section 4); a
+proxy that has never been validated, or failed its last check, is still
+servable.
+
+Every completed check is recorded as measured, pass or fail, whatever the rest
+of its batch did. Its timestamp and attempt count are what move a proxy to the
+back of its validation queue; a batch whose results were withheld because
+nothing in it passed left the same oldest rows at the head of the queue for
+every following cycle, and left dead proxies marked alive.
+
+The cost of that honesty is an unreachable validation target. Every proxy it
+checked while down is recorded as failed, and a failed proxy is checked again
+only when the oldest-first failed-proxy queue comes round to it - a full pass
+over every inactive row, which on a table of mostly dead rows takes hours.
+Until then those proxies lose their `is_active` signal, and
+`/get-premium-proxy`, which requires it, has fewer or none to offer. Supply is
+not affected: serving never depends on `is_active`, and proxies with good
+feedback records stay in the candidate set however they were last validated
+(4.1). The per-target health verdict
+(`validation_target_min_samples`) is kept as a diagnostic for the log and
+`/ready`. A task that ends without a verdict - cancelled, or broken in a way
+the per-proxy handlers did not anticipate - is not recorded at all.
+
+A batch reads its validation config once, when it starts: targets, success
+threshold, timeout and concurrency. A reload that lands mid-batch applies from
+the next one; the requests and the summary of their results always agree on
+the target list.
 
 Feedback latency remains observable as `avg_latency_ms`. It is recorded and
 nothing else: it does not enter the score, and it does not order the pool
@@ -75,96 +100,113 @@ earns its score back on fresh evidence while remaining servable throughout.
 ## 4. Candidate pool selection
 
 Ranking is the only mechanism. Each source keeps a fixed-size candidate pool,
-rebuilt on a timer and filled best-first; a handout is a uniform random pick
-from that pool.
+rebuilt on a timer; a handout is a uniform random pick from that pool.
 
 ```text
-every pool_refresh_seconds, fill candidate_pool_size slots in priority order:
+every pool_refresh_seconds, over every proxy the router can see (4.1):
 
-  tier 1   proxies with successful feedback on record   <- scored, ordered
-  tier 2   proxies that passed validation (is_active)   <- tops up tier 1
-  tier 3   anything else, including never-validated     <- tops up the rest
+  ranked slots       candidate_pool_size - exploration_slots, by current score
+  exploration slots  exploration_slots, rotated over everyone else (4.2)
 ```
 
-Tier 1 is defined by feedback, not by validation: `is_active` is not one of its
-conditions. Its candidates are the proxies the router can see - the live set
-and the reserve page (4.1) - so a proxy with a success on record that has since
-failed validation is usually outside both until it passes again. That boundary
-is provisional; see 4.5.
+The ranking is the current score and nothing else feedback wrote. A success
+long ago buys no slot once later failures have taken the score down, and a
+proxy that keeps failing yields its slot on the next rebuild. Validation only
+breaks ties: in practice that orders proxies no feedback has reached yet,
+where it is the best evidence available, so the live set goes before the
+reserve. Among equal scores in the same place, whoever was tried longest ago
+goes first, and the URL settles the rest so two rebuilds over the same state
+agree - `active_proxies` is a set and iterates in no reproducible order.
 
-Score orders within a tier and decides who makes the cut. It never decides
-whether a proxy may serve. The pool therefore always holds
-`min(candidate_pool_size, everything available)`, which makes an empty answer
-structurally impossible while the database holds any proxy at all. The
-invariant is a property of the data structure, not a fallback branch someone
-has to remember to write - and it is asserted by test, not by review note.
-
-Ordering within tiers 1 and 2 is by descending score, then by URL, so two
-rebuilds over the same state agree; `active_proxies` is a set and its iteration
-order is not reproducible on its own. Tier 3 keeps the order the database
-returned, because score there is the untouched prior for very nearly every row.
+Score decides who makes the cut. It never decides whether a proxy may serve.
+The pool therefore always holds `min(candidate_pool_size, everything
+available)`, which makes an empty answer structurally impossible while the
+database holds any proxy at all. The invariant is a property of the data
+structure, not a fallback branch someone has to remember to write - and it is
+asserted by test, not by review note.
 
 A cold pool is the same code path as a warm one. With nothing validated and
-nothing scored, tier 3 fills every slot from whatever the fetchers have found;
-validation and feedback then promote proxies into tiers 2 and 1 over the
-following hours, and the served-quality curve rises while the served volume
-never drops.
+nothing scored, the reserve fills every slot from whatever the fetchers have
+found; validation and feedback then reorder the pool over the following hours,
+and the served-quality curve rises while the served volume never drops.
 
-### 4.1 Tier 3 has its own query
+The score's own shape decides how long a mediocre proxy keeps its slot. With
+the default prior and `score = 100 * min(slow, fast)`, a proxy that succeeds
+one time in ten drops below an untried one after five or six consecutive
+failures and goes back to the rotation; at low success rates that concentrates
+traffic less than a rule that kept every proxy with any success on record at
+the top - which is exactly what let proxies that had succeeded once and then
+died hold the pool.
+
+### 4.1 What the router can see
 
 `get_active_proxies()` answers `is_active = true` only, so the routing layer
 cannot see a never-validated proxy through it - which on a cold start is the
-entire population, and exactly the tier that has to carry it.
-`get_reserve_proxies(limit)` supplies the rest of the table. Its result is held
-in memory as `reserve_proxies`, so the pool refresh stays lock-only and never
-waits on the database.
+entire population. The reserve supplies the rest, in two bounded parts held in
+memory as `reserve_proxies`, so the pool refresh stays lock-only and never
+waits on the database:
 
-That placement is deliberate. Running the query on the refresh timer instead
-would put a network round trip inside the routing control plane, and a brief
-database outage would then empty tier 3 - the one tier that carries a cold
-start. A failed reserve query keeps the previous list rather than emptying it.
+1. **The first page of the table in fallback order**: `get_reserve_proxies()`,
+   never-validated rows first - an unmeasured proxy is a better guess than one
+   that has already failed a check - then by the stalest last check,
+   `candidate_pool_size` rows. `idx_proxies_reserve_pool` matches that
+   ordering so the `LIMIT` stops at the first page rather than sorting every
+   dead row in the table.
+2. **The rows with the best feedback records**: for each source, the
+   `candidate_pool_size` best-scored records carrying feedback that neither
+   the live set nor that page covers, checked against the table in one
+   bounded lookup (`get_existing_proxies()`). A failed check stamps a row
+   newest, which pushes it off the first page; without this part a proxy real
+   traffic keeps succeeding on lost its ranking - and all of its traffic - the
+   moment it missed one check. No record below that many better ones can win a
+   slot anyway, and the existence check keeps history whose row is gone (a
+   rebuilt database, then a restored backup) from being served.
+
+Placement on the sync rather than the refresh timer is deliberate. Running the
+queries on the timer would put a network round trip inside the routing control
+plane, and a brief database outage would then empty the fallback that carries
+a cold start. A failed query keeps the previous list rather than emptying it.
 
 Publication is event-driven, and must never be conditional on a validation
 cycle *succeeding* - rows are servable the moment they are committed, whatever
-the validator later makes of them. Three paths publish it:
+the validator later makes of them. Two paths publish it:
 
 | Path | Why |
 | --- | --- |
-| pool sync | the ordinary case, alongside the active query |
+| pool sync | the ordinary case, alongside the active query; every completed validation cycle ends in one |
 | a fetch that committed rows | "serves from the first fetch onward" means the fetch, not the validation cycle that may follow minutes later |
-| a validation cycle whose target quorum is down | otherwise a target that stays down leaves the router blind to the whole table |
 
-The last two go through `_publish_reserve_pool()`, which republishes tier 3 and
-rebuilds but never reads or rewrites `active_proxies`. That narrowness is the
-point: it can run on a path where a validation batch has just failed, where
-preserving last-known-good liveness is the standing contract.
+The fetch path goes through `_publish_reserve_pool()`, which republishes the
+reserve and rebuilds but never reads or rewrites `active_proxies`. Each
+source's rows are committed and published as soon as its own fetch returns; a
+source that spends its whole curl retry budget holds back only itself.
 
 Reserve proxies keep their records under the stats cap exactly as live ones do:
 `_truncate_stats_pool()` exempts the whole servable set, live and reserve. The
 pool re-seeds a blank stat for any member that lacks one, so evicting a reserve
 proxy that is still being served would launder its failure history.
 
-The row count is bounded by `candidate_pool_size`: one pool's worth is all
-tier 3 can ever place, so the bound needs no tunable of its own. Rows are
-ordered never-validated first - an unmeasured proxy is a better guess than one
-that has already failed a check - then by the stalest last check.
-`idx_proxies_reserve_pool` matches that ordering so the `LIMIT` stops at the
-first page rather than sorting every dead row in the table.
+### 4.2 Exploration slots
 
-### 4.2 Reserved exploration slots
+`exploration_slots` of the N slots rotate over the proxies the ranking left
+out. It exists because a pool filled purely by score would never try anything
+below the cut again: a newcomer would wait behind every proxy scored above the
+prior, and a proxy that failed and has since recovered would never get the
+trial that shows it.
 
-`exploration_slots` of the N slots are held back for proxies that have never
-been measured. This is the only remaining role of exploration, and it exists
-for one reason: a pool filled entirely from tier 1 would never admit a new
-proxy again - today's best would hold their slots indefinitely and tomorrow's
-better proxy would never be discovered.
+The rotation takes the live set first, then whoever was tried longest ago -
+the later of the last handout and the last feedback, never counting as
+longest. Each trial moves a proxy to the back of the line, so newcomers go
+first and everything else comes round again; nothing is locked out for good,
+and no failure record is cleared to make that happen. A proxy that earns a
+good score in its turn keeps its place through the ranking.
 
-It is a floor, not a gate:
+It is a rotation, not a gate:
 
-- reserved slots that no newcomer claims go back to the ranking;
-- `0` disables the reservation and the pool still fills;
+- `0` disables it and the pool still fills by score;
 - a value at or above `candidate_pool_size` still fills the pool, it merely
-  spends it all on newcomers - degraded quality, never degraded availability.
+  spends every slot on the rotation - degraded quality, never degraded
+  availability.
 
 ### 4.3 What is not on the routing path
 
@@ -221,44 +263,26 @@ nothing reads `avg_latency_ms` to decide anything.
 cooldown filters pool members, so at a large enough value it holds every member
 out at once, which the governing rule does not permit to survive.
 
-### 4.5 Open decision: proven proxies outside the reserve page
+### 4.5 Replaced: tiers by lifetime success
 
-A proxy that has succeeded for real clients and then failed validation is a
-tier-1 proxy by definition, but the router usually cannot see it: its last
-check is the newest in the table, so it sorts to the end of the reserve
-ordering and falls outside the page. Until it passes validation again - and the
-failed-proxy retry queue is oldest-first across the whole dead table, so that
-can take hours - it is out of the ranking.
+The first version of this pool filled three tiers in order - any successful
+feedback on record, then validated, then the rest - and reserved its
+exploration slots for proxies no feedback had ever reached. Both rules were
+identities rather than evidence, and neither expired:
 
-Pulling every such proxy into tier 1, existence-checked against the database,
-is the obvious fix and was deliberately not taken, because of how tier 1 is
-defined: *any* success on record, a lifetime counter that never resets, filled
-as a block ahead of tier 2. Widened to all history, tier 1 fills with proxies
-that succeeded once and have since died, ahead of proxies validated alive. A
-simulation of 120 live proxies and 170 non-active proxies with a success on
-record, 20 of which still work:
+- a proxy that had succeeded once kept its place ahead of every proxy without
+  a success, whatever came after: 200 proxies that succeeded once and then
+  failed a hundred times each held 180 of 200 slots at a score of 0.0;
+- one failure took a proxy out of exploration for good, so once every newcomer
+  had been tried once, those same 200 held all 200 slots;
+- a proven proxy that failed one validation check fell off the reserve page
+  and lost all of its traffic.
 
-| True success rate of the 20 that still work | not widened | widened | widened: traffic to dead proxies |
-| --- | ---: | ---: | ---: |
-| 30% | 0.073 | 0.141 | 25% |
-| 12% | 0.073 | 0.081 | 26% |
-| 3% | 0.073 | 0.057 | 36% |
-| 0% | 0.073 | 0.057 | 37% |
-
-Widening pays only if proven-but-non-active proxies keep succeeding at about
-the rate of the better live ones; otherwise it costs roughly a fifth of served
-quality. The simulation does not model re-validation, which returns a working
-proxy to the live set on its own, so it overstates the gain.
-
-Bounding the widening by score - only proxies scoring above the prior - was
-tested and rejected. It is the removed score gate in miniature: a non-active
-proxy that dips below the prior on an ordinary losing streak is never served
-again, so it can never produce the evidence that would lift it back (0.116 in
-the 30% row, below both alternatives).
-
-The decision waits on production data: how many proxies with a success on
-record are non-active, how recent that success is, and how often they pass
-re-validation.
+Ranking by current score, rotating exploration, and retaining the best
+feedback records (4.1) replace them. In a replay where the 20 proxies that
+carried a pool died and 20 others started succeeding, the tiered pool never
+recovered - it could not re-admit a proxy it had measured once - while the
+ranked pool's served success rate climbed to the uniform-draw ceiling.
 
 ## 5. Source-wide outage guard
 
@@ -305,8 +329,8 @@ Routing is split into a control plane and a data plane.
 and in what order. It runs inside the pool sync - reusing the pass that already
 refreshes every score - and on `pool_refresh_seconds` between syncs. It also
 seeds a stat for every pool member, because anything that can be handed out
-needs somewhere to record feedback, or a tier-3 proxy could never earn its way
-up into tier 1.
+needs somewhere to record feedback, or a proxy served from the reserve could
+never earn its score.
 
 `allocate_proxy()` holds no pool logic: one dict lookup and one
 `random.choice`. Nothing in it scales with the size of the pool, and nothing in
@@ -336,6 +360,16 @@ Proxy reputation is not mirrored into PostgreSQL. If a JSON snapshot is absent
 or intentionally skipped, each proxy starts from the fixed prior and relearns
 through normal feedback. This accepts a bounded warm-up period in exchange for
 removing reputation migrations, hydration, and a second write path.
+
+Startup restores a snapshot only if it was generated at most
+`stats_restore_max_age_hours` (default 12) ago, judged by the `timestamp` the
+snapshot records - never by the file's mtime, so copying an old file does not
+make it new. Timestamps are written with their UTC offset; one without an
+offset is read as local time, which is how earlier backups wrote it. A missing
+or unreadable timestamp, or an older snapshot, skips the restore and every
+proxy starts at the prior. The limit applies to the snapshot as a whole: a
+fresh snapshot restores every record in it however old the feedback behind
+it, and nothing ages running scores or feedback out while the service runs.
 
 The optional cold-start mode is non-destructive:
 
