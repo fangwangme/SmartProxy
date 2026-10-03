@@ -266,7 +266,13 @@ filling the pool. Neither may remove a proxy from it.
   score-weighted draw. A real cold start (2026-10-03) showed why weighting
   matters: with the pool drawn uniformly the client's success rate reached
   ~35% after 18 minutes, against 60-70% at the same stage before #27, while
-  the 40 proxies scoring 50 or more had 93% success on their own record.
+  the 40 proxies scoring 50 or more had 93% success on their own record. The
+  same client on the same restored scores, after the switch to the weighted
+  draw, ran at 80-87%, and counting only fully parsed pages (`100`, not `7`)
+  it still ran at 78-85%. The top 50 proxies carried 84% of the traffic at 94%
+  success. That concentration is the point, and also the risk to watch: if a
+  target site rate-limits per IP, the fast estimator has to move traffic off
+  those proxies within a few failures.
 - **The ranked tier lists** (`max_pool_size`, `top_tier_size`) are reporting,
   and the input to `selection_strategy = tiered`. They are not an eligibility
   gate and are not what fills the pool.
