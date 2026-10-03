@@ -407,7 +407,7 @@ smartproxy_plan_refresh_duration_seconds {plan_refresh_duration:.6f}
             return (
                 jsonify(
                     {
-                        "error": "Invalid feedback status. Use 0/4 for legacy failures, 1/2/3 or HTTP 1xx-3xx for success, and HTTP 4xx-5xx for failure."
+                        "error": "Invalid feedback status. Use 0/4 for legacy failures, 1/2/3/7 or HTTP 1xx-3xx for success, and HTTP 4xx-5xx for failure."
                     }
                 ),
                 400,

@@ -242,7 +242,7 @@ Submits feedback on a proxy's performance. This is crucial for the scoring syste
 * **Request Body** (JSON):  
   * source (string, required): The source pool the proxy belongs to.  
   * proxy (string, required): The exact proxy URL that was handed out.
-  * status (integer, required): 0 and 4 are legacy failures; 1/2/3 and HTTP 1xx-3xx are successes; HTTP 4xx-5xx are failures; other values are rejected.  
+  * status (integer, required): 0 and 4 are legacy failures; 1/2/3, 7 (page fetched, fields missing) and HTTP 1xx-3xx are successes; HTTP 4xx-5xx are failures; other values are rejected.  
   * response\_time\_ms (integer, optional): Diagnostic response time in milliseconds. It does not affect reliability or selection; it is recorded as `avg_latency_ms` for observability only. Must be finite, non-negative, and no larger than `max_feedback_latency_ms` (defaults to one day, `86400000`); anything else is rejected with a 400.
   * failure\_kind (string, optional): One of `timeout`, `proxy_error`, `dead`, `blocked`, `slow`, or `content_error`. `dead` applies the failure to every source where that proxy is tracked; other kinds affect only the reported source.
 

@@ -302,9 +302,32 @@ class TestProxyManager(ProxyManagerTestBase):
         """Feedback status should reject unknown values and classify HTTP failures."""
         self.assertTrue(self.manager.classify_feedback_status(200))
         self.assertTrue(self.manager.classify_feedback_status(2))
+        # The scraper's "page fetched, fields missing": the proxy delivered.
+        self.assertTrue(self.manager.classify_feedback_status(7))
         self.assertFalse(self.manager.classify_feedback_status(0))
         self.assertFalse(self.manager.classify_feedback_status(500))
         self.assertFalse(self.manager.is_valid_feedback_status(999))
+
+    def test_status_seven_is_accepted_and_counted_as_a_success(self):
+        """
+        The insolvencydirect scraper reports 7 for "page fetched, fields
+        missing". It used to answer 400, so the result was dropped: neither the
+        proxy's score nor the per-minute counts saw it.
+        """
+        proxy_url = "http://192.0.2.7:8080"
+        self.manager.source_stats["source1"][proxy_url] = (
+            self.manager._get_new_proxy_stat("source1")
+        )
+
+        response = create_app(self.manager).test_client().post(
+            "/feedback",
+            json={"source": "source1", "proxy": proxy_url, "status": 7},
+            environ_base={"REMOTE_ADDR": "127.0.0.1"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        stat = self.manager.source_stats["source1"][proxy_url]
+        self.assertEqual((stat["success_count"], stat["failure_count"]), (1, 0))
 
     def test_process_feedback_handles_unknown_proxy(self):
         """Test that process_feedback handles unknown proxy gracefully."""

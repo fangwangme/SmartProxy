@@ -94,7 +94,10 @@ FAILED_STATUS_CODES = {
     0,
     4,
 }  # Set of status codes that indicate failure (0=timeout, 4=proxy error)
-LEGACY_SUCCESS_STATUS_CODES = {1, 2, 3}
+# 1/2/3 are legacy successes. 7 is the insolvencydirect scraper's "page
+# fetched, required fields missing": the proxy delivered the page, so it
+# counts for the proxy like any other fetched page.
+SUCCESS_STATUS_CODES = {1, 2, 3, 7}
 VALID_FAILURE_KINDS = {
     "timeout",
     "proxy_error",
@@ -3479,7 +3482,7 @@ class ProxyManager:
     def classify_feedback_status(self, status_code: int) -> bool:
         if status_code in FAILED_STATUS_CODES:
             return False
-        if status_code in LEGACY_SUCCESS_STATUS_CODES:
+        if status_code in SUCCESS_STATUS_CODES:
             return True
         if 100 <= status_code < 400:
             return True
