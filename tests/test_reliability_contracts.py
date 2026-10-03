@@ -355,8 +355,8 @@ class TestHandoutAccountingAndPools(ProxyManagerTestBase):
         self.assertEqual(stat["handout_count"], 2)
         self.assertEqual(len(stat["inflight"]), 2)
 
-        self.manager.process_feedback("source1", proxy, 200)
-        self.manager.process_feedback("source1", proxy, 200)
+        self.manager.process_feedback("source1", proxy, 100)
+        self.manager.process_feedback("source1", proxy, 100)
 
         self.assertEqual(len(stat["inflight"]), 0)
         self.assertEqual(self.manager.unmatched_feedback_total, 0)
@@ -370,7 +370,7 @@ class TestHandoutAccountingAndPools(ProxyManagerTestBase):
         # referee, so it is still scored - but it is counted, because a
         # duplicate, a late report or a wrong source is the only way to
         # produce one.
-        self.manager.process_feedback("source1", proxy, 200)
+        self.manager.process_feedback("source1", proxy, 100)
 
         self.assertEqual(self.manager.unmatched_feedback_total, 1)
         self.assertEqual(stat["success_count"], before[0] + 1)
@@ -429,7 +429,7 @@ class TestHandoutAccountingAndPools(ProxyManagerTestBase):
         self.assertEqual(handout["source"], "source1")
         self.assertEqual(len(self.manager.source_stats["source1"][proxy]["inflight"]), 1)
         with patch.object(self.manager, "_sync_premium_proxies_locked") as sync:
-            self.manager.process_feedback("source1", proxy, 500)
+            self.manager.process_feedback("source1", proxy, 4)
 
         sync.assert_not_called()
         self.assertFalse(self.manager._is_premium_grade(stat, "source1"))
@@ -1099,7 +1099,7 @@ class TestApiAndLifecycleContracts(ProxyManagerTestBase):
         proxy = "http://192.0.2.50:80"
         for source in ("source1", "source2"):
             self.manager.source_stats[source][proxy] = self.manager._get_new_proxy_stat(source)
-        self.manager.process_feedback("source1", proxy, 500, failure_kind="dead")
+        self.manager.process_feedback("source1", proxy, 4, failure_kind="dead")
         self.assertEqual(self.manager.accepted_feedback_failure_total, 1)
         self.manager.source_stats.clear()
 

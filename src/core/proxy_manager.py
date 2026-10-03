@@ -90,14 +90,15 @@ TRANSIENT_CURL_EXIT_CODES = frozenset({5, 6, 7, 16, 18, 28, 35, 52, 55, 56, 92})
 # HTTP statuses that say "ask again later"; every other >=400 is persistent.
 TRANSIENT_HTTP_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
 
-FAILED_STATUS_CODES = {
-    0,
-    4,
-}  # Set of status codes that indicate failure (0=timeout, 4=proxy error)
-# 1/2/3 are legacy successes. 7 is the insolvencydirect scraper's "page
-# fetched, required fields missing": the proxy delivered the page, so it
-# counts for the proxy like any other fetched page.
-SUCCESS_STATUS_CODES = {1, 2, 3, 7}
+# The /feedback status protocol, as the clients define it: the task status
+# their scrapers already record. 100 = page fetched and parsed; 7 = page
+# fetched but the expected data is missing - the proxy still delivered it, so
+# it counts as a success for the proxy; 4 = the request failed (connection,
+# timeout, proxy or TLS error, non-2xx). Any other integer is accepted but not
+# scored: a value nobody defined cannot be scored correctly, and refusing it
+# would only make the client's report fail.
+SUCCESS_STATUS_CODES = frozenset({100, 7})
+FAILED_STATUS_CODES = frozenset({4})
 VALID_FAILURE_KINDS = {
     "timeout",
     "proxy_error",
@@ -192,6 +193,9 @@ class ProxyManager:
         self.candidate_pool_built_at: Dict[str, float] = {}
         self.accepted_feedback_success_total = 0
         self.accepted_feedback_failure_total = 0
+        # Accepted with a status outside the protocol, so not scored.
+        self.accepted_feedback_unscored_total = 0
+        self._warned_unscored_statuses: Set[Tuple[str, int]] = set()
         # Feedback that arrived with no outstanding handout to close. It is
         # still scored - the client owns its own correctness - but duplicate,
         # late and cross-source reports are the only things that can produce
@@ -3354,6 +3358,9 @@ class ProxyManager:
         """
         source = self._get_source_or_default(source)
         is_success = self.classify_feedback_status(status_code)
+        if is_success is None:
+            self._record_unscored_feedback(source, proxy_url, status_code)
+            return False
         if failure_kind and failure_kind not in VALID_FAILURE_KINDS:
             logger.warning("Ignoring unknown failure_kind '{}'", failure_kind)
             failure_kind = None
@@ -3416,6 +3423,7 @@ class ProxyManager:
                     response_time_ms,
                     current_timestamp,
                 )
+        return True
 
     def _apply_feedback_to_stat(
         self,
@@ -3479,20 +3487,36 @@ class ProxyManager:
             f"{old_score:.1f} -> {stat['score']:.1f}"
         )
 
-    def classify_feedback_status(self, status_code: int) -> bool:
-        if status_code in FAILED_STATUS_CODES:
-            return False
+    @staticmethod
+    def classify_feedback_status(status_code: int) -> Optional[bool]:
+        """True for a success, False for a failure, None for "not scored"."""
         if status_code in SUCCESS_STATUS_CODES:
             return True
-        if 100 <= status_code < 400:
-            return True
-        if 400 <= status_code <= 599:
+        if status_code in FAILED_STATUS_CODES:
             return False
-        raise ValueError(f"Unsupported feedback status: {status_code}")
+        return None
 
-    def is_valid_feedback_status(self, status_code: int) -> bool:
-        try:
-            self.classify_feedback_status(status_code)
-            return True
-        except ValueError:
-            return False
+    def _record_unscored_feedback(self, source: str, proxy_url: str, status_code: int):
+        """
+        A report whose status is outside the protocol: count it, close its
+        handout, and leave the proxy's score and the minute counts alone.
+        """
+        now_ts = time.time()
+        with self.lock:
+            self.accepted_feedback_unscored_total += 1
+            stat = self.source_stats.get(source, {}).get(proxy_url)
+            if stat is not None:
+                if self._lease_count(stat, now_ts) == 0:
+                    self.unmatched_feedback_total += 1
+                self._release_lease(stat)
+            first_time = (source, status_code) not in self._warned_unscored_statuses
+            self._warned_unscored_statuses.add((source, status_code))
+        if first_time:
+            logger.warning(
+                "Feedback status {} for source '{}' is outside the protocol "
+                "(100/7 success, 4 failure); accepted but not scored. Further "
+                "reports of it are counted in "
+                "smartproxy_feedback_accepted_total{{outcome=\"unscored\"}}.",
+                status_code,
+                source,
+            )

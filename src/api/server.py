@@ -207,6 +207,7 @@ def create_app(proxy_manager: ProxyManager):
             
             total_success = proxy_manager.accepted_feedback_success_total
             total_failure = proxy_manager.accepted_feedback_failure_total
+            total_unscored = proxy_manager.accepted_feedback_unscored_total
             unmatched_total = proxy_manager.unmatched_feedback_total
             outage_metrics = [
                 (
@@ -255,6 +256,7 @@ smartproxy_sources_total {sources_count}
 # TYPE smartproxy_feedback_accepted_total counter
 smartproxy_feedback_accepted_total{{outcome="success"}} {total_success}
 smartproxy_feedback_accepted_total{{outcome="failure"}} {total_failure}
+smartproxy_feedback_accepted_total{{outcome="unscored"}} {total_unscored}
 
 # HELP smartproxy_feedback_unmatched_total Accepted feedback with no outstanding handout to close
 # TYPE smartproxy_feedback_unmatched_total counter
@@ -403,19 +405,19 @@ smartproxy_plan_refresh_duration_seconds {plan_refresh_duration:.6f}
             )
         if failure_kind is not None and not isinstance(failure_kind, str):
             return jsonify({"error": "'failure_kind' must be a string."}), 400
-        if not proxy_manager.is_valid_feedback_status(status_code):
-            return (
-                jsonify(
-                    {
-                        "error": "Invalid feedback status. Use 0/4 for legacy failures, 1/2/3/7 or HTTP 1xx-3xx for success, and HTTP 4xx-5xx for failure."
-                    }
-                ),
-                400,
-            )
-
-        proxy_manager.process_feedback(
+        scored = proxy_manager.process_feedback(
             source, proxy_url, status_code, resp_time, failure_kind
         )
+        if scored is False:
+            # Outside the protocol: accepted so the client's report does not
+            # fail, but nothing was scored. Say so, so the client can see it.
+            return jsonify(
+                {
+                    "message": "Feedback received; status not scored.",
+                    "scored": False,
+                    "hint": "Use 100 (fetched) or 7 (fetched, no data) for success and 4 for failure.",
+                }
+            )
         return jsonify({"message": "Feedback received."})
 
     @app.route("/reload-sources", methods=["POST"])

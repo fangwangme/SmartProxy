@@ -222,7 +222,7 @@ class CandidatePoolServingTests(ProxyManagerTestBase):
         for _ in range(30):
             handout = self.manager.allocate_proxy(self.SOURCE)
             self.assertIsNotNone(handout)
-            self.manager.process_feedback(self.SOURCE, handout["proxy"], 0)
+            self.manager.process_feedback(self.SOURCE, handout["proxy"], 4)
 
         self.manager._rebuild_candidate_pool(self.SOURCE)
         self.assertIsNotNone(self.manager.allocate_proxy(self.SOURCE))
@@ -298,7 +298,7 @@ class LowSuccessRateTests(ProxyManagerTestBase):
             else:
                 is_success = step % success_every == 0
             self.manager.process_feedback(
-                self.SOURCE, proxy_url, 200 if is_success else 0
+                self.SOURCE, proxy_url, 100 if is_success else 4
             )
         return served, refused, served_better
 
@@ -371,7 +371,7 @@ class ColdStartTests(ProxyManagerTestBase):
                     refusals += 1
                     self.assertEqual(step, 0, "refused while the database held proxies")
                     continue
-                self.manager.process_feedback(self.SOURCE, handout["proxy"], 0)
+                self.manager.process_feedback(self.SOURCE, handout["proxy"], 4)
 
         self.assertEqual(refusals, 200)
 
@@ -460,7 +460,7 @@ class ProductionShapeReplayTests(ProxyManagerTestBase):
                 is_success = random.random() < (0.12 if is_better else 0.01)
                 successes += int(is_success)
                 self.manager.process_feedback(
-                    self.SOURCE, handout["proxy"], 200 if is_success else 0
+                    self.SOURCE, handout["proxy"], 100 if is_success else 4
                 )
             volume_curve.append(served)
             quality_curve.append(successes / served)
@@ -817,13 +817,13 @@ class ScoreRankingTests(ProxyManagerTestBase):
 
     def report_failures(self, proxy_url, times=1):
         for _ in range(times):
-            self.manager.process_feedback(self.SOURCE, proxy_url, 0)
+            self.manager.process_feedback(self.SOURCE, proxy_url, 4)
 
     def test_a_success_long_ago_buys_no_slot_once_the_score_is_gone(self):
         old, fresh = urls(200, first_octet=10), urls(200, first_octet=60)
         self.seed_pool(active=old + fresh)
         for proxy_url in old:
-            self.manager.process_feedback(self.SOURCE, proxy_url, 200)
+            self.manager.process_feedback(self.SOURCE, proxy_url, 100)
             self.report_failures(proxy_url, 100)
         self.seed_pool(active=old + fresh)
         self.assertLess(self.manager.source_stats[self.SOURCE][old[0]]["score"], 0.01)
@@ -835,7 +835,7 @@ class ScoreRankingTests(ProxyManagerTestBase):
         old, fresh = urls(200, first_octet=10), urls(200, first_octet=60)
         self.seed_pool(active=old + fresh)
         for proxy_url in old:
-            self.manager.process_feedback(self.SOURCE, proxy_url, 200)
+            self.manager.process_feedback(self.SOURCE, proxy_url, 100)
             self.report_failures(proxy_url, 100)
         for proxy_url in fresh:
             self.report_failures(proxy_url)
@@ -894,7 +894,7 @@ class ScoreRankingTests(ProxyManagerTestBase):
         page = urls(50, first_octet=80)
         self.seed_pool(reserve=[star] + page)
         for _ in range(40):
-            self.manager.process_feedback(self.SOURCE, star, 200)
+            self.manager.process_feedback(self.SOURCE, star, 100)
         self.mock_db_instance.get_existing_proxies.side_effect = lambda wanted: {
             proxy_url for proxy_url in wanted if proxy_url == star
         }
@@ -914,7 +914,7 @@ class ScoreRankingTests(ProxyManagerTestBase):
         page = urls(50, first_octet=80)
         self.seed_pool(reserve=[ghost] + page)
         for _ in range(40):
-            self.manager.process_feedback(self.SOURCE, ghost, 200)
+            self.manager.process_feedback(self.SOURCE, ghost, 100)
         self.mock_db_instance.get_existing_proxies.return_value = set()
 
         self.seed_pool(reserve=page)
@@ -925,7 +925,7 @@ class ScoreRankingTests(ProxyManagerTestBase):
     def test_a_failed_retained_lookup_keeps_the_previous_reserve(self):
         page = urls(20, first_octet=80)
         self.seed_pool(reserve=page)
-        self.manager.process_feedback(self.SOURCE, page[0], 200)
+        self.manager.process_feedback(self.SOURCE, page[0], 100)
         self.mock_db_instance.get_existing_proxies.return_value = None
         self.mock_db_instance.get_reserve_proxies.return_value = urls(5, first_octet=90)
 
@@ -954,7 +954,7 @@ class WinnerSwitchTests(ProxyManagerTestBase):
                 proxy_url = self.manager.allocate_proxy(self.SOURCE)["proxy"]
                 ok = rng.random() < (0.8 if proxy_url in winners else 0.02)
                 succeeded += ok
-                self.manager.process_feedback(self.SOURCE, proxy_url, 200 if ok else 0)
+                self.manager.process_feedback(self.SOURCE, proxy_url, 100 if ok else 4)
             return succeeded / 400
 
         for _ in range(8):

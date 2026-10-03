@@ -265,7 +265,7 @@ class TestProxyManager(ProxyManagerTestBase):
             }
         }
         
-        self.manager.process_feedback("source1", proxy_url, 200, response_time_ms=500)
+        self.manager.process_feedback("source1", proxy_url, 100, response_time_ms=500)
         
         stat = self.manager.source_stats["source1"][proxy_url]
         # Score should be recalculated based on new sliding window
@@ -289,7 +289,7 @@ class TestProxyManager(ProxyManagerTestBase):
         }
         
         # 0 is in FAILED_STATUS_CODES
-        self.manager.process_feedback("source1", proxy_url, 0)
+        self.manager.process_feedback("source1", proxy_url, 4)
         
         stat = self.manager.source_stats["source1"][proxy_url]
         # Score recalculated based on sliding window (now has 1 failure)
@@ -299,14 +299,51 @@ class TestProxyManager(ProxyManagerTestBase):
         self.assertEqual(len(stat["recent_results"]), 1)
 
     def test_feedback_status_classification(self):
-        """Feedback status should reject unknown values and classify HTTP failures."""
-        self.assertTrue(self.manager.classify_feedback_status(200))
-        self.assertTrue(self.manager.classify_feedback_status(2))
-        # The scraper's "page fetched, fields missing": the proxy delivered.
-        self.assertTrue(self.manager.classify_feedback_status(7))
-        self.assertFalse(self.manager.classify_feedback_status(0))
-        self.assertFalse(self.manager.classify_feedback_status(500))
-        self.assertFalse(self.manager.is_valid_feedback_status(999))
+        """
+        The protocol is the clients' own task status: 100 fetched, 7 fetched
+        with no data (the proxy still delivered), 4 failed. Everything else -
+        the legacy 1/2/3, 0, HTTP codes - is not scored.
+        """
+        self.assertIs(self.manager.classify_feedback_status(100), True)
+        self.assertIs(self.manager.classify_feedback_status(7), True)
+        self.assertIs(self.manager.classify_feedback_status(4), False)
+        for unscored in (0, 1, 2, 3, 10, 11, 200, 404, 500, 999):
+            with self.subTest(status=unscored):
+                self.assertIsNone(self.manager.classify_feedback_status(unscored))
+
+    def test_a_status_outside_the_protocol_is_accepted_but_not_scored(self):
+        """
+        Refusing an unknown status would only fail the client's report. It is
+        accepted and its handout closed, but the proxy's score and the minute
+        counts stay where they were, and it is counted separately.
+        """
+        proxy_url = "http://192.0.2.8:8080"
+        stat = self.manager._get_new_proxy_stat("source1")
+        self.manager.source_stats["source1"][proxy_url] = stat
+        self.manager._mark_proxy_handed_out("source1", proxy_url, time.time())
+        before = (stat["score"], stat["success_count"], stat["failure_count"])
+
+        response = create_app(self.manager).test_client().post(
+            "/feedback",
+            json={"source": "source1", "proxy": proxy_url, "status": 0},
+            environ_base={"REMOTE_ADDR": "127.0.0.1"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIs(response.get_json()["scored"], False)
+        self.assertEqual(
+            (stat["score"], stat["success_count"], stat["failure_count"]), before
+        )
+        self.assertEqual(len(stat["inflight"]), 0)
+        self.assertEqual(self.manager.accepted_feedback_unscored_total, 1)
+        self.assertEqual(
+            (
+                self.manager.accepted_feedback_success_total,
+                self.manager.accepted_feedback_failure_total,
+            ),
+            (0, 0),
+        )
+        self.assertFalse(self.manager.feedback_buffer)
 
     def test_status_seven_is_accepted_and_counted_as_a_success(self):
         """
@@ -335,7 +372,7 @@ class TestProxyManager(ProxyManagerTestBase):
         self.manager.source_stats["source1"] = {}
         
         # Should not raise
-        self.manager.process_feedback("source1", "http://unknown:80", 200)
+        self.manager.process_feedback("source1", "http://unknown:80", 100)
 
     # ========== Source Management Tests ==========
     
@@ -610,7 +647,7 @@ class TestIssue13PoolQuality(ProxyManagerTestBase):
         for _ in range(20):
             selected = self.manager.get_proxy("source1")
             handed_out.add(selected)
-            self.manager.process_feedback("source1", selected, 200)
+            self.manager.process_feedback("source1", selected, 100)
 
         self.assertNotIn(dead, handed_out)
         self.assertEqual(handed_out, {alive})
@@ -1218,7 +1255,7 @@ class TestReviewRegressions(ProxyManagerTestBase):
         url = "http://1.1.1.1:80"
         self.manager.source_stats["source1"] = {url: self.manager._get_new_proxy_stat()}
 
-        self.manager.process_feedback("source1", url, 200, response_time_ms="fast")
+        self.manager.process_feedback("source1", url, 100, response_time_ms="fast")
 
         stat = self.manager.source_stats["source1"][url]
         self.assertIsNone(stat["avg_latency_ms"])
@@ -1253,18 +1290,17 @@ class TestReviewRegressions(ProxyManagerTestBase):
         pm.trust_proxy_headers = False
         pm.trusted_proxy_ips = []
         pm.lock = threading.RLock()
-        pm.is_valid_feedback_status.return_value = True
         client = create_app(pm).test_client()
 
         bad_payloads = [
-            {"source": "s", "proxy": "p", "status": 200, "response_time_ms": "fast"},
-            {"source": "s", "proxy": "p", "status": 200, "response_time_ms": -1},
-            {"source": "s", "proxy": "p", "status": 200, "response_time_ms": float("nan")},
+            {"source": "s", "proxy": "p", "status": 100, "response_time_ms": "fast"},
+            {"source": "s", "proxy": "p", "status": 100, "response_time_ms": -1},
+            {"source": "s", "proxy": "p", "status": 100, "response_time_ms": float("nan")},
             {"source": "s", "proxy": "p", "status": True},          # bool is not an int here
-            {"source": "", "proxy": "p", "status": 200},
-            {"source": 5, "proxy": "p", "status": 200},
-            {"source": "s", "proxy": None, "status": 200},
-            {"source": "s", "proxy": "p", "status": 200, "failure_kind": 7},
+            {"source": "", "proxy": "p", "status": 100},
+            {"source": 5, "proxy": "p", "status": 100},
+            {"source": "s", "proxy": None, "status": 100},
+            {"source": "s", "proxy": "p", "status": 100, "failure_kind": 7},
         ]
         for payload in bad_payloads:
             with self.subTest(payload=payload):
@@ -1277,7 +1313,7 @@ class TestReviewRegressions(ProxyManagerTestBase):
 
         r = client.post(
             "/feedback",
-            json={"source": "s", "proxy": "p", "status": 200, "response_time_ms": 12.5},
+            json={"source": "s", "proxy": "p", "status": 100, "response_time_ms": 12.5},
             environ_overrides={"REMOTE_ADDR": "127.0.0.1"},
         )
         self.assertEqual(r.status_code, 200)
@@ -1792,7 +1828,7 @@ class TestSecondReviewRegressions(ProxyManagerTestBase):
 
     def _aged_single_failure(self, manager, url, hours):
         """One real failure through process_feedback(), then aged by `hours`."""
-        manager.process_feedback("source1", url, 500, None, None)
+        manager.process_feedback("source1", url, 4, None, None)
         stat = manager.source_stats["source1"][url]
         old = time.time() - hours * 3600
         for result in stat["recent_results"]:
@@ -1826,7 +1862,7 @@ class TestSecondReviewRegressions(ProxyManagerTestBase):
 
     def test_fresh_failure_is_still_punished(self):
         manager = self._manager_with_three_proxies()
-        manager.process_feedback("source1", "http://bad:1", 500, None, None)
+        manager.process_feedback("source1", "http://bad:1", 4, None, None)
         stat = manager.source_stats["source1"]["http://bad:1"]
         self.assertLess(manager._refresh_score(stat, "source1"), 35)
 
@@ -1949,7 +1985,7 @@ class TestSecondReviewRegressions(ProxyManagerTestBase):
         proxy_url = "http://bounded:80"
         manager.source_stats["source1"][proxy_url] = manager._get_new_proxy_stat()
         manager.process_feedback(
-            "source1", proxy_url, 200, response_time_ms=1001
+            "source1", proxy_url, 100, response_time_ms=1001
         )
         self.assertIsNone(
             manager.source_stats["source1"][proxy_url]["recent_results"][-1][2]
@@ -2008,7 +2044,7 @@ class TestFeedbackLatencyBoundary(unittest.TestCase):
             json={
                 "source": "source1",
                 "proxy": "http://1.2.3.4:80",
-                "status": 200,
+                "status": 100,
                 "response_time_ms": resp_time,
             },
             environ_overrides={"REMOTE_ADDR": "127.0.0.1"},
@@ -2036,7 +2072,6 @@ class TestFeedbackLatencyBoundary(unittest.TestCase):
         self.assertIn("1000", response.get_json()["error"])
 
     def test_ordinary_latency_still_accepted(self):
-        self.mock_proxy_manager.is_valid_feedback_status.return_value = True
         self.assertEqual(self._post(250).status_code, 200)
 
 
@@ -2409,7 +2444,7 @@ class TestIssue23OnlineReliability(ProxyManagerTestBase):
             self.manager._get_new_proxy_stat("source2")
         )
 
-        self.manager.process_feedback("source1", proxy, 500)
+        self.manager.process_feedback("source1", proxy, 4)
 
         self.assertAlmostEqual(
             self.manager.source_stats["source1"][proxy]["score"], 3.5, places=6
@@ -2605,7 +2640,7 @@ class TestIssue23OutageGuard(ProxyManagerTestBase):
 
     def test_broad_outage_rolls_back_window_pauses_then_recovers(self):
         for url in self.urls:
-            self.manager.process_feedback("source1", url, 200)
+            self.manager.process_feedback("source1", url, 100)
         healthy_scores = {
             url: self.manager.source_stats["source1"][url]["score"]
             for url in self.urls
@@ -2614,7 +2649,7 @@ class TestIssue23OutageGuard(ProxyManagerTestBase):
             self.manager._outage_state("source1")["previous_window_healthy"]
         )
 
-        self.manager.process_feedback("source1", self.urls[0], 500)
+        self.manager.process_feedback("source1", self.urls[0], 4)
         candidate_backup = Path(self.tmp_dir) / "outage-candidate.json"
         self.manager.stats_backup_path = candidate_backup
         self.assertEqual(self.manager.backup_stats()["status"], "success")
@@ -2625,7 +2660,7 @@ class TestIssue23OutageGuard(ProxyManagerTestBase):
 
         with patch("src.core.proxy_manager.logger.error") as outage_log:
             for url in self.urls[1:]:
-                self.manager.process_feedback("source1", url, 500)
+                self.manager.process_feedback("source1", url, 4)
         self.assertTrue(
             any("activated" in str(call.args[0]) for call in outage_log.call_args_list)
         )
@@ -2644,7 +2679,7 @@ class TestIssue23OutageGuard(ProxyManagerTestBase):
         self.assertEqual((aggregate["success"], aggregate["failure"]), (4, 4))
 
         for url in self.urls:
-            self.manager.process_feedback("source1", url, 200)
+            self.manager.process_feedback("source1", url, 100)
         self.assertFalse(self.manager._outage_state("source1")["active"])
         self.assertEqual(
             {
@@ -2655,7 +2690,7 @@ class TestIssue23OutageGuard(ProxyManagerTestBase):
         )
 
         before = self.manager.source_stats["source1"][self.urls[0]]["score"]
-        self.manager.process_feedback("source1", self.urls[0], 200)
+        self.manager.process_feedback("source1", self.urls[0], 100)
         self.assertGreater(
             self.manager.source_stats["source1"][self.urls[0]]["score"], before
         )
@@ -2663,7 +2698,7 @@ class TestIssue23OutageGuard(ProxyManagerTestBase):
     def test_uniformly_poor_cold_start_never_arms_guard(self):
         for _ in range(2):
             for url in self.urls:
-                self.manager.process_feedback("source1", url, 500)
+                self.manager.process_feedback("source1", url, 4)
         state = self.manager._outage_state("source1")
         self.assertFalse(state["active"])
         self.assertFalse(state["previous_window_healthy"])
@@ -2840,7 +2875,7 @@ class TestIssue23ReviewFixes(ProxyManagerTestBase):
         self.assertTrue(self.manager._outage_state("source1")["active"])
         other = dict(self.manager.source_stats["source2"][urls[0]])
 
-        self.manager.process_feedback("source1", urls[0], 0, None, "dead")
+        self.manager.process_feedback("source1", urls[0], 4, None, "dead")
 
         # The guard has judged this source unable to say anything reliable
         # about a proxy; fanning its failures out would strip reputation the
@@ -2858,7 +2893,7 @@ class TestIssue23ReviewFixes(ProxyManagerTestBase):
         self.manager.active_proxies = set(urls)
         self.manager.outage_guard_enabled = False
 
-        self.manager.process_feedback("source1", urls[0], 0, None, "dead")
+        self.manager.process_feedback("source1", urls[0], 4, None, "dead")
 
         self.assertEqual(
             self.manager.source_stats["source2"][urls[0]]["failure_count"], 1
@@ -2886,7 +2921,7 @@ class TestIssue23ReviewFixes(ProxyManagerTestBase):
             self.assertEqual(manager.get_proxy(source), proxy)
         self.assertIn("source2", manager.candidate_pools)
         self.assertIn("source2", manager.candidate_pool_built_at)
-        manager.process_feedback("source2", proxy, 200)
+        manager.process_feedback("source2", proxy, 100)
         manager._rebuild_candidate_pool("source2")
         manager.allocate_proxy("source2")
 
@@ -2934,7 +2969,7 @@ class TestIssue23ReviewFixes(ProxyManagerTestBase):
     def _window(self, urls, successes):
         for index, url in enumerate(urls):
             self.manager.process_feedback(
-                "source1", url, 200 if index < successes else 500
+                "source1", url, 100 if index < successes else 4
             )
 
     def test_guard_arms_and_fires_against_a_ten_percent_baseline(self):
@@ -2993,7 +3028,7 @@ class TestIssue23ReviewFixes(ProxyManagerTestBase):
             selected = self.manager.get_proxy("source1")
             self.assertIsNotNone(selected, "a paused source stopped serving")
             served += 1
-            self.manager.process_feedback("source1", selected, 500)
+            self.manager.process_feedback("source1", selected, 4)
 
         scores_after = {
             url: self.manager.source_stats["source1"][url]["score"] for url in urls
