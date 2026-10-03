@@ -839,7 +839,6 @@ class TestConfigurationBoundaries(ProxyManagerTestBase):
             ({"source_pool": {"reliability_slow_alpha": "0.5", "reliability_fast_alpha": "0.4"}}, "alpha ordering"),
             ({"source_pool": {"reliability_decay_half_life_hours": "0"}}, "half life"),
             ({"source_pool": {"reliability_recent_results_limit": "0"}}, "history limit"),
-            ({"source_pool": {"reliability_history_prior_weight": "-1"}}, "history weight"),
             ({"source_pool": {"outage_window_size": "0"}}, "outage window"),
             ({"source_pool": {"outage_window_size": "4", "outage_min_distinct_proxies": "5"}}, "outage distinct"),
             ({"source_pool": {"outage_healthy_baseline_ratio": "1.1"}}, "healthy ratio"),

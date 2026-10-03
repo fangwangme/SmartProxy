@@ -468,26 +468,31 @@ class TestProxyManager(ProxyManagerTestBase):
 
         self.assertAlmostEqual(score_low, score_high, places=3)
 
-    def test_counter_only_history_is_prior_shrunk_not_trusted(self):
-        """A legacy record's own score is discarded; its counters are shrunk."""
-        # Legacy stat format (no recent_results)
+    def test_counters_without_results_start_at_the_prior_but_are_kept(self):
+        """
+        Lifetime counters carry no order, so they cannot say what is recent.
+
+        1000 successes and one failure might all be from last week, or the
+        failure might be the only thing that happened today. A record with
+        nothing but counters therefore starts at the prior, however fresh its
+        last feedback and whatever score it claims, and earns its score on new
+        evidence. The counters themselves survive.
+        """
         legacy_stat = {
-            "score": 150.0,  # Old unbounded score
-            "success_count": 80,
-            "failure_count": 20,
+            "score": 150.0,
+            "success_count": 1000,
+            "failure_count": 1,
             "last_feedback_ts": time.time(),
         }
-        
+
         migrated = self.manager._migrate_legacy_stat(legacy_stat)
-        
-        # Should have new fields
-        self.assertIn("recent_results", migrated)
-        self.assertIn("avg_latency_ms", migrated)
+
         self.assertEqual(migrated["recent_results"], [])
-        
-        # Counter-only history is prior-shrunk instead of trusting score=150.
-        self.assertGreaterEqual(migrated["score"], 70)
-        self.assertLessEqual(migrated["score"], 80)
+        self.assertIn("avg_latency_ms", migrated)
+        self.assertEqual(migrated["score"], 5.0)
+        self.assertEqual(
+            (migrated["success_count"], migrated["failure_count"]), (1000, 1)
+        )
 
     def test_stale_successes_decay_toward_the_prior(self):
         """Results older than the half-life stop carrying their original weight."""
@@ -520,41 +525,6 @@ class TestProxyManager(ProxyManagerTestBase):
 
         score = self.manager._refresh_score(stat)
         self.assertLess(score, 5.0)
-
-    def test_aged_counter_history_decays_to_the_prior(self):
-        """Counter-only history seeded from an old timestamp ages to the prior."""
-        import time
-
-        self.manager.reliability_decay_half_life_hours = 24
-
-        stat = self.manager._get_new_proxy_stat()
-        stat["success_count"] = 80
-        stat["failure_count"] = 20
-        stat["last_feedback_ts"] = time.time() - (10 * 24 * 3600)
-
-        score = self.manager._refresh_score(stat)
-        self.assertAlmostEqual(score, 5.0, delta=0.1)
-
-    def test_history_without_a_timestamp_seeds_at_the_prior_but_keeps_counters(self):
-        """
-        Unknown evidence age is unbounded age, not fresh evidence.
-
-        Deliberate, and the conservative direction: the score drives
-        exploitation weight, so a record that cannot be dated is aged to the
-        prior rather than trusted. The raw counters survive - only the derived
-        estimator, which genuinely cannot be reconstructed without a date, is
-        reset - and the proxy re-enters as a discovery candidate, so it earns
-        its way back on fresh evidence.
-        """
-        stat = self.manager._get_new_proxy_stat()
-        stat["success_count"] = 95
-        stat["failure_count"] = 5
-        stat["last_feedback_ts"] = None
-
-        score = self.manager._refresh_score(stat)
-
-        self.assertEqual(score, 5.0)
-        self.assertEqual((stat["success_count"], stat["failure_count"]), (95, 5))
 
 class TestIssue13PoolQuality(ProxyManagerTestBase):
     """
@@ -885,9 +855,13 @@ class TestIssue13PoolQuality(ProxyManagerTestBase):
         self.manager.max_pool_size = 2
         self.manager.stats_pool_max_multiplier = 1
         punished = "http://punished:80"
+        punished_stat = self.manager._get_new_proxy_stat()
+        now = time.time()
+        for index in range(30):
+            self.manager._update_reliability_state(punished_stat, False, now - 30 + index)
+        punished_stat.update(failure_count=30, last_feedback_ts=now)
         self.manager.source_stats["source1"] = {
-            punished: self.manager._get_new_proxy_stat()
-            | {"score": 20.0, "failure_count": 30, "last_feedback_ts": time.time()},
+            punished: punished_stat,
             "http://never_used_a:80": self.manager._get_new_proxy_stat(),
             "http://never_used_b:80": self.manager._get_new_proxy_stat(),
         }
@@ -1833,24 +1807,6 @@ class TestSecondReviewRegressions(ProxyManagerTestBase):
         stat = manager.source_stats["source1"]["http://bad:1"]
         self.assertLess(manager._refresh_score(stat, "source1"), 35)
 
-    def test_never_observed_proxy_still_uses_historical_counters(self):
-        """The recovery rule must not swallow the restored-backup fallback."""
-        manager = self._manager_with_three_proxies()
-        stat = manager._get_new_proxy_stat()
-        stat.update(
-            {
-                "success_count": 9,
-                "failure_count": 1,
-                "recent_results": [],
-                "last_feedback_ts": time.time(),
-            }
-        )
-
-        expected = (9 + 5 * 0.05) / (10 + 5) * 100
-        self.assertAlmostEqual(
-            manager._refresh_score(stat, "source1"), expected, places=1
-        )
-
     def test_code_fallback_matches_the_shipped_default(self):
         merged = {s: dict(o) for s, o in self.config_dict.items()}
         del merged["source_pool"]["candidate_pool_size"]
@@ -2404,25 +2360,6 @@ class TestIssue23OnlineReliability(ProxyManagerTestBase):
             before_success = stat["score"]
             self.manager._update_reliability_state(stat, True, now)
             self.assertGreater(stat["score"], before_success)
-
-    def test_historical_all_failure_record_does_not_bypass_baseline(self):
-        """
-        When restoring counter-only history without a recent window, an all-failure
-        historical record (e.g. 0 successes, 10 failures) must not receive a 10.0 floor
-        and must score strictly below the baseline.
-        """
-        stat = self.manager._get_new_proxy_stat("source1")
-        stat.update({
-            "success_count": 0,
-            "failure_count": 10,
-            "recent_results": [],
-            "last_feedback_ts": time.time(),
-        })
-
-        score = self.manager._refresh_score(stat, "source1")
-        print(f"\n[Historical all-failure counter] score: {score:.2f} vs prior: 5.0")
-        self.assertLess(score, 5.0)
-        self.assertLess(score, self.manager._baseline_score("source1"))
 
     def test_stale_estimator_state_converges_toward_fixed_prior(self):
         now = time.time()

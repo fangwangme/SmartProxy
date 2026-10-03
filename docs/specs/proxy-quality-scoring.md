@@ -90,12 +90,10 @@ of evidence: old good and bad state both converge on the initial score.
 `recent_results` is retained as bounded raw replay data. It is not a separate
 sliding-window scorer. It is normalized once on the way in - at the API
 boundary, by `restore_stats()`, and by `_migrate_legacy_stat()` - and appended
-in timestamp order. Counter-only history is seeded from a lifetime
-success rate shrunk toward `p0`, then aged from its last feedback timestamp. A
-record whose timestamp is missing or unusable is aged to the prior instead of
-trusted as fresh: unknown age is unbounded age, and the score decides pool
-membership and ordering. The raw counters survive either way, so the proxy
-earns its score back on fresh evidence while remaining servable throughout.
+in timestamp order. A record with lifetime counters but neither estimators nor
+`recent_results` starts at `p0`: counters carry no order, so they cannot say
+which outcomes are recent. The counters are kept, and the proxy earns its score
+on fresh evidence while remaining servable throughout.
 
 ## 4. Candidate pool selection
 

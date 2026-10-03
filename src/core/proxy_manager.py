@@ -609,9 +609,6 @@ class ProxyManager:
         self.reliability_recent_results_limit = self._cfg_int(
             "source_pool", "reliability_recent_results_limit", 100, low=1
         )
-        self.reliability_history_prior_weight = self._cfg_float(
-            "source_pool", "reliability_history_prior_weight", 5.0, low=0.0
-        )
 
         # Outage guard thresholds are relative to the source\'s own observed
         # success rate, never absolute. An absolute "healthy window >= 50%" gate
@@ -2955,7 +2952,6 @@ class ProxyManager:
             last_feedback_ts = max(result[0] for result in normalized_results)
         stat["last_feedback_ts"] = last_feedback_ts
 
-        total = success_count + failure_count
         stat["handout_count"] = nonnegative_int(stat.get("handout_count", 0))
         stat["last_handed_out_ts"] = self._coerce_timestamp(
             stat.get("last_handed_out_ts"), now_ts
@@ -2980,9 +2976,9 @@ class ProxyManager:
             self._age_reliability_state(stat, now_ts)
         elif normalized_results:
             self._replay_reliability_results(stat, normalized_results, now_ts)
-        elif total:
-            self._seed_reliability_from_history(stat, now_ts)
         else:
+            # Counters alone say nothing about which outcomes are recent, so
+            # they are kept as history but never turned into a score.
             stat["quality_slow"] = self.reliability_prior
             stat["quality_fast"] = self.reliability_prior
             stat["quality_updated_ts"] = None
@@ -3070,34 +3066,6 @@ class ProxyManager:
         stat["quality_updated_ts"] = None
         for event_ts, outcome, _ in sorted(results, key=lambda result: result[0]):
             self._update_reliability_state(stat, bool(outcome), event_ts)
-        self._age_reliability_state(stat, now_ts)
-
-    def _seed_reliability_from_history(self, stat: Dict, now_ts: float):
-        successes = int(stat.get("success_count", 0) or 0)
-        failures = int(stat.get("failure_count", 0) or 0)
-        total = successes + failures
-        if total <= 0:
-            seeded = self.reliability_prior
-        else:
-            prior_weight = self.reliability_history_prior_weight
-            seeded = (
-                successes + prior_weight * self.reliability_prior
-            ) / (total + prior_weight)
-        # Decide the anchor first: a seeded estimator is only meaningful if we
-        # know how old the evidence behind it is. An absent or unusable
-        # last_feedback_ts is unbounded age, not recent evidence, so the record
-        # is aged all the way to the prior rather than trusted as fresh. The
-        # raw counters are kept either way - it is the derived estimator that
-        # cannot be reconstructed without a date.
-        anchor_ts = self._coerce_timestamp(stat.get("last_feedback_ts"), now_ts)
-        if anchor_ts is None:
-            stat["quality_slow"] = self.reliability_prior
-            stat["quality_fast"] = self.reliability_prior
-            stat["quality_updated_ts"] = now_ts
-        else:
-            stat["quality_slow"] = seeded
-            stat["quality_fast"] = seeded
-            stat["quality_updated_ts"] = anchor_ts
         self._age_reliability_state(stat, now_ts)
 
     def _refresh_score(self, stat: Dict, source: str = None) -> float:
