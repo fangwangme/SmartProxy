@@ -52,11 +52,47 @@ showed the tie it served does not occur - across 8000 stored stats only two
 groups shared a score, and neither held distinct latencies - so a 1ms success
 and a 30s success are now worth exactly the same to selection.
 
+## 1a. Feedback protocol
+
+`status` is the clients' own task status, not an HTTP code. An audit of every
+client (2026-10-03: the fiverr universal scraper, TheGamesDB, and an old
+tripadvisor copy) found that none forwards the target's HTTP status. Each
+reports the status its scraper already stores on the task:
+
+| `status` | Client meaning | Scored |
+|---|---|---|
+| `100` | page fetched and parsed | success |
+| `7` | page fetched, expected data missing | success |
+| `4` | request failed (connection, timeout, proxy/TLS error, non-2xx) | failure |
+| any other integer | outside the protocol | not scored |
+
+`7` is a success because the question feedback answers is whether the *proxy*
+delivered, and it did. Whether the page held what the task wanted is the
+task's concern. A block page that arrives with HTTP 200 also lands in `7`,
+which is the client's call to make.
+
+Earlier versions read `status` three ways at once: `0`/`4` as failures,
+`1`/`2`/`3` as legacy successes, and any HTTP `1xx`-`5xx` by range. `100` was
+scored correctly only because it fell in the HTTP `1xx` range. `7` matched no
+rule and was refused with `400`, so those reports were silently lost. `0`
+meant "timeout" to the service but "page fetched, nothing parsed" to
+tripadvisor, so working proxies were scored as failing.
+
+An unknown status is accepted, not refused. A `400` fails the client's report
+and teaches nothing, while guessing a meaning scores the proxy on a value
+nobody defined. So the report is accepted and closes its handout, but moves
+neither the score nor the per-minute counts. The response says
+`"scored": false`, the first occurrence per source and status is logged, and
+each one is counted in `smartproxy_feedback_accepted_total{outcome="unscored"}`.
+A client that adopts a new status shows up there rather than in the scores.
+tripadvisor's `0`/`10`/`11` sit here until that scraper maps them to
+`100`/`7`/`4` itself.
+
 ## 2. Two-speed online reliability
 
 Each proxy has independent per-source `quality_slow` and `quality_fast`
 estimators. Both start at a fixed configured prior `p0` (default `0.05`) and
-update for every accepted client result:
+update for every scored client result (1a):
 
 ```text
 slow = (1 - slow_alpha) * slow + slow_alpha * outcome
@@ -98,7 +134,7 @@ on fresh evidence while remaining servable throughout.
 ## 4. Candidate pool selection
 
 Ranking is the only mechanism. Each source keeps a fixed-size candidate pool,
-rebuilt on a timer; a handout is a uniform random pick from that pool.
+rebuilt on a timer; a handout is a score-weighted pick from that pool (4.3).
 
 ```text
 every pool_refresh_seconds, over every proxy the router can see (4.1):
@@ -231,9 +267,9 @@ filling the pool. Neither may remove a proxy from it.
   matters: with the pool drawn uniformly the client's success rate reached
   ~35% after 18 minutes, against 60-70% at the same stage before #27, while
   the 40 proxies scoring 50 or more had 93% success on their own record.
-- **The ranked tier lists** (`max_pool_size`, `top_tier_size`) are reporting
-  and the input that later weighting change would use. They are not an
-  eligibility gate and are not what `/get-proxy` reads.
+- **The ranked tier lists** (`max_pool_size`, `top_tier_size`) are reporting,
+  and the input to `selection_strategy = tiered`. They are not an eligibility
+  gate and are not what fills the pool.
 
 ### 4.4 Removed in issue #27
 
