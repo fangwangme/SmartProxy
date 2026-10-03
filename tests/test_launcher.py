@@ -144,13 +144,52 @@ class LauncherSafetyTests(unittest.TestCase):
             self.assertIn(option, args)
             self.assertGreater(float(args[args.index(option) + 1]), 0)
 
+    def test_start_detaches_with_or_without_setsid(self):
+        """
+        setsid comes from util-linux and macOS has none. Start must work
+        either way, and use it where it exists. PATH is built from scratch so
+        the result never depends on what the machine running the test has
+        installed.
+        """
+        for has_setsid in (True, False):
+            with self.subTest(setsid=has_setsid):
+                tools = self.project / f"tools-{has_setsid}"
+                tools.mkdir()
+                for name in ("cat", "date", "dirname", "mkdir", "nohup", "ps", "rm", "sleep"):
+                    (tools / name).symlink_to(shutil.which(name))
+                capture = self.project / f"setsid-{has_setsid}.txt"
+                if has_setsid:
+                    setsid = tools / "setsid"
+                    setsid.write_text(
+                        "#!/bin/bash\necho used > \"$SETSID_CAPTURE\"\nexec \"$@\"\n",
+                        encoding="utf-8",
+                    )
+                    setsid.chmod(0o755)
+                self.env["PATH"] = str(tools)
+                self.env["SETSID_CAPTURE"] = str(capture)
+
+                started = self._run("start")
+
+                self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+                pid_file = self.project / ".smart_proxy.pid"
+                pid = int(pid_file.read_text(encoding="utf-8"))
+                self._kill_if_ours(pid)
+                pid_file.unlink()
+                self.assertEqual(capture.exists(), has_setsid)
+
     def _kill_if_ours(self, pid):
+        # ps rather than /proc, which macOS does not have.
+        command_line = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            check=False,
+            capture_output=True,
+            text=True,
+        ).stdout
+        if str(self.project) not in command_line:
+            return
         try:
-            with open(f"/proc/{pid}/cmdline", "rb") as cmdline:
-                if str(self.project).encode() not in cmdline.read():
-                    return
             os.kill(pid, signal.SIGKILL)
-        except (FileNotFoundError, ProcessLookupError):
+        except ProcessLookupError:
             pass
 
     @staticmethod

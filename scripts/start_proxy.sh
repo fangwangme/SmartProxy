@@ -116,8 +116,14 @@ start_server() {
     echo " Restore Mode: $RESTORE_MODE"
     echo "=================================================="
 
-    # 使用 setsid + nohup 完全脱离当前会话，避免父会话退出时子进程被连带终止
-    nohup setsid "$PYTHON" -u -m src.main "${SERVICE_FLAGS[@]}" </dev/null >> "$LOG_FILE" 2>&1 &
+    # 使用 setsid + nohup 完全脱离当前会话，避免父会话退出时子进程被连带终止。
+    # setsid 来自 util-linux，macOS 没有；那里退回 nohup：它忽略 SIGHUP，
+    # 而非交互 shell 的后台任务本来就忽略 SIGINT/SIGQUIT。
+    if command -v setsid >/dev/null 2>&1; then
+        nohup setsid "$PYTHON" -u -m src.main "${SERVICE_FLAGS[@]}" </dev/null >> "$LOG_FILE" 2>&1 &
+    else
+        nohup "$PYTHON" -u -m src.main "${SERVICE_FLAGS[@]}" </dev/null >> "$LOG_FILE" 2>&1 &
+    fi
     echo $! > "$PID_FILE"
 
     sleep 1
