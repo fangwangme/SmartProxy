@@ -69,7 +69,7 @@ that has shipped so far came in through a pull request.
   use: `feat`, `fix`, `perf`, `chore`, `docs`.
 - Work in a git worktree under `.worktrees/<branch-name>`, not by switching
   branches in the main checkout. Each worktree needs its own `.venv`
-  (`uv sync --locked`) its own `dashboard/node_modules` (`bun install`) and
+  (`uv sync --locked`), its own `dashboard/node_modules` (`bun install`) and
   its own dashboard build (`bun run build`) — see the Development Environment section above.
 - Open a pull request against `main` with `Closes #<issue>` in the body, and
   record the verification you actually ran.
