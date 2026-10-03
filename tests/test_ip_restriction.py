@@ -18,7 +18,6 @@ class TestIPRestriction(unittest.TestCase):
         self.mock_proxy_manager.predefined_sources = set()
         self.mock_proxy_manager.dashboard_sources = set()
         self.mock_proxy_manager.is_validating = False
-        self.mock_proxy_manager.is_valid_feedback_status.return_value = True
         
         # Create Flask app
         self.app = create_app(self.mock_proxy_manager)
@@ -228,9 +227,9 @@ class TestIPRestriction(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
 
-    def test_feedback_rejects_unknown_status(self):
-        """Unknown status codes should not be counted as success."""
-        self.mock_proxy_manager.is_valid_feedback_status.return_value = False
+    def test_feedback_accepts_an_unknown_status_without_scoring_it(self):
+        """An unknown status is accepted, and the answer says it was not scored."""
+        self.mock_proxy_manager.process_feedback.return_value = False
 
         response = self.client.post(
             "/feedback",
@@ -238,7 +237,31 @@ class TestIPRestriction(unittest.TestCase):
             environ_overrides={"REMOTE_ADDR": "127.0.0.1"},
         )
 
-        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.status_code, 200)
+        self.assertIs(response.get_json()["scored"], False)
+
+    def test_local_reverse_proxy_cannot_reach_internal_endpoints(self):
+        """
+        A loopback peer carrying forwarding headers is a proxy on this host
+        relaying an outside client. Loopback alone does not open internal
+        endpoints.
+        """
+        for header in ("X-Forwarded-For", "Forwarded", "X-Real-IP"):
+            for path in ("/metrics", "/health", "/ready"):
+                with self.subTest(header=header, path=path):
+                    response = self.client.get(
+                        path,
+                        headers={header: "203.0.113.9"},
+                        environ_overrides={"REMOTE_ADDR": "127.0.0.1"},
+                    )
+                    self.assertEqual(response.status_code, 403)
+        response = self.client.post(
+            "/reload-sources",
+            headers={"X-Forwarded-For": "203.0.113.9"},
+            environ_overrides={"REMOTE_ADDR": "127.0.0.1"},
+        )
+        self.assertEqual(response.status_code, 403)
+        self.mock_proxy_manager.reload_sources.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()

@@ -5,7 +5,10 @@ import argparse
 import signal
 import threading
 import configparser
-from waitress import serve
+import logging
+import select
+from waitress import wasyncore
+from waitress.server import create_server
 
 # Local imports
 from src.utils.logger import logger, setup_logging
@@ -34,6 +37,78 @@ def load_proxy_manager(config_path: str, restore_mode: str = "normal") -> ProxyM
             "Cold start detected; the scheduler will run one initial fetch and validation cycle."
         )
     return manager
+
+
+def waitress_options(proxy_manager) -> dict:
+    """
+    The production server's settings, in one place so tests run the same ones.
+
+    - asyncore_use_poll: poll(), not waitress's default select(). select()
+      cannot watch a descriptor numbered 1024 or above and raises straight out
+      of the serving loop when it meets one. The database pool, validation
+      sockets and fetcher pipes share that numbering, so a connection_limit
+      sized for real traffic crosses the line long before its own count does.
+    - clear_untrusted_proxy_headers=False: by default waitress strips
+      forwarding headers before the app sees them, which silently disabled
+      [server] trust_proxy_headers / trusted_proxy_ips in production. Waitress's
+      own trusted_proxy takes a single address; the app's list is the one
+      authority, and it only honours forwarding headers from a peer on it.
+    """
+    return {
+        "host": "0.0.0.0",
+        "port": proxy_manager.server_port,
+        "threads": proxy_manager.production_threads,
+        "connection_limit": proxy_manager.server_connection_limit,
+        "asyncore_use_poll": True,
+        "clear_untrusted_proxy_headers": False,
+    }
+
+def _poll_once(timeout, map):
+    """
+    waitress's poll2(), without subscribing to POLLPRI.
+
+    POLLPRI signals TCP urgent data, which HTTP never sends. macOS poll()
+    nevertheless reports it alongside POLLHUP whenever a peer closes its
+    connection, and waitress answers a POLLPRI that carries no socket error by
+    logging "unhandled incoming priority event" - once for every request.
+    Not asking for the event means the kernel never reports it; POLLHUP,
+    POLLERR and POLLNVAL are reported regardless and still close the channel.
+    """
+    pollster = select.poll()
+    for fd, obj in list(map.items()):
+        flags = 0
+        if obj.readable():
+            flags |= select.POLLIN
+        # accepting sockets should not be writable
+        if obj.writable() and not obj.accepting:
+            flags |= select.POLLOUT
+        if flags:
+            pollster.register(fd, flags)
+    for fd, flags in pollster.poll(None if timeout is None else int(timeout * 1000)):
+        obj = map.get(fd)
+        if obj is not None:
+            wasyncore.readwrite(obj, flags)
+
+
+class _PollLoop:
+    """The wasyncore surface BaseWSGIServer.run() uses, on _poll_once()."""
+
+    dispatcher = wasyncore.dispatcher
+
+    @staticmethod
+    def loop(timeout=30.0, use_poll=True, map=None, count=None):
+        while map and (count is None or count > 0):
+            _poll_once(timeout, map)
+            if count is not None:
+                count -= 1
+
+
+def create_production_server(app, proxy_manager, **overrides):
+    """The waitress server main() runs; tests build theirs here too."""
+    server = create_server(app, **(waitress_options(proxy_manager) | overrides))
+    server.asyncore = _PollLoop
+    return server
+
 
 def main():
     # Parse command line arguments
@@ -85,12 +160,10 @@ def main():
             app.run(host="0.0.0.0", port=proxy_manager.server_port, debug=False)
         else:
             # One process keeps lease and scoring state coherent.
-            serve(
-                app,
-                host="0.0.0.0",
-                port=proxy_manager.server_port,
-                threads=proxy_manager.production_threads,
-            )
+            logging.basicConfig()  # what waitress.serve() did for its own logger
+            server = create_production_server(app, proxy_manager)
+            server.print_listen("Serving on http://{}:{}")
+            server.run()
     finally:
         if not shutdown_started.is_set():
             shutdown_started.set()

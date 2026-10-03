@@ -45,6 +45,23 @@ def _is_loopback_address(value: str) -> bool:
     return bool(mapped and mapped.is_loopback)
 
 
+# Headers a reverse proxy adds. A loopback request carrying any of them is a
+# proxy on this host relaying someone else, not a caller on this host.
+FORWARDING_HEADERS = (
+    "X-Forwarded-For",
+    "Forwarded",
+    "X-Real-IP",
+    "X-Forwarded-Host",
+    "X-Forwarded-Proto",
+    "X-Forwarded-Port",
+    "X-Forwarded-By",
+)
+
+
+def _is_forwarded() -> bool:
+    return any(request.headers.get(name) is not None for name in FORWARDING_HEADERS)
+
+
 def _get_client_ip(proxy_manager: ProxyManager) -> str:
     """Resolve the client IP, trusting proxy headers only from configured proxies."""
     remote_addr = request.remote_addr or ""
@@ -107,7 +124,13 @@ def create_app(proxy_manager: ProxyManager):
         client_ip = _get_client_ip(proxy_manager)
 
         if path in INTERNAL_ONLY_ENDPOINTS:
-            if not _is_loopback_address(remote_addr):
+            # Loopback is necessary, not sufficient. A reverse proxy on this
+            # host also connects from loopback while relaying an outside
+            # client, and it says so with forwarding headers - which a genuine
+            # local caller (the launcher's curl, a local scraper) never sends.
+            # Forwarded requests are refused whatever the trust settings: these
+            # endpoints are for this host, not for anyone behind a proxy.
+            if not _is_loopback_address(remote_addr) or _is_forwarded():
                 logger.warning(
                     "Unauthorized internal API access attempt: path={}",
                     request.path,
@@ -184,6 +207,7 @@ def create_app(proxy_manager: ProxyManager):
             
             total_success = proxy_manager.accepted_feedback_success_total
             total_failure = proxy_manager.accepted_feedback_failure_total
+            total_unscored = proxy_manager.accepted_feedback_unscored_total
             unmatched_total = proxy_manager.unmatched_feedback_total
             outage_metrics = [
                 (
@@ -232,6 +256,7 @@ smartproxy_sources_total {sources_count}
 # TYPE smartproxy_feedback_accepted_total counter
 smartproxy_feedback_accepted_total{{outcome="success"}} {total_success}
 smartproxy_feedback_accepted_total{{outcome="failure"}} {total_failure}
+smartproxy_feedback_accepted_total{{outcome="unscored"}} {total_unscored}
 
 # HELP smartproxy_feedback_unmatched_total Accepted feedback with no outstanding handout to close
 # TYPE smartproxy_feedback_unmatched_total counter
@@ -265,7 +290,7 @@ smartproxy_backup_duration_seconds {backup_duration:.6f}
 # TYPE smartproxy_manager_lock_hold_seconds gauge
 smartproxy_manager_lock_hold_seconds {manager_lock_duration:.6f}
 
-# HELP smartproxy_plan_refresh_duration_seconds Duration of the most recent serving-plan refresh
+# HELP smartproxy_plan_refresh_duration_seconds Duration of the most recent candidate-pool refresh
 # TYPE smartproxy_plan_refresh_duration_seconds gauge
 smartproxy_plan_refresh_duration_seconds {plan_refresh_duration:.6f}
 """
@@ -380,19 +405,19 @@ smartproxy_plan_refresh_duration_seconds {plan_refresh_duration:.6f}
             )
         if failure_kind is not None and not isinstance(failure_kind, str):
             return jsonify({"error": "'failure_kind' must be a string."}), 400
-        if not proxy_manager.is_valid_feedback_status(status_code):
-            return (
-                jsonify(
-                    {
-                        "error": "Invalid feedback status. Use 0/4 for legacy failures, 1/2/3 or HTTP 1xx-3xx for success, and HTTP 4xx-5xx for failure."
-                    }
-                ),
-                400,
-            )
-
-        proxy_manager.process_feedback(
+        scored = proxy_manager.process_feedback(
             source, proxy_url, status_code, resp_time, failure_kind
         )
+        if scored is False:
+            # Outside the protocol: accepted so the client's report does not
+            # fail, but nothing was scored. Say so, so the client can see it.
+            return jsonify(
+                {
+                    "message": "Feedback received; status not scored.",
+                    "scored": False,
+                    "hint": "Use 100 (fetched) or 7 (fetched, no data) for success and 4 for failure.",
+                }
+            )
         return jsonify({"message": "Feedback received."})
 
     @app.route("/reload-sources", methods=["POST"])

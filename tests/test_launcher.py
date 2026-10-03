@@ -100,6 +100,98 @@ class LauncherSafetyTests(unittest.TestCase):
         self.assertEqual(capture.read_text(encoding="utf-8"), "http://localhost:7123/backup-stats")
         self.assertEqual(list((self.project / "tmp").iterdir()), [])
 
+    def test_stop_still_signals_the_service_when_the_backup_request_times_out(self):
+        """
+        A service that accepts the pre-stop backup request and never answers
+        must not keep stop from reaching the signal. The request has a finite
+        budget; running out of it carries on with the controlled shutdown.
+        """
+        (self.project / ".venv" / "bin" / "python").write_text(
+            "#!/bin/bash\n"
+            "if [ \"$1\" = \"-c\" ]; then\n"
+            "  case \"$2\" in *shutdown_deadline*) echo 3 ;; *) echo 7123 ;; esac\n"
+            "  exit 0\n"
+            "fi\n"
+            "while true; do sleep 0.1; done\n",
+            encoding="utf-8",
+        )
+        tools = self.project / "tools"
+        tools.mkdir()
+        capture = self.project / "curl-args.txt"
+        curl = tools / "curl"
+        # curl's own exit status for "operation timed out".
+        curl.write_text(
+            "#!/bin/bash\nprintf '%s\\n' \"$@\" > \"$CURL_CAPTURE\"\nexit 28\n",
+            encoding="utf-8",
+        )
+        curl.chmod(0o755)
+        self.env["PATH"] = f"{tools}:{self.env['PATH']}"
+        self.env["CURL_CAPTURE"] = str(capture)
+
+        started = self._run("start")
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        pid = int((self.project / ".smart_proxy.pid").read_text(encoding="utf-8"))
+        self.addCleanup(self._kill_if_ours, pid)
+
+        stopped = self._run("stop")
+
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertIn("timed out", stopped.stdout)
+        self.assertIn("SmartProxy stopped.", stopped.stdout)
+        self.assertFalse((self.project / ".smart_proxy.pid").exists())
+        args = capture.read_text(encoding="utf-8").split()
+        for option in ("--connect-timeout", "--max-time"):
+            self.assertIn(option, args)
+            self.assertGreater(float(args[args.index(option) + 1]), 0)
+
+    def test_start_detaches_with_or_without_setsid(self):
+        """
+        setsid comes from util-linux and macOS has none. Start must work
+        either way, and use it where it exists. PATH is built from scratch so
+        the result never depends on what the machine running the test has
+        installed.
+        """
+        for has_setsid in (True, False):
+            with self.subTest(setsid=has_setsid):
+                tools = self.project / f"tools-{has_setsid}"
+                tools.mkdir()
+                for name in ("cat", "date", "dirname", "mkdir", "nohup", "ps", "rm", "sleep"):
+                    (tools / name).symlink_to(shutil.which(name))
+                capture = self.project / f"setsid-{has_setsid}.txt"
+                if has_setsid:
+                    setsid = tools / "setsid"
+                    setsid.write_text(
+                        "#!/bin/bash\necho used > \"$SETSID_CAPTURE\"\nexec \"$@\"\n",
+                        encoding="utf-8",
+                    )
+                    setsid.chmod(0o755)
+                self.env["PATH"] = str(tools)
+                self.env["SETSID_CAPTURE"] = str(capture)
+
+                started = self._run("start")
+
+                self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+                pid_file = self.project / ".smart_proxy.pid"
+                pid = int(pid_file.read_text(encoding="utf-8"))
+                self._kill_if_ours(pid)
+                pid_file.unlink()
+                self.assertEqual(capture.exists(), has_setsid)
+
+    def _kill_if_ours(self, pid):
+        # ps rather than /proc, which macOS does not have.
+        command_line = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            check=False,
+            capture_output=True,
+            text=True,
+        ).stdout
+        if str(self.project) not in command_line:
+            return
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
     @staticmethod
     def _terminate(process):
         if process.poll() is None:

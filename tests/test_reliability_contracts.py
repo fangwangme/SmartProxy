@@ -2,7 +2,9 @@ import asyncio
 import copy
 import importlib
 import json
+import os
 import sys
+import threading
 import time
 import unittest
 import socket
@@ -121,24 +123,23 @@ class ValidationOutageContractTests(ProxyManagerTestBase):
         self.assertEqual(metadata["healthy_targets"], [True, True])
         self.assertEqual(([row["id"] for row in successes], failures), ([1], []))
 
-    def test_cycle_preserves_revalidation_and_advances_new_candidate(self):
-        old_proxy = "http://192.0.2.10:80"
-        self.manager.active_proxies = {old_proxy}
+    def test_an_all_failure_batch_is_recorded_like_any_other(self):
+        """
+        Every completed check is written, however the batch as a whole went.
+
+        Withholding the results of a batch in which nothing passed - on the
+        theory that the validation target must be down - left the timestamps
+        and attempt counts of the oldest rows untouched, so the oldest-first
+        queues handed the same rows to every following cycle: a batch of dead
+        proxies at the head of the queue kept every row behind it from ever
+        being checked, and a live proxy that died stayed active. Serving does
+        not depend on is_active any more, so an unreachable target costs
+        ranking signal - until the failed-proxy queue reaches those rows
+        again - never supply.
+        """
         batch = [
-            {
-                "id": 1,
-                "protocol": "http",
-                "ip": "192.0.2.11",
-                "port": 80,
-                "_validation_origin": "new",
-            },
-            {
-                "id": 2,
-                "protocol": "http",
-                "ip": "192.0.2.10",
-                "port": 80,
-                "_validation_origin": "active",
-            },
+            {"id": 1, "protocol": "http", "ip": "192.0.2.11", "port": 80},
+            {"id": 2, "protocol": "http", "ip": "192.0.2.10", "port": 80},
         ]
         self.manager.validation_supplement_threshold = 0
 
@@ -150,7 +151,7 @@ class ValidationOutageContractTests(ProxyManagerTestBase):
                 AsyncMock(
                     return_value=(
                         [],
-                        [],
+                        [1, 2],
                         {"quorum_healthy": False, "healthy_targets": [False]},
                     )
                 ),
@@ -160,11 +161,12 @@ class ValidationOutageContractTests(ProxyManagerTestBase):
             self.manager._run_validation_cycle()
 
         self.mock_db_instance.batch_update_proxy_results.assert_called_once_with(
-            [], [1], self.manager.validation_window_minutes
+            [], [1, 2], self.manager.validation_window_minutes
         )
-        sync.assert_not_called()
-        self.assertEqual(self.manager.active_proxies, {old_proxy})
-        self.assertIsNone(self.manager.last_validation_success_ts)
+        sync.assert_called_once()
+        self.assertIsNotNone(self.manager.last_validation_success_ts)
+        self.assertFalse(self.manager.last_validation_quorum_healthy)
+        self.assertFalse(self.manager.is_validating)
 
         self.mock_db_instance.batch_update_proxy_results.reset_mock()
         recovered = [
@@ -193,6 +195,101 @@ class ValidationOutageContractTests(ProxyManagerTestBase):
         )
         sync.assert_called_once()
         self.assertIsNotNone(self.manager.last_validation_success_ts)
+
+    def test_a_task_that_ends_without_a_verdict_is_not_recorded(self):
+        """
+        Only a finished check is a result. A task that raised - cancelled, or
+        broken past the per-proxy handlers - stays queued for a later cycle
+        instead of being written as a failure it never measured.
+        """
+        finished = {
+            "id": 1,
+            "success": True,
+            "latency": 10,
+            "anonymity": "elite",
+            "target_results": [{"target_index": 0, "success": True}],
+        }
+        for unfinished in (RuntimeError("injected"), asyncio.CancelledError()):
+            with self.subTest(unfinished=type(unfinished).__name__):
+                successes, failures, metadata = self._batch(
+                    [finished, unfinished],
+                    ["https://validation.invalid/echo"],
+                    1,
+                )
+
+                self.assertEqual([row["id"] for row in successes], [1])
+                self.assertEqual(failures, [])
+                self.assertTrue(metadata["quorum_healthy"])
+
+    def test_a_batch_in_which_no_check_finished_is_not_reported_as_validated(self):
+        """Nothing recorded is not a validation: readiness must not count it."""
+        batch = [{"id": 1, "protocol": "http", "ip": "192.0.2.12", "port": 80}]
+        self.manager.validation_supplement_threshold = 0
+
+        with (
+            patch.object(self.manager, "_collect_validation_batch", return_value=batch),
+            patch.object(
+                self.manager,
+                "_validate_proxy_async",
+                AsyncMock(side_effect=asyncio.CancelledError()),
+            ),
+            patch.object(self.manager, "_sync_and_select_top_proxies"),
+        ):
+            self.manager._run_validation_cycle()
+
+        self.mock_db_instance.batch_update_proxy_results.assert_not_called()
+        self.assertIsNone(self.manager.last_validation_success_ts)
+        self.assertFalse(self.manager.is_validating)
+
+    def test_a_reload_mid_batch_applies_from_the_next_batch(self):
+        """
+        The requests and the summary of their results share one config copy.
+
+        A reload that shortened the target list while tasks were still
+        reporting results against the old one raised IndexError in the
+        summary, and the whole batch went unrecorded.
+        """
+        two_targets = {
+            "validator": {
+                "validation_targets": "https://one.invalid/get,https://two.invalid/get",
+                "validation_success_threshold": "2",
+            }
+        }
+        manager = self.make_manager(two_targets, name="two-targets.ini")
+        one_target = {
+            section: dict(options) for section, options in self.config_dict.items()
+        }
+        one_target["validator"]["validation_targets"] = "https://one.invalid/get"
+        both_passed = [
+            {"target_index": 0, "success": True},
+            {"target_index": 1, "success": True},
+        ]
+
+        async def validate_while_reloading(session, proxy_id, proxy_url, semaphore, settings):
+            write_config_file(self.tmp_dir, one_target, name="two-targets.ini")
+            manager.reload_sources()
+            return {
+                "id": proxy_id,
+                "success": True,
+                "latency": 10,
+                "anonymity": "elite",
+                "target_results": both_passed,
+            }
+
+        proxies = [{"id": 1, "protocol": "http", "ip": "192.0.2.5", "port": 80}]
+        with patch.object(
+            manager, "_validate_proxy_async", side_effect=validate_while_reloading
+        ):
+            successes, failures, metadata = asyncio.run(
+                manager._validate_proxies_batch_async(proxies)
+            )
+
+        self.assertEqual(([row["id"] for row in successes], failures), ([1], []))
+        self.assertEqual(metadata["successes_by_target"], [1, 1])
+        self.assertEqual(manager.validation_targets, ["https://one.invalid/get"])
+        self.assertEqual(
+            manager._validation_settings().targets, ("https://one.invalid/get",)
+        )
 
     def test_failed_validation_write_is_not_reported_as_success(self):
         batch = [{"id": 1, "protocol": "http", "ip": "192.0.2.20", "port": 80}]
@@ -223,8 +320,8 @@ class ValidationOutageContractTests(ProxyManagerTestBase):
         self.assertFalse(self.manager.is_validating)
 
 
-class TestHandoutAccountingAndPlans(ProxyManagerTestBase):
-    def _install_qualified(self, source="source1", proxy="http://192.0.2.30:80", quality=0.9):
+class TestHandoutAccountingAndPools(ProxyManagerTestBase):
+    def _install_proven(self, source="source1", proxy="http://192.0.2.30:80", quality=0.9):
         now = time.time()
         stat = self.manager._get_new_proxy_stat(source) | {
             "score": quality * 100,
@@ -241,7 +338,7 @@ class TestHandoutAccountingAndPlans(ProxyManagerTestBase):
             "bottom_tier": [],
         }
         with self.manager.lock:
-            self.manager._build_serving_plan(source)
+            self.manager._rebuild_candidate_pool(source)
         return proxy, stat
 
     def _aggregate_total(self):
@@ -252,14 +349,14 @@ class TestHandoutAccountingAndPlans(ProxyManagerTestBase):
         )
 
     def test_feedback_closes_one_handout_and_extra_reports_are_counted(self):
-        proxy, stat = self._install_qualified()
+        proxy, stat = self._install_proven()
         self.manager.allocate_proxy("source1")
         self.manager.allocate_proxy("source1")
         self.assertEqual(stat["handout_count"], 2)
         self.assertEqual(len(stat["inflight"]), 2)
 
-        self.manager.process_feedback("source1", proxy, 200)
-        self.manager.process_feedback("source1", proxy, 200)
+        self.manager.process_feedback("source1", proxy, 100)
+        self.manager.process_feedback("source1", proxy, 100)
 
         self.assertEqual(len(stat["inflight"]), 0)
         self.assertEqual(self.manager.unmatched_feedback_total, 0)
@@ -273,7 +370,7 @@ class TestHandoutAccountingAndPlans(ProxyManagerTestBase):
         # referee, so it is still scored - but it is counted, because a
         # duplicate, a late report or a wrong source is the only way to
         # produce one.
-        self.manager.process_feedback("source1", proxy, 200)
+        self.manager.process_feedback("source1", proxy, 100)
 
         self.assertEqual(self.manager.unmatched_feedback_total, 1)
         self.assertEqual(stat["success_count"], before[0] + 1)
@@ -295,9 +392,16 @@ class TestHandoutAccountingAndPlans(ProxyManagerTestBase):
 
         self.assertEqual(stat["inflight"], [])
 
-    def test_stale_exploit_member_is_tombstoned_before_handout(self):
-        proxy, stat = self._install_qualified()
-        self.manager.serving_plan_max_age_s = 60.0
+    def test_a_proxy_that_stops_scoring_well_is_still_served(self):
+        """
+        Issue #27: the pool re-ranks, it does not evict.
+
+        This replaces three tests that asserted the opposite - that a proxy
+        dropping below the prior was tombstoned out of the exploit set, demoted
+        into a trial group, or held out by a cooldown. Each of those could empty
+        the servable set, which is the defect this issue removes.
+        """
+        proxy, stat = self._install_proven()
         stat.update(
             {
                 "score": 1.0,
@@ -306,47 +410,16 @@ class TestHandoutAccountingAndPlans(ProxyManagerTestBase):
                 "recent_results": [[time.time(), False, None]],
             }
         )
-
-        self.assertIsNone(self.manager.allocate_proxy("source1"))
-        plan = self.manager.serving_plans["source1"]
-        self.assertNotIn(proxy, plan["exploit"])
-        self.assertNotIn(proxy, plan["exploit_members"])
-
-    def test_demotion_moves_from_exploit_to_trial_atomically(self):
-        proxy, stat = self._install_qualified(quality=0.06)
-        self.manager.allocate_proxy("source1")
-        self.manager.process_feedback("source1", proxy, 500)
-        plan = self.manager.serving_plans["source1"]
-
-        self.assertFalse(self.manager._is_qualified(stat))
-        self.assertNotIn(proxy, plan["exploit_members"])
-        self.assertNotIn(proxy, plan["exploit"])
-        self.assertIn(proxy, plan["members"])
-        self.assertEqual(plan["fallback"].count(proxy), 1)
-
-    def test_trial_cooldown_prevents_immediate_reinsertion(self):
-        proxy = "http://192.0.2.32:80"
-        stat = self.manager._get_new_proxy_stat("source1")
-        self.manager.source_stats["source1"][proxy] = stat
-        self.manager.active_proxies = {proxy}
-        self.manager.available_proxies["source1"] = {
-            "top_tier": [proxy],
-            "bottom_tier": [],
-        }
-        self.manager.proxy_cooldown_ms = 1000
         with self.manager.lock:
-            self.manager._build_serving_plan("source1")
+            self.manager._rebuild_candidate_pool("source1")
 
-        self.manager.allocate_proxy("source1")
-        self.manager.process_feedback("source1", proxy, 200)
+        handout = self.manager.allocate_proxy("source1")
 
-        plan = self.manager.serving_plans["source1"]
-        self.assertNotIn(proxy, plan["members"])
-        self.assertNotIn(proxy, plan["discovery"])
-        self.assertNotIn(proxy, plan["fallback"])
+        self.assertEqual(handout["proxy"], proxy)
+        self.assertIn(proxy, self.manager.candidate_pools["source1"])
 
     def test_premium_uses_the_source_contract_and_demotes_immediately(self):
-        proxy, stat = self._install_qualified(quality=0.06)
+        proxy, stat = self._install_proven(quality=0.06)
         self.manager.premium_min_usage_count = 3
         self.manager._sync_premium_proxies_locked()
 
@@ -356,29 +429,31 @@ class TestHandoutAccountingAndPlans(ProxyManagerTestBase):
         self.assertEqual(handout["source"], "source1")
         self.assertEqual(len(self.manager.source_stats["source1"][proxy]["inflight"]), 1)
         with patch.object(self.manager, "_sync_premium_proxies_locked") as sync:
-            self.manager.process_feedback("source1", proxy, 500)
+            self.manager.process_feedback("source1", proxy, 4)
 
         sync.assert_not_called()
-        self.assertFalse(self.manager._is_qualified(stat))
+        self.assertFalse(self.manager._is_premium_grade(stat, "source1"))
         self.assertNotIn(proxy, self.manager.premium_proxies)
         self.assertIsNone(self.manager.allocate_premium_proxy())
 
-    def test_expired_plan_serves_without_synchronous_rebuild_and_schedules_once(self):
-        proxy, _ = self._install_qualified()
-        self.manager.serving_plan_max_age_s = 1.0
-        self.manager.serving_plans["source1"]["built_at"] = time.time() - 10
+    def test_a_stale_pool_serves_without_rebuilding_on_the_request_thread(self):
+        """
+        Staleness costs ranking accuracy, never availability.
 
-        with (
-            patch.object(self.manager, "_build_serving_plan") as build,
-            patch.object(self.manager, "_submit_background") as submit,
-        ):
+        The refresh timer owns rebuilds. Doing one on the request path would
+        put pool-sized work behind the manager lock on every handout, and a
+        request that arrives while the pool is stale still has a pool.
+        """
+        proxy, _ = self._install_proven()
+        self.manager.pool_refresh_seconds = 1.0
+        self.manager.candidate_pool_built_at["source1"] = time.time() - 3600
+
+        with patch.object(self.manager, "_rebuild_candidate_pool") as rebuild:
             first = self.manager.allocate_proxy("source1")
             second = self.manager.allocate_proxy("source1")
 
         self.assertEqual((first["proxy"], second["proxy"]), (proxy, proxy))
-        build.assert_not_called()
-        submit.assert_called_once()
-        self.assertIn("source1", self.manager.plan_refreshing)
+        rebuild.assert_not_called()
 
 
 class TestPersistenceAndTransactions(ProxyManagerTestBase):
@@ -389,7 +464,7 @@ class TestPersistenceAndTransactions(ProxyManagerTestBase):
             json.dumps(
                 {
                     "scoring_version": 2,
-                    "timestamp": "2026-01-01T00:00:00+00:00",
+                    "timestamp": datetime.now().astimezone().isoformat(),
                     "source_stats": {
                         "source1": {
                             proxy: {
@@ -404,6 +479,7 @@ class TestPersistenceAndTransactions(ProxyManagerTestBase):
                                 "recent_results": [[time.time(), True, None]] * 3,
                                 "handout_count": 3,
                                 "trial_handout_count": 0,
+                                "retry_after_ts": 1234.0,
                                 "inflight": [],
                             }
                         }
@@ -418,10 +494,17 @@ class TestPersistenceAndTransactions(ProxyManagerTestBase):
         restored = self.manager.source_stats["source1"][proxy]
         self.assertNotIn("completed_feedback_count", restored)
         self.assertNotIn("consecutive_failures", restored)
+        # The #27 gate fields are now in the same class: a snapshot written by
+        # an older build still loads, and its gate bookkeeping is dropped
+        # rather than rejected.
+        self.assertNotIn("trial_handout_count", restored)
+        self.assertNotIn("retry_after_ts", restored)
         self.assertEqual(self.manager.backup_stats()["status"], "success")
         serialized = backup_path.read_text(encoding="utf-8")
         self.assertNotIn("completed_feedback_count", serialized)
         self.assertNotIn("consecutive_failures", serialized)
+        self.assertNotIn("trial_handout_count", serialized)
+        self.assertNotIn("retry_after_ts", serialized)
 
     def test_fetch_backoff_is_restored_and_success_clears_durable_state(self):
         next_attempt = time.time() + 120
@@ -709,6 +792,7 @@ class TestConfigurationBoundaries(ProxyManagerTestBase):
             ({"server": {"readiness_validation_max_age_seconds": "0"}}, "validation age"),
             ({"server": {"readiness_flush_max_age_seconds": "0"}}, "flush age"),
             ({"server": {"background_workers": "0"}}, "background workers"),
+            ({"server": {"connection_limit": "0"}}, "connection limit"),
             ({"server": {"allowed_ips": "not-an-address"}}, "allowed address"),
             ({"server": {"trusted_proxy_ips": "not-an-address"}}, "trusted address"),
             ({"database": {"min_connections": "0"}}, "database minimum"),
@@ -741,25 +825,12 @@ class TestConfigurationBoundaries(ProxyManagerTestBase):
             ({"source_pool": {"top_tier_size": "-1"}}, "tier size"),
             ({"source_pool": {"max_pool_size": "10", "top_tier_size": "11"}}, "tier over pool"),
             ({"source_pool": {"top_tier_load_percentage": "101"}}, "percentage over 100"),
-            ({"source_pool": {"proxy_cooldown_ms": "-1"}}, "negative cooldown"),
-            ({"source_pool": {"exploration_min_ratio": "-0.1"}}, "exploration minimum"),
-            ({"source_pool": {"exploration_max_ratio": "1.1"}}, "exploration maximum"),
-            ({"source_pool": {"exploration_min_ratio": "0.5", "exploration_max_ratio": "0.4"}}, "exploration bounds"),
-            ({"source_pool": {"exploration_target_qualified": "0"}}, "exploration target"),
-            ({"source_pool": {"exploration_target_qualified_ratio": "1.1"}}, "qualified ratio"),
-            ({"source_pool": {"exploration_discovery_share": "1.1"}}, "discovery share"),
-            ({"source_pool": {"qualification_min_results": "0"}}, "qualification evidence"),
-            ({"source_pool": {"qualification_min_results": "4", "probation_attempts": "3"}}, "probation evidence"),
-            ({"source_pool": {"retry_attempts": "-1"}}, "retry attempts"),
-            ({"source_pool": {"retry_delay_seconds": "-1"}}, "retry delay"),
-            ({"source_pool": {"probation_forgiveness_hours": "0"}}, "forgiveness"),
             ({"source_pool": {"proxy_inflight_timeout_seconds": "0"}}, "lease expiry"),
-            ({"source_pool": {"proxy_max_inflight": "-1"}}, "capacity"),
-            ({"source_pool": {"exploit_draw_attempts": "0"}}, "draw attempts"),
-            ({"source_pool": {"serving_plan_max_age_seconds": "0"}}, "plan age"),
+            ({"source_pool": {"candidate_pool_size": "0"}}, "candidate pool size"),
+            ({"source_pool": {"pool_refresh_seconds": "0"}}, "pool refresh"),
+            ({"source_pool": {"exploration_slots": "-1"}}, "exploration slots"),
             ({"source_pool": {"selection_weight_floor": "0"}}, "weight floor"),
             ({"source_pool": {"softmax_temperature": "0"}}, "temperature"),
-            ({"source_pool": {"avg_latency_alpha": "0"}}, "latency alpha"),
             ({"source_pool": {"max_feedback_latency_ms": "0"}}, "latency bound"),
             ({"source_pool": {"premium_pool_size": "-1"}}, "premium pool"),
             ({"source_pool": {"premium_min_usage_count": "-1"}}, "premium evidence"),
@@ -768,7 +839,6 @@ class TestConfigurationBoundaries(ProxyManagerTestBase):
             ({"source_pool": {"reliability_slow_alpha": "0.5", "reliability_fast_alpha": "0.4"}}, "alpha ordering"),
             ({"source_pool": {"reliability_decay_half_life_hours": "0"}}, "half life"),
             ({"source_pool": {"reliability_recent_results_limit": "0"}}, "history limit"),
-            ({"source_pool": {"reliability_history_prior_weight": "-1"}}, "history weight"),
             ({"source_pool": {"outage_window_size": "0"}}, "outage window"),
             ({"source_pool": {"outage_window_size": "4", "outage_min_distinct_proxies": "5"}}, "outage distinct"),
             ({"source_pool": {"outage_healthy_baseline_ratio": "1.1"}}, "healthy ratio"),
@@ -818,13 +888,19 @@ class TestConfigurationBoundaries(ProxyManagerTestBase):
             self.manager.server_port,
             self.manager.production_threads,
             self.manager.background_workers,
+            self.manager.server_connection_limit,
             self.manager.proxy_inflight_timeout_s,
         )
         changed = {
             section: dict(values) for section, values in self.config_dict.items()
         }
         changed["server"].update(
-            {"port": "7001", "production_threads": "12", "background_workers": "6"}
+            {
+                "port": "7001",
+                "production_threads": "12",
+                "background_workers": "6",
+                "connection_limit": "77",
+            }
         )
         changed["source_pool"]["proxy_inflight_timeout_seconds"] = "15"
         write_config_file(self.tmp_dir, changed, name="config.ini")
@@ -836,12 +912,13 @@ class TestConfigurationBoundaries(ProxyManagerTestBase):
                 self.manager.server_port,
                 self.manager.production_threads,
                 self.manager.background_workers,
+                self.manager.server_connection_limit,
                 self.manager.proxy_inflight_timeout_s,
             ),
             old_values,
         )
         self.assertIn(
-            "[server] production_threads / background_workers",
+            "[server] production_threads / background_workers / connection_limit",
             result["restart_required_for"],
         )
         self.assertIn(
@@ -858,6 +935,7 @@ class TestConfigurationBoundaries(ProxyManagerTestBase):
                 self.manager.server_port,
                 self.manager.production_threads,
                 self.manager.background_workers,
+                self.manager.server_connection_limit,
                 self.manager.proxy_inflight_timeout_s,
             ),
             old_values,
@@ -918,6 +996,80 @@ class TestApiAndLifecycleContracts(ProxyManagerTestBase):
         self.assertEqual(recovered_health.get_json()["status"], "healthy")
         self.assertEqual(recovered_ready.get_json(), ready)
 
+    def _serving_normally(self):
+        """A manager whose scheduler runs, database answers and flushes land."""
+        stop = threading.Event()
+        self.manager.scheduler_thread = threading.Thread(target=stop.wait, daemon=True)
+        self.manager.scheduler_thread.start()
+        self.addCleanup(stop.set)
+        self.mock_db_instance.ping.return_value = True
+        self.manager.last_flush_success_ts = time.time()
+
+    def test_readiness_waits_out_a_revalidation_window_without_failing(self):
+        """
+        Once every proxy has been checked, nothing is due again for a whole
+        validation window, and an empty batch records nothing - honestly, it
+        validated nothing. The freshness limit has to cover that wait; at 600s
+        it reported a healthy, idle service unready for most of every window.
+        """
+        self._serving_normally()
+        self.mock_db_instance.get_active_proxies.return_value = {"http://192.0.2.70:80"}
+        self.manager._sync_and_select_top_proxies()
+        recorded_at = time.time() - 20 * 60
+        self.manager.last_validation_success_ts = recorded_at
+        self.mock_db_instance.get_new_proxies_to_validate.return_value = []
+        self.mock_db_instance.get_active_proxies_to_revalidate.return_value = []
+        self.mock_db_instance.get_eligible_failed_proxies.return_value = []
+
+        self.manager._run_validation_cycle()
+
+        self.assertEqual(self.manager.last_validation_success_ts, recorded_at)
+        self.assertTrue(self.manager.readiness_status()["ready"])
+        self.manager.last_validation_success_ts = (
+            time.time() - self.manager.readiness_validation_max_age_s - 1
+        )
+        self.assertFalse(self.manager.readiness_status()["dependencies"]["validation"])
+
+    def test_readiness_counts_the_fallback_and_reports_quorum_as_a_diagnostic(self):
+        """
+        /get-proxy serves never-validated and failed rows when nothing is
+        active, so a pool of them is a usable pool. What the last checks said
+        is reported, not required; an empty table is still unready.
+        """
+        self._serving_normally()
+        self.manager.last_validation_success_ts = time.time()
+        self.manager.last_validation_quorum_healthy = False
+        self.mock_db_instance.get_active_proxies.return_value = set()
+        self.mock_db_instance.get_reserve_proxies.return_value = [
+            f"http://192.0.2.{index}:80" for index in range(71, 76)
+        ]
+        self.manager._sync_and_select_top_proxies()
+
+        status = self.manager.readiness_status()
+
+        self.assertTrue(status["ready"], status)
+        self.assertEqual(status["usable_proxies"], 5)
+        self.assertEqual(status["active_proxies"], 0)
+        self.assertFalse(status["validation_quorum_healthy"])
+
+        self.mock_db_instance.get_reserve_proxies.return_value = []
+        self.manager._sync_and_select_top_proxies()
+        status = self.manager.readiness_status()
+        self.assertFalse(status["dependencies"]["usable_pool"])
+        self.assertIsNone(self.manager.allocate_proxy("source1"))
+
+    def test_a_freshness_limit_shorter_than_the_revalidation_window_warns(self):
+        with patch("src.core.proxy_manager.logger.warning") as warn:
+            self.make_manager(
+                {"server": {"readiness_validation_max_age_seconds": "600"}},
+                name="short-readiness.ini",
+            )
+        self.assertIn("one revalidation window", str(warn.call_args_list))
+
+        with patch("src.core.proxy_manager.logger.warning") as warn:
+            self.make_manager({}, name="default-readiness.ini")
+        self.assertNotIn("one revalidation window", str(warn.call_args_list))
+
     def test_stats_validate_before_database_and_backend_failures_are_503(self):
         invalid_requests = [
             ("/api/stats/daily?source=source1&date=bad", "get_daily_stats"),
@@ -947,7 +1099,7 @@ class TestApiAndLifecycleContracts(ProxyManagerTestBase):
         proxy = "http://192.0.2.50:80"
         for source in ("source1", "source2"):
             self.manager.source_stats[source][proxy] = self.manager._get_new_proxy_stat(source)
-        self.manager.process_feedback("source1", proxy, 500, failure_kind="dead")
+        self.manager.process_feedback("source1", proxy, 4, failure_kind="dead")
         self.assertEqual(self.manager.accepted_feedback_failure_total, 1)
         self.manager.source_stats.clear()
 
@@ -1012,7 +1164,7 @@ class TestApiAndLifecycleContracts(ProxyManagerTestBase):
 
         with (
             patch.object(self.manager, "_submit_background", side_effect=submit),
-            patch.object(self.manager, "refresh_serving_plans"),
+            patch.object(self.manager, "refresh_candidate_pools"),
             patch.object(
                 self.manager.stop_scheduler_event,
                 "wait",
@@ -1075,6 +1227,72 @@ class TestApiAndLifecycleContracts(ProxyManagerTestBase):
 
         validate.assert_called_once_with()
 
+    def test_a_slow_source_does_not_hold_back_a_fast_one(self):
+        """
+        Each source's rows commit when its own fetch returns. Waiting for every
+        fetch first let one source spending its whole curl retry budget - about
+        three minutes by default - keep a cold install from serving anything
+        the fast sources had already found.
+        """
+        fast_row = ("http", "192.0.2.61", 80)
+        table = []
+        self.mock_db_instance.insert_proxies.side_effect = (
+            lambda rows: table.extend(tuple(row) for row in rows)
+        )
+        self.mock_db_instance.get_reserve_proxies.side_effect = lambda _limit: [
+            f"{protocol}://{ip}:{port}" for protocol, ip, port in table
+        ]
+        fast, slow = Future(), Future()
+        fast.set_result([fast_row, fast_row])
+        validate = self.enterContext(
+            patch.object(self.manager, "_run_validation_cycle")
+        )
+        worker = threading.Thread(
+            target=self.manager._handle_fetch_results,
+            args=([fast, slow], True),
+            daemon=True,
+        )
+        worker.start()
+        # However the test ends, the slow fetch completes and the worker exits
+        # while the patch still stands: a failed assertion must not leave it
+        # blocked on the future for good.
+        self.addCleanup(worker.join, 5)
+        self.addCleanup(lambda: slow.done() or slow.set_result([]))
+
+        deadline = time.monotonic() + 5
+        while not table and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        self.assertEqual(table, [fast_row])
+        self.assertEqual(
+            self.manager.allocate_proxy("source1")["proxy"], "http://192.0.2.61:80"
+        )
+        validate.assert_not_called()
+
+        slow.set_result([("http", "192.0.2.62", 80)])
+        worker.join(timeout=5)
+
+        self.assertEqual(len(table), 2)
+        validate.assert_called_once_with()
+
+    def test_one_source_failing_to_commit_keeps_the_others(self):
+        committed = []
+
+        def insert(rows):
+            if rows == [["http", "192.0.2.63", 80]]:
+                raise DatabaseWriteError("insert_proxies", RuntimeError("injected"))
+            committed.extend(rows)
+
+        self.mock_db_instance.insert_proxies.side_effect = insert
+        failing, broken, good = Future(), Future(), Future()
+        failing.set_result([("http", "192.0.2.63", 80)])
+        broken.set_exception(RuntimeError("fetch failed"))
+        good.set_result([("http", "192.0.2.64", 80)])
+
+        self.manager._handle_fetch_results([failing, broken, good])
+
+        self.assertEqual(committed, [["http", "192.0.2.64", 80]])
+
     def test_production_entry_uses_single_process_waitress(self):
         import src.main as main_module
 
@@ -1082,22 +1300,40 @@ class TestApiAndLifecycleContracts(ProxyManagerTestBase):
         fake_manager.debug_mode = False
         fake_manager.server_port = 7000
         fake_manager.production_threads = 9
+        fake_manager.server_connection_limit = 900
         fake_app = MagicMock()
         with (
             patch.object(sys, "argv", ["smartproxy"]),
             patch.object(main_module, "configure_logging_from_file"),
             patch.object(main_module, "load_proxy_manager", return_value=fake_manager),
             patch.object(main_module, "create_app", return_value=fake_app),
-            patch.object(main_module, "serve") as serve,
+            patch.object(main_module, "create_server") as create_server,
             patch.object(main_module.signal, "signal"),
         ):
             main_module.main()
 
         fake_manager.start_scheduler.assert_called_once()
         fake_manager.stop_scheduler.assert_called_once()
-        serve.assert_called_once_with(
-            fake_app, host="0.0.0.0", port=7000, threads=9
+        # connection_limit is passed explicitly: waitress defaults it to 100,
+        # and exhausting that turns any refusal into a connection-level outage.
+        # asyncore_use_poll goes with it: under the default select() loop, a
+        # descriptor numbered 1024 or above raises out of the server - with a
+        # thousand connections plus the database pool, that is reachable.
+        create_server.assert_called_once_with(
+            fake_app,
+            host="0.0.0.0",
+            port=7000,
+            threads=9,
+            connection_limit=900,
+            asyncore_use_poll=True,
+            # Forwarding headers reach the app, whose trusted_proxy_ips list
+            # is the one authority on them; waitress would strip them first.
+            clear_untrusted_proxy_headers=False,
         )
+        server = create_server.return_value
+        # The poll loop that never subscribes to POLLPRI, not waitress's own.
+        self.assertIs(server.asyncore, main_module._PollLoop)
+        server.run.assert_called_once()
         fake_app.run.assert_not_called()
 
     def test_importing_logger_does_not_initialize_a_persistent_sink(self):
@@ -1106,6 +1342,121 @@ class TestApiAndLifecycleContracts(ProxyManagerTestBase):
         with patch.object(logger_module.logger, "add") as add:
             importlib.reload(logger_module)
         add.assert_not_called()
+
+
+class RestoreAgeTests(ProxyManagerTestBase):
+    """
+    Startup restores a snapshot only while it is at most 12 hours old.
+
+    The age is the generation time recorded inside the snapshot, never the
+    file's mtime, and it is the snapshot's age alone: a fresh snapshot brings
+    back every record in it, however old the feedback behind that record.
+    """
+
+    NOW = 1_800_000_000.0
+    PROXY = "http://192.0.2.80:80"
+
+    def write_snapshot(self, timestamp, results=None):
+        results = results or [[self.NOW - 3 * 86400, True, 120]]
+        path = Path(self.tmp_dir) / "stats.json"
+        snapshot = {
+            "scoring_version": 2,
+            "source_stats": {
+                "source1": {
+                    self.PROXY: {
+                        "success_count": sum(1 for result in results if result[1]),
+                        "failure_count": sum(1 for result in results if not result[1]),
+                        "recent_results": results,
+                        "last_feedback_ts": results[-1][0],
+                    }
+                }
+            },
+        }
+        if timestamp is not None:
+            snapshot["timestamp"] = timestamp
+        path.write_text(json.dumps(snapshot), encoding="utf-8")
+        self.manager.stats_backup_path = path
+        return path
+
+    def restore_at(self, now):
+        with patch("src.core.proxy_manager.time.time", return_value=now):
+            return self.manager.restore_stats()
+
+    def generated(self, hours_ago):
+        return datetime.fromtimestamp(self.NOW - hours_ago * 3600).astimezone().isoformat()
+
+    def test_a_snapshot_up_to_twelve_hours_old_is_restored(self):
+        for hours_ago in (0, 11 + 59 / 60, 12):
+            with self.subTest(hours_ago=hours_ago):
+                self.manager.source_stats["source1"] = {}
+                self.write_snapshot(self.generated(hours_ago))
+
+                self.assertEqual(self.restore_at(self.NOW)["status"], "success")
+                self.assertIn(self.PROXY, self.manager.source_stats["source1"])
+
+    def test_an_older_snapshot_is_skipped_however_new_the_file_looks(self):
+        path = self.write_snapshot(self.generated(12 + 1 / 3600))
+        # A copy made just now: the mtime says new, the snapshot says old.
+        copied_at = time.time()
+        os.utime(path, (copied_at, copied_at))
+
+        result = self.restore_at(self.NOW)
+
+        self.assertEqual(result["status"], "skipped")
+        self.assertNotIn(self.PROXY, self.manager.source_stats["source1"])
+
+    def test_a_timestamp_without_an_offset_is_local_time(self):
+        """How backups were written before offsets were: naive local time."""
+        naive_local = datetime.fromtimestamp(self.NOW - 3600).isoformat()
+        self.write_snapshot(naive_local)
+
+        self.assertEqual(self.restore_at(self.NOW)["status"], "success")
+
+        self.manager.source_stats["source1"] = {}
+        self.write_snapshot(datetime.fromtimestamp(self.NOW - 13 * 3600).isoformat())
+        self.assertEqual(self.restore_at(self.NOW)["status"], "skipped")
+
+    def test_a_missing_or_unreadable_timestamp_skips_the_restore(self):
+        for timestamp in (None, "fixture", 1_799_999_000):
+            with self.subTest(timestamp=timestamp):
+                self.write_snapshot(timestamp)
+
+                result = self.restore_at(self.NOW)
+
+                self.assertEqual(result["status"], "skipped")
+                self.assertNotIn(self.PROXY, self.manager.source_stats["source1"])
+
+    def test_a_fresh_snapshot_keeps_its_older_feedback(self):
+        results = [
+            [self.NOW - 3 * 86400, True, 100],
+            [self.NOW - 2 * 86400, False, None],
+            [self.NOW - 13 * 3600, True, 90],
+        ]
+        self.write_snapshot(self.generated(1), results=results)
+
+        self.assertEqual(self.restore_at(self.NOW)["status"], "success")
+
+        stat = self.manager.source_stats["source1"][self.PROXY]
+        self.assertEqual([result[0] for result in stat["recent_results"]], [r[0] for r in results])
+        self.assertEqual((stat["success_count"], stat["failure_count"]), (2, 1))
+
+    def test_a_skipped_restore_still_serves_from_the_database(self):
+        self.write_snapshot(self.generated(24))
+        self.assertEqual(self.restore_at(self.NOW)["status"], "skipped")
+
+        self.mock_db_instance.get_active_proxies.return_value = set()
+        self.mock_db_instance.get_reserve_proxies.return_value = [self.PROXY]
+        self.manager._sync_and_select_top_proxies()
+
+        self.assertEqual(self.manager.allocate_proxy("source1")["proxy"], self.PROXY)
+
+    def test_the_backup_records_its_generation_time_with_an_offset(self):
+        self.manager.stats_backup_path = Path(self.tmp_dir) / "written.json"
+        self.manager.backup_stats()
+
+        written = json.loads(self.manager.stats_backup_path.read_text(encoding="utf-8"))
+        self.assertIsNotNone(datetime.fromisoformat(written["timestamp"]).utcoffset())
+        self.assertEqual(self.manager.restore_stats()["status"], "success")
 
 
 if __name__ == "__main__":

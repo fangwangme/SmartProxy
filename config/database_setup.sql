@@ -53,6 +53,11 @@ CREATE TABLE proxies (
 CREATE INDEX idx_proxies_is_active ON proxies (is_active);
 CREATE INDEX idx_proxies_last_validated_at ON proxies (last_validated_at);
 CREATE INDEX idx_proxies_validation_logic ON proxies (is_active, window_start_time, validation_attempts_in_window);
+-- Serves get_reserve_proxies(): the non-active rows the router falls back on
+-- when nothing has been validated yet, never-validated ones first. The NULLS
+-- FIRST ordering is part of the index so the LIMIT stops at the first page
+-- instead of sorting every dead row in the table.
+CREATE INDEX idx_proxies_reserve_pool ON proxies (is_active, last_validated_at ASC NULLS FIRST, id);
 
 COMMENT ON TABLE proxies IS 'Stores physical attributes and validation status of all discovered proxies.';
 COMMENT ON COLUMN proxies.is_active IS 'True if the proxy passed the last validation, false otherwise.';

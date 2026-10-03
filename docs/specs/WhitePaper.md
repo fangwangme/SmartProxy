@@ -1,3 +1,8 @@
+> **Historical.** This is the V3.0 design note and is no longer maintained. Its
+> persistence (Pickle snapshots), scheduling and selection descriptions are out
+> of date. The current design is in [proxy-quality-scoring.md](proxy-quality-scoring.md)
+> and [the README](../../README.md).
+
 # Intelligent Proxy Service Architecture
 
 ## 1\. Core Design Philosophy

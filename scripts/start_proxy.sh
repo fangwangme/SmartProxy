@@ -17,6 +17,11 @@ SHUTDOWN_GRACE_SECONDS=""
 SERVICE_FLAGS=()
 DEBUG_ENABLED=false
 RESTORE_MODE="normal"
+# The pre-stop backup is a courtesy: the service writes its own final backup
+# on SIGTERM. A process that accepts the connection and never answers must not
+# keep stop/restart from ever reaching the signal.
+BACKUP_CONNECT_TIMEOUT_SECONDS=5
+BACKUP_MAX_TIME_SECONDS=30
 
 # 确保日志目录存在
 mkdir -p "$LOG_DIR" 2>/dev/null
@@ -45,7 +50,12 @@ backup_stats() {
     local response_file
     response_file=$(mktemp "${TMPDIR:-/tmp}/smartproxy-backup.XXXXXX") || return 1
     trap 'rm -f "$response_file"' RETURN
-    if curl -s -X POST "http://localhost:$PORT/backup-stats" -o "$response_file" 2>/dev/null; then
+    curl -s -X POST \
+        --connect-timeout "$BACKUP_CONNECT_TIMEOUT_SECONDS" \
+        --max-time "$BACKUP_MAX_TIME_SECONDS" \
+        "http://localhost:$PORT/backup-stats" -o "$response_file" 2>/dev/null
+    local curl_status=$?
+    if [ "$curl_status" -eq 0 ]; then
         status=$("$PYTHON" -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("status", "unknown"))' "$response_file" 2>/dev/null)
         if [ "$status" = "success" ]; then
             sources=$("$PYTHON" -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("sources", "N/A"))' "$response_file" 2>/dev/null)
@@ -54,6 +64,8 @@ backup_stats() {
         else
             echo "Backup failed or service not responding"
         fi
+    elif [ "$curl_status" -eq 28 ]; then
+        echo "Backup request timed out after at most ${BACKUP_MAX_TIME_SECONDS}s"
     else
         echo "Could not connect to SmartProxy service"
     fi
@@ -104,8 +116,14 @@ start_server() {
     echo " Restore Mode: $RESTORE_MODE"
     echo "=================================================="
 
-    # 使用 setsid + nohup 完全脱离当前会话，避免父会话退出时子进程被连带终止
-    nohup setsid "$PYTHON" -u -m src.main "${SERVICE_FLAGS[@]}" </dev/null >> "$LOG_FILE" 2>&1 &
+    # 使用 setsid + nohup 完全脱离当前会话，避免父会话退出时子进程被连带终止。
+    # setsid 来自 util-linux，macOS 没有；那里退回 nohup：它忽略 SIGHUP，
+    # 而非交互 shell 的后台任务本来就忽略 SIGINT/SIGQUIT。
+    if command -v setsid >/dev/null 2>&1; then
+        nohup setsid "$PYTHON" -u -m src.main "${SERVICE_FLAGS[@]}" </dev/null >> "$LOG_FILE" 2>&1 &
+    else
+        nohup "$PYTHON" -u -m src.main "${SERVICE_FLAGS[@]}" </dev/null >> "$LOG_FILE" 2>&1 &
+    fi
     echo $! > "$PID_FILE"
 
     sleep 1
