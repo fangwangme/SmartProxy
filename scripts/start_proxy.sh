@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # SmartProxy 服务管理脚本
-# 用法: ./start_proxy.sh {start|stop|restart|status|logs|backup} [flags]
+# 用法: ./start_proxy.sh {start|stop|restart|status|logs|backup|help} [flags]
 
 # 获取项目根目录（脚本所在目录的父目录）
 PROJECT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." && pwd )"
@@ -237,12 +237,69 @@ logs_server() {
     fi
 }
 
+show_help() {
+    cat << 'EOF'
+======================================================================
+ SmartProxy Management Script
+======================================================================
+
+[PREREQUISITE: PostgreSQL Database]
+SmartProxy requires a running PostgreSQL database instance.
+
+▶ Linux (systemd / Omarchy):
+  - Start service:       sudo systemctl start postgresql
+  - Check status:        systemctl status postgresql
+  - Enable on boot:      sudo systemctl enable --now postgresql
+
+▶ macOS (Homebrew):
+  - Start service:       brew services start postgresql
+                         (or brew services start postgresql@16)
+  - Check status:        brew services list
+
+* First-time database setup:
+  psql -U proxy_user -d proxy_db -f config/database_setup.sql
+
+----------------------------------------------------------------------
+
+[USAGE]
+  ./scripts/start_proxy.sh <command> [flags]
+
+[COMMANDS]
+  start       Start SmartProxy server as a detached background process
+  stop        Gracefully stop the server (triggers backup before stop)
+  restart     Restart the server (stops, waits 1s, then starts)
+  status      Display server status, PID, port, log path, and uptime
+  logs        Follow realtime server log output (tail -f)
+  backup      Trigger an immediate in-memory statistics backup to disk
+  help, -h    Display this help message
+
+[FLAGS]
+  --debug       Enable debug mode with verbose logging
+  --no-restore  Start fresh without restoring previous stats backup
+
+[EXAMPLES]
+  ./scripts/start_proxy.sh start            # Start server
+  ./scripts/start_proxy.sh start --debug    # Start in debug mode
+  ./scripts/start_proxy.sh status           # Check server status
+  ./scripts/start_proxy.sh logs             # View live logs
+  ./scripts/start_proxy.sh stop             # Backup and stop server
+  ./scripts/start_proxy.sh help             # Show this help
+======================================================================
+EOF
+}
+
 # Parse service flags after the management command. Arrays preserve argument
 # boundaries and avoid word-splitting values into executable shell fragments.
 COMMAND="${1:-start}"
 if [ "$#" -gt 0 ]; then
     shift
 fi
+
+if [ "$COMMAND" = "help" ] || [ "$COMMAND" = "-h" ] || [ "$COMMAND" = "--help" ]; then
+    show_help
+    exit 0
+fi
+
 for arg in "$@"; do
     case "$arg" in
         --debug)
@@ -253,8 +310,13 @@ for arg in "$@"; do
             RESTORE_MODE="no-restore"
             SERVICE_FLAGS+=("--no-restore")
             ;;
+        -h|--help)
+            show_help
+            exit 0
+            ;;
         *)
             echo "Unknown flag: $arg"
+            echo "Run '$0 help' for usage instructions."
             exit 1
             ;;
     esac
@@ -282,8 +344,14 @@ case "$COMMAND" in
     backup)
         backup_stats
         ;;
+    help|-h|--help)
+        show_help
+        exit 0
+        ;;
     *)
-        echo "Usage: $0 {start|stop|restart|status|logs|backup} [--debug] [--no-restore]"
+        echo "Unknown command: $COMMAND"
+        echo "Usage: $0 {start|stop|restart|status|logs|backup|help} [--debug] [--no-restore]"
+        echo "Run '$0 help' for full documentation."
         exit 1
         ;;
 esac
