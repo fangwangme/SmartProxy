@@ -23,9 +23,6 @@ RESTORE_MODE="normal"
 BACKUP_CONNECT_TIMEOUT_SECONDS=5
 BACKUP_MAX_TIME_SECONDS=30
 
-# 确保日志目录存在
-mkdir -p "$LOG_DIR" 2>/dev/null
-
 load_runtime_config() {
     if [ ! -x "$PYTHON" ]; then
         return 1
@@ -91,6 +88,8 @@ start_server() {
 
     # 进入项目目录
     cd "$PROJECT_DIR"
+    # 确保日志目录存在
+    mkdir -p "$LOG_DIR" 2>/dev/null
 
     # 检查项目虚拟环境是否存在（不要求当前 shell 已 activate）
     if [ ! -x "$PYTHON" ]; then
@@ -246,18 +245,27 @@ show_help() {
 [PREREQUISITE: PostgreSQL Database]
 SmartProxy requires a running PostgreSQL database instance.
 
-▶ Linux (systemd / Omarchy):
+* Linux (systemd / Omarchy):
+  - Initialize (Arch / Omarchy, once):
+                         sudo -iu postgres initdb -D /var/lib/postgres/data
   - Start service:       sudo systemctl start postgresql
   - Check status:        systemctl status postgresql
   - Enable on boot:      sudo systemctl enable --now postgresql
 
-▶ macOS (Homebrew):
-  - Start service:       brew services start postgresql
-                         (or brew services start postgresql@16)
+* macOS (Homebrew):
+  - Start service:       brew services start postgresql@<version>
+                         (the formula you installed, e.g. postgresql@16)
   - Check status:        brew services list
 
 * First-time database setup:
-  psql -U proxy_user -d proxy_db -f config/database_setup.sql
+  <user> and <db> are the [database] user and dbname in config/config.ini.
+  Create the role and database (on macOS, drop "sudo -u postgres"):
+    sudo -u postgres createuser -P <user>
+    sudo -u postgres createdb -O <user> <db>
+  Load the schema:
+    psql -h localhost -U <user> -d <db> -f config/database_setup.sql
+  WARNING: database_setup.sql DROPS and recreates every SmartProxy table.
+           Run it only on a new, empty database - never on an existing one.
 
 ----------------------------------------------------------------------
 
@@ -271,7 +279,7 @@ SmartProxy requires a running PostgreSQL database instance.
   status      Display server status, PID, port, log path, and uptime
   logs        Follow realtime server log output (tail -f)
   backup      Trigger an immediate in-memory statistics backup to disk
-  help, -h    Display this help message
+  help        Display this help message (also -h, --help)
 
 [FLAGS]
   --debug       Enable debug mode with verbose logging
@@ -294,12 +302,11 @@ COMMAND="${1:-start}"
 if [ "$#" -gt 0 ]; then
     shift
 fi
-
-if [ "$COMMAND" = "help" ] || [ "$COMMAND" = "-h" ] || [ "$COMMAND" = "--help" ]; then
-    show_help
-    exit 0
+# -h / --help mean help wherever they appear, even after an unknown flag.
+if [ "$COMMAND" = "-h" ] || [ "$COMMAND" = "--help" ]; then
+    COMMAND="help"
 fi
-
+UNKNOWN_FLAG=""
 for arg in "$@"; do
     case "$arg" in
         --debug)
@@ -311,16 +318,18 @@ for arg in "$@"; do
             SERVICE_FLAGS+=("--no-restore")
             ;;
         -h|--help)
-            show_help
-            exit 0
+            COMMAND="help"
             ;;
         *)
-            echo "Unknown flag: $arg"
-            echo "Run '$0 help' for usage instructions."
-            exit 1
+            [ -z "$UNKNOWN_FLAG" ] && UNKNOWN_FLAG="$arg"
             ;;
     esac
 done
+if [ -n "$UNKNOWN_FLAG" ] && [ "$COMMAND" != "help" ]; then
+    echo "Unknown flag: $UNKNOWN_FLAG"
+    echo "Run '$0 help' for usage instructions."
+    exit 1
+fi
 
 # 命令行参数处理
 case "$COMMAND" in
@@ -344,9 +353,8 @@ case "$COMMAND" in
     backup)
         backup_stats
         ;;
-    help|-h|--help)
+    help)
         show_help
-        exit 0
         ;;
     *)
         echo "Unknown command: $COMMAND"
