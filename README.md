@@ -45,13 +45,19 @@ and Bun for the dashboard.
 ```bash
 uv sync --locked                                   # creates .venv
 cp config/config.example.ini config/config.ini     # then set [database], port, allowed_ips
-psql -U <user> -d <db> -f config/database_setup.sql
+
+# First-time database setup (create role, database, and load schema):
+sudo -u postgres createuser -P <user>              # on macOS: createuser -P <user>
+sudo -u postgres createdb -O <user> <db>           # on macOS: createdb -O <user> <db>
+psql -h localhost -U <user> -d <db> -f config/database_setup.sql
+
 (cd dashboard && bun install && bun run build)     # dashboard served at /
 ./scripts/start_proxy.sh start
 ```
 
 The service listens on port 6942 by default. The dashboard is at
-`http://localhost:6942/` once it has been built.
+`http://localhost:6942/` once it has been built. Run `./scripts/start_proxy.sh help`
+for full service commands and OS-specific PostgreSQL instructions.
 
 Without uv: `python3.14 -m venv .venv && .venv/bin/pip install -r
 requirements.txt`. `requirements.txt` is generated from `uv.lock`; declare
