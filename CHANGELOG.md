@@ -1,5 +1,20 @@
 # Changelog
 
+## 3.3.7 — 2026-10-20 — PR #33: Per-source candidate pool overrides
+
+This change closes [Issue #32](https://github.com/fangwangme/SmartProxy/issues/32).
+
+### Added
+
+- **Per-source pool shape**: an optional `[source_pool.<source>]` section overrides `candidate_pool_size`, `exploration_slots` and `softmax_temperature` for that source; other keys and other sources keep `[source_pool]`. A target whose client waits between two requests through the same IP can get a much wider, flatter pool without widening every source's.
+- **Reload reports overrides**: `/reload-sources` returns the effective `source_pool_overrides`.
+
+### Changed
+
+- The reserve page is sized by the widest effective pool across sources.
+- `/reload-sources` re-reads the reserve and rebuilds every pool as soon as it commits, so a raised pool size fills at once instead of at the next sync.
+- A `[source_pool.<source>]` section naming a source not in `predefined_sources`, an unknown key, or an out-of-range value fails config load; on reload the running configuration is kept.
+
 ## 3.3.6 — 2026-09-05 — PR #26: Reliability contracts, lifecycle, and observability
 
 This change closes [Issue #25](https://github.com/fangwangme/SmartProxy/issues/25).
