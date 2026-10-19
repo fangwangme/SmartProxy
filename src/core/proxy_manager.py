@@ -285,6 +285,62 @@ class ProxyManager:
             raise ValueError(f"[{section}] {option} must be <= {high}")
         return value
 
+    # The tunables a [source_pool.<source>] section may override, with the
+    # lower bound [source_pool] enforces for each. The attribute holding the
+    # global value has the key's name.
+    POOL_SHAPE_LOWER_BOUNDS = {
+        "candidate_pool_size": 1,
+        "exploration_slots": 0,
+        "softmax_temperature": 0.1,
+    }
+    SOURCE_POOL_SECTION_PREFIX = "source_pool."
+
+    def _load_source_pool_overrides(self) -> Dict[str, Dict[str, float]]:
+        """
+        Read every [source_pool.<source>] section. Call after predefined_sources.
+
+        A section declares nothing: predefined_sources is the only place a
+        source exists, so a section for any other name is a misspelling, and
+        so is a key outside POOL_SHAPE_LOWER_BOUNDS. Both fail the load.
+        """
+        overrides: Dict[str, Dict[str, float]] = {}
+        for section in self.config.sections():
+            if not section.startswith(self.SOURCE_POOL_SECTION_PREFIX):
+                continue
+            source = section[len(self.SOURCE_POOL_SECTION_PREFIX) :]
+            if source not in self.predefined_sources:
+                raise ValueError(
+                    f"[{section}] names a source that is not in "
+                    "[sources] predefined_sources"
+                )
+            values: Dict[str, float] = {}
+            for option in self.config.options(section):
+                low = self.POOL_SHAPE_LOWER_BOUNDS.get(option)
+                if low is None:
+                    raise ValueError(
+                        f"[{section}] {option} is not a per-source setting; "
+                        f"allowed: {', '.join(self.POOL_SHAPE_LOWER_BOUNDS)}"
+                    )
+                read = self._cfg_float if isinstance(low, float) else self._cfg_int
+                values[option] = read(section, option, None, low=low)
+            overrides[source] = values
+        return overrides
+
+    def _pool_shape(self, source: str, key: str) -> float:
+        """This source's effective value for one POOL_SHAPE_LOWER_BOUNDS key."""
+        return self.source_pool_overrides.get(source, {}).get(key, getattr(self, key))
+
+    def _largest_pool_size(self) -> int:
+        """The widest candidate pool any source asks for."""
+        return max(
+            [self.candidate_pool_size]
+            + [
+                values["candidate_pool_size"]
+                for values in self.source_pool_overrides.values()
+                if "candidate_pool_size" in values
+            ]
+        )
+
     def _load_config(self):
         self.server_port = self._cfg_int("server", "port", 6942, low=1, high=65535)
         self.production_threads = self._cfg_int(
@@ -489,7 +545,10 @@ class ProxyManager:
         # it: a parameter whose wrong value degrades performance is a tunable,
         # a parameter whose wrong value empties the servable set is a defect.
         self.candidate_pool_size = self._cfg_int(
-            "source_pool", "candidate_pool_size", 300, low=1
+            "source_pool",
+            "candidate_pool_size",
+            300,
+            low=self.POOL_SHAPE_LOWER_BOUNDS["candidate_pool_size"],
         )
         self.pool_refresh_seconds = self._cfg_float(
             "source_pool", "pool_refresh_seconds", 60.0, low=0.001
@@ -501,7 +560,10 @@ class ProxyManager:
         # never be drawn. A value at or above candidate_pool_size still fills
         # the pool, all of it by rotation.
         self.exploration_slots = self._cfg_int(
-            "source_pool", "exploration_slots", 30, low=0
+            "source_pool",
+            "exploration_slots",
+            30,
+            low=self.POOL_SHAPE_LOWER_BOUNDS["exploration_slots"],
         )
         # Leases are bookkeeping, not routing: nothing on the selection path
         # reads them. They exist so process_feedback can tell a first report
@@ -517,8 +579,12 @@ class ProxyManager:
             "source_pool", "selection_weight_floor", 1.0, low=0.01
         )
         self.softmax_temperature = self._cfg_float(
-            "source_pool", "softmax_temperature", 14.0, low=0.1
+            "source_pool",
+            "softmax_temperature",
+            14.0,
+            low=self.POOL_SHAPE_LOWER_BOUNDS["softmax_temperature"],
         )
+        self.source_pool_overrides = self._load_source_pool_overrides()
         self.max_feedback_latency_ms = self._cfg_int(
             "source_pool",
             "max_feedback_latency_ms",
@@ -712,8 +778,11 @@ class ProxyManager:
             return {"missing": [], "unknown": [], "checked": False}
 
         def _is_user_defined(section: str) -> bool:
-            # Proxy source sections are per-deployment; never diff them.
-            return section.startswith("proxy_source_")
+            # Proxy source and per-source pool sections are per-deployment;
+            # never diff them.
+            return section.startswith(
+                ("proxy_source_", ProxyManager.SOURCE_POOL_SECTION_PREFIX)
+            )
 
         missing: List[str] = []
         unknown: List[str] = []
@@ -950,6 +1019,14 @@ class ProxyManager:
 
             if not added_sources and not removed_sources:
                 logger.info("Predefined sources reloaded. No changes detected.")
+            source_pool_overrides = copy.deepcopy(self.source_pool_overrides)
+
+        # The reserve page is sized by the widest pool, which the new file may
+        # have raised; re-read it now rather than at the next sync - a database
+        # read, so outside the lock - and rebuild every pool from it, so no
+        # pool is filled from the old reserve in between.
+        self._refresh_reserve_proxies()
+        self.refresh_candidate_pools()
 
         return {
             "added_fetcher_jobs": added_jobs,
@@ -957,6 +1034,7 @@ class ProxyManager:
             "added_predefined_sources": added_sources,
             "removed_predefined_sources": removed_sources,
             "restart_required_for": list(self.RESTART_REQUIRED_CONFIG),
+            "source_pool_overrides": source_pool_overrides,
         }
 
     def _fetch_and_parse_source(self, job: Dict) -> List:
@@ -1730,7 +1808,7 @@ class ProxyManager:
         validator later makes of them, so every path that learns the table has
         grown publishes the reserve.
         """
-        page = self.db.get_reserve_proxies(self.candidate_pool_size)
+        page = self.db.get_reserve_proxies(self._largest_pool_size())
         if page is None:
             logger.warning(
                 "Reserve proxy query failed. Keeping the previous reserve list."
@@ -1764,9 +1842,9 @@ class ProxyManager:
         through the live set or the reserve page like any other.
         """
         wanted: Dict[str, None] = {}
-        for stats_pool in self.source_stats.values():
+        for source, stats_pool in self.source_stats.items():
             best = heapq.nlargest(
-                self.candidate_pool_size,
+                self._pool_shape(source, "candidate_pool_size"),
                 (
                     proxy_url
                     for proxy_url, stat in stats_pool.items()
@@ -1859,7 +1937,8 @@ class ProxyManager:
                     f"Stats pool: {len(sorted_proxies)} proxies, "
                     f"of which {len(usable_proxies)} are alive and usable. "
                     f"Fixed reliability prior: {self._baseline_score(source):.1f}. "
-                    f"Candidate pool: {len(pool)}/{self.candidate_pool_size} "
+                    f"Candidate pool: {len(pool)}/"
+                    f"{self._pool_shape(source, 'candidate_pool_size')} "
                     f"(reserve available: {len(self.reserve_proxies)})."
                 )
 
@@ -2570,7 +2649,7 @@ class ProxyManager:
                 return None
             ranked, cum_weights, exploring = self.candidate_draws[source]
             if exploring and (
-                not ranked or random.random() < self._exploration_share()
+                not ranked or random.random() < self._exploration_share(source)
             ):
                 selected = random.choice(exploring)
             elif cum_weights is None:
@@ -2686,8 +2765,8 @@ class ProxyManager:
             )
 
         ranked = sorted(position, key=by_score)
-        capacity = self.candidate_pool_size
-        reserved = min(self.exploration_slots, capacity)
+        capacity = self._pool_shape(source, "candidate_pool_size")
+        reserved = min(self._pool_shape(source, "exploration_slots"), capacity)
         ranked_slots = ranked[: capacity - reserved]
         exploring = heapq.nsmallest(
             reserved, ranked[capacity - reserved :], key=by_turn
@@ -2709,9 +2788,13 @@ class ProxyManager:
         self.candidate_pool_built_at[source] = now_ts
         return pool
 
-    def _exploration_share(self) -> float:
-        """The share of handouts drawn from the exploration slots."""
-        return min(1.0, self.exploration_slots / self.candidate_pool_size)
+    def _exploration_share(self, source: str) -> float:
+        """The share of this source's handouts drawn from the exploration slots."""
+        return min(
+            1.0,
+            self._pool_shape(source, "exploration_slots")
+            / self._pool_shape(source, "candidate_pool_size"),
+        )
 
     def _selection_cum_weights(
         self, source: str, candidates: List[str]
@@ -2734,9 +2817,8 @@ class ProxyManager:
         ]
         if self.selection_strategy == "softmax":
             top = max(scores)
-            weights = [
-                math.exp((score - top) / self.softmax_temperature) for score in scores
-            ]
+            temperature = self._pool_shape(source, "softmax_temperature")
+            weights = [math.exp((score - top) / temperature) for score in scores]
         elif self.selection_strategy == "tiered":
             # The top tier collectively receives top_tier_load_percentage of
             # the traffic, as a two-level weighting rather than its own path.

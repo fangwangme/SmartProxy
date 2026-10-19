@@ -159,6 +159,22 @@ database holds any proxy at all. The invariant is a property of the data
 structure, not a fallback branch someone has to remember to write - and it is
 asserted by test, not by review note.
 
+### Per-source pool shape
+
+`candidate_pool_size`, `exploration_slots` and `softmax_temperature` are the
+three tunables that shape a pool, and each source may set its own in an
+optional `[source_pool.<source>]` section; a key the section leaves out, and
+every key of a source with no section, takes the `[source_pool]` value. A
+source's pool, its exploration share of handouts and its softmax draw all read
+that source's effective values. They are routing tunables, not policy: a
+target that throttles each IP on the client side gets a wider pool here, while
+the wait itself stays in the client - the server never learns a per-IP reuse
+interval, so the rule lives in one place.
+
+No other key is per-source. The ranked tier lists, the premium pool and the
+scoring parameters describe the proxy population, not one target's appetite
+for it.
+
 A cold pool is the same code path as a warm one. With nothing validated and
 nothing scored, the reserve fills every slot from whatever the fetchers have
 found; validation and feedback then reorder the pool over the following hours,
@@ -183,11 +199,13 @@ waits on the database:
 1. **The first page of the table in fallback order**: `get_reserve_proxies()`,
    never-validated rows first - an unmeasured proxy is a better guess than one
    that has already failed a check - then by the stalest last check,
-   `candidate_pool_size` rows. `idx_proxies_reserve_pool` matches that
+   as many rows as the largest effective `candidate_pool_size` across
+   sources, so the widest pool can fill. `idx_proxies_reserve_pool` matches that
    ordering so the `LIMIT` stops at the first page rather than sorting every
    dead row in the table.
-2. **The rows with the best feedback records**: for each source, the
-   `candidate_pool_size` best-scored records carrying feedback that neither
+2. **The rows with the best feedback records**: for each source, as many of
+   the best-scored records carrying feedback as that source's own
+   `candidate_pool_size`, among those that neither
    the live set nor that page covers, checked against the table in one
    bounded lookup (`get_existing_proxies()`). A failed check stamps a row
    newest, which pushes it off the first page; without this part a proxy real
@@ -428,6 +446,22 @@ The optional cold-start mode is non-destructive:
 All thresholds above live in `[source_pool]` and are documented in
 `config/config.example.ini`. Missing deployment keys are reported by
 `check_config_drift()`. `config.ini` remains optional and git-ignored.
+
+`[sources] predefined_sources` is the only place a source is declared. A
+`[source_pool.<source>]` section overrides that source's pool shape (4) and
+declares nothing: a section naming a source the list does not hold is a
+configuration error, not a new source, because a misspelt name would
+otherwise create an unused source with the wide pool while the intended one
+silently kept the default. An unknown key in such a section, or a value
+outside the bounds `[source_pool]` enforces for the same key, is the same
+error. Each fails config load: startup raises, and `/reload-sources` raises
+and keeps the running configuration. Override sections are per deployment and
+are not diffed by `check_config_drift()`.
+
+`/reload-sources` applies overrides without a restart. Once the reload
+commits, the reserve is re-read and every pool is rebuilt from it, so a raised
+`candidate_pool_size` fills at once rather than at the next sync, and the
+reload result reports the effective per-source overrides.
 
 ## 8. Operational observation
 

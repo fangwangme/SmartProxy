@@ -7,6 +7,7 @@ one property that matters: while the `proxies` table holds anything at all, the
 handout path answers. Every test below is written against that invariant rather
 than against the mechanism that implements it.
 """
+import configparser
 import random
 import time
 from concurrent.futures import Future
@@ -1039,3 +1040,154 @@ class WeightedDrawTests(ProxyManagerTestBase):
         proven_share = sum(url in set(self.proven) for url in handouts) / len(handouts)
 
         self.assertAlmostEqual(proven_share, 10 / 100, delta=0.03)
+
+
+class PerSourcePoolOverrideTests(ProxyManagerTestBase):
+    """
+    Issue #32: `[source_pool.<source>]` reshapes one source's pool.
+
+    The shared fixture sets candidate_pool_size = 200 and exploration_slots =
+    20 globally for source1 and source2.
+    """
+
+    def seed(self, manager, active=(), reserve=()):
+        self.mock_db_instance.get_active_proxies.return_value = set(active)
+        self.mock_db_instance.get_reserve_proxies.return_value = list(reserve)
+        manager._sync_and_select_top_proxies()
+
+    def requested_reserve_size(self):
+        call = self.mock_db_instance.get_reserve_proxies.call_args
+        return call.args[0] if call.args else next(iter(call.kwargs.values()))
+
+    def test_override_sizes_only_its_own_source(self):
+        manager = self.make_manager(
+            {
+                "source_pool.source2": {
+                    "candidate_pool_size": "50",
+                    "exploration_slots": "7",
+                }
+            }
+        )
+        self.seed(manager, active=urls(300))
+
+        self.assertEqual(len(manager.candidate_pools["source2"]), 50)
+        self.assertEqual(len(manager.candidate_draws["source2"][2]), 7)
+        # The source without a section keeps the [source_pool] values.
+        self.assertEqual(len(manager.candidate_pools["source1"]), 200)
+        self.assertEqual(len(manager.candidate_draws["source1"][2]), 20)
+
+    def test_override_temperature_and_exploration_share(self):
+        manager = self.make_manager(
+            {
+                "source_pool": {
+                    "selection_strategy": "softmax",
+                    "softmax_temperature": "14",
+                },
+                "source_pool.source2": {
+                    "candidate_pool_size": "100",
+                    "exploration_slots": "50",
+                    "softmax_temperature": "1000",
+                },
+            }
+        )
+        proven = urls(10, first_octet=100)
+        untried = urls(190, first_octet=110)
+        now = time.time()
+        for source in ("source1", "source2"):
+            for proxy_url in proven:
+                stat = manager._get_new_proxy_stat(source)
+                for index in range(20):
+                    manager._update_reliability_state(stat, True, now - 20 + index)
+                stat["success_count"] = 20
+                manager.source_stats[source][proxy_url] = stat
+        self.seed(manager, active=proven + untried)
+        random.seed(3201)
+
+        def draw(source, count=4000):
+            return [manager.allocate_proxy(source)["proxy"] for _ in range(count)]
+
+        def share(handouts, members):
+            members = set(members)
+            return sum(url in members for url in handouts) / len(handouts)
+
+        source2 = draw("source2")
+        # 50 of 100 slots explore -> half of the handouts.
+        self.assertAlmostEqual(
+            share(source2, manager.candidate_draws["source2"][2]), 0.5, delta=0.03
+        )
+        # At temperature 1000 the ranked draw is close to uniform: the ten
+        # proven proxies hold 10 of 50 ranked slots, so about a tenth of all
+        # handouts, where temperature 14 would give them nearly half.
+        self.assertLess(share(source2, proven), 0.2)
+
+        source1 = draw("source1")
+        # source1 keeps 20 / 200 exploration and temperature 14, which puts
+        # nearly the whole ranked share on the proven proxies.
+        self.assertAlmostEqual(
+            share(source1, manager.candidate_draws["source1"][2]), 0.1, delta=0.02
+        )
+        self.assertGreater(share(source1, proven), 0.8)
+
+    def test_reserve_page_sized_by_largest_pool(self):
+        manager = self.make_manager(
+            {"source_pool.source2": {"candidate_pool_size": "500"}}
+        )
+        self.seed(manager, active=urls(20))
+
+        self.assertEqual(self.requested_reserve_size(), 500)
+
+    def test_invalid_override_sections_fail_load(self):
+        cases = {
+            "undeclared source": {"source_pool.nosuch": {"candidate_pool_size": "10"}},
+            "unknown key": {"source_pool.source2": {"max_pool_size": "10"}},
+            "pool size out of range": {
+                "source_pool.source2": {"candidate_pool_size": "0"}
+            },
+            "exploration out of range": {
+                "source_pool.source2": {"exploration_slots": "-1"}
+            },
+            "temperature out of range": {
+                "source_pool.source2": {"softmax_temperature": "0"}
+            },
+        }
+        for index, (label, overrides) in enumerate(cases.items()):
+            with self.subTest(label):
+                with self.assertRaises(ValueError):
+                    self.make_manager(overrides, name=f"invalid-{index}.ini")
+
+    def write_overrides(self, sections):
+        config = configparser.ConfigParser()
+        config.read(self.config_path, encoding="utf-8")
+        for section in list(config.sections()):
+            if section.startswith("source_pool."):
+                config.remove_section(section)
+        for section, options in sections.items():
+            config[section] = options
+        with open(self.config_path, "w", encoding="utf-8") as handle:
+            config.write(handle)
+
+    def test_reload_applies_and_rolls_back_overrides(self):
+        self.seed(self.manager, active=urls(300))
+        self.assertEqual(len(self.manager.candidate_pools["source2"]), 200)
+
+        self.write_overrides({"source_pool.source2": {"candidate_pool_size": "500"}})
+        self.mock_db_instance.get_reserve_proxies.reset_mock()
+        result = self.manager.reload_sources()
+
+        self.assertEqual(
+            result["source_pool_overrides"]["source2"]["candidate_pool_size"], 500
+        )
+        # The reserve is re-read for the wider pool by the reload itself, not
+        # at the next sync.
+        self.mock_db_instance.get_reserve_proxies.assert_called()
+        self.assertEqual(self.requested_reserve_size(), 500)
+        self.assertIsNotNone(self.manager.allocate_proxy("source2"))
+        self.assertEqual(len(self.manager.candidate_pools["source2"]), 300)
+        self.assertEqual(len(self.manager.candidate_pools["source1"]), 200)
+
+        # An invalid override is rejected and the running values stay.
+        self.write_overrides({"source_pool.nosuch": {"candidate_pool_size": "10"}})
+        with self.assertRaises(ValueError):
+            self.manager.reload_sources()
+        self.manager.refresh_candidate_pools()
+        self.assertEqual(len(self.manager.candidate_pools["source2"]), 300)
