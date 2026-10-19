@@ -458,10 +458,10 @@ error. Each fails config load: startup raises, and `/reload-sources` raises
 and keeps the running configuration. Override sections are per deployment and
 are not diffed by `check_config_drift()`.
 
-`/reload-sources` applies overrides without a restart. The pools are rebuilt
-on the next handout, the reserve is re-read once the reload commits so a
-raised `candidate_pool_size` fills at once rather than at the next sync, and
-the reload result reports the effective per-source overrides.
+`/reload-sources` applies overrides without a restart. Once the reload
+commits, the reserve is re-read and every pool is rebuilt from it, so a raised
+`candidate_pool_size` fills at once rather than at the next sync, and the
+reload result reports the effective per-source overrides.
 
 ## 8. Operational observation
 

@@ -2945,13 +2945,14 @@ class TestIssue23ReviewFixes(ProxyManagerTestBase):
         self.manager._rebuild_candidate_pool("source1")
         self.assertIn("source1", self.manager.candidate_pools)
 
+        self.manager.candidate_pool_built_at["source1"] = 0.0
+
         self.manager.reload_sources()
 
         # candidate_pool_size and exploration_slots are baked into the pool
         # when it is filled, so a reload that left the pools standing would
         # not be authoritative until they aged out.
-        self.assertEqual(self.manager.candidate_pools, {})
-        self.assertEqual(self.manager.candidate_pool_built_at, {})
+        self.assertGreater(self.manager.candidate_pool_built_at["source1"], 0.0)
         # And the source still serves: clearing a pool is not emptying it.
         self.assertIsNotNone(self.manager.allocate_proxy("source1"))
 
