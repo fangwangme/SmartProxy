@@ -1,5 +1,17 @@
 # Changelog
 
+## 3.3.8 — 2026-10-22 — PR #35: Reload command in start_proxy.sh and documentation synchronization
+
+This change closes [Issue #34](https://github.com/fangwangme/SmartProxy/issues/34).
+
+### Added
+
+- **Reload command in management script**: `./scripts/start_proxy.sh reload` triggers `/reload-sources` via POST request, formats and prints the reload summary (added/removed fetcher jobs and effective source pool overrides), and exits with appropriate status code.
+- **Documentation synchronization**:
+  - Documented `[source_pool.<source>]` per-source overrides and `/reload-sources` behaviors in [README.md](README.md).
+  - Added `reload` and `help` commands to the operations quick reference in [README.md](README.md).
+  - Backfilled missing changelog entries for PR #28 and PR #31 to maintain release history continuity.
+
 ## 3.3.7 — 2026-10-20 — PR #33: Per-source candidate pool overrides
 
 This change closes [Issue #32](https://github.com/fangwangme/SmartProxy/issues/32).
@@ -14,6 +26,29 @@ This change closes [Issue #32](https://github.com/fangwangme/SmartProxy/issues/3
 - The reserve page is sized by the widest effective pool across sources.
 - `/reload-sources` re-reads the reserve and rebuilds every pool as soon as it commits, so a raised pool size fills at once instead of at the next sync.
 - A `[source_pool.<source>]` section naming a source not in `predefined_sources`, an unknown key, or an out-of-range value fails config load; on reload the running configuration is kept.
+
+## 3.3.6b — 2026-10-16 — PR #31: Comprehensive help command in start_proxy.sh
+
+This change closes [Issue #30](https://github.com/fangwangme/SmartProxy/issues/30).
+
+### Added
+
+- Comprehensive English `help` command (also `-h`, `--help`) in `scripts/start_proxy.sh` covering prerequisites, setup, commands, and examples.
+- Documented PostgreSQL installation, startup, database creation, and `database_setup.sql` precautions for Linux (systemd / Arch) and macOS (Homebrew).
+
+## 3.3.6a — 2026-10-03 — PR #28: Candidate pool selection and feedback protocol audit
+
+This change closes [Issue #27](https://github.com/fangwangme/SmartProxy/issues/27).
+
+### Added
+
+- **Fixed-size candidate pool**: replaced cumulative reputation and four qualification gates with a fixed candidate pool (`candidate_pool_size`), exploration slots (`exploration_slots`), and softmax weighted draws.
+- **Strict client feedback protocol**: scored feedback statuses are limited to client task outcomes (100 and 7 for success, 4 for failure); legacy codes and raw HTTP codes are accepted but unscored.
+
+### Changed
+
+- Waitress main loop transitioned from `select()` to `poll()`.
+- Service documentation and specs rewritten around client integration and candidate pool operation.
 
 ## 3.3.6 — 2026-09-05 — PR #26: Reliability contracts, lifecycle, and observability
 
