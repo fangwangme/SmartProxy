@@ -100,6 +100,40 @@ class LauncherSafetyTests(unittest.TestCase):
         self.assertEqual(capture.read_text(encoding="utf-8"), "http://localhost:7123/backup-stats")
         self.assertEqual(list((self.project / "tmp").iterdir()), [])
 
+    def test_reload_triggers_reload_sources_endpoint_and_reports_details(self):
+        tools = self.project / "tools"
+        tools.mkdir()
+        capture = self.project / "curl-url.txt"
+        curl = tools / "curl"
+        curl.write_text(
+            "#!/bin/bash\n"
+            "out=\n"
+            "for ((i=1; i<=$#; i++)); do\n"
+            "  arg=${!i}\n"
+            "  if [ \"$arg\" = \"-o\" ]; then next=$((i+1)); out=${!next}; fi\n"
+            "  case \"$arg\" in http://*) printf '%s' \"$arg\" > \"$CURL_CAPTURE\" ;; esac\n"
+            "done\n"
+            "printf '%s' '{\"status\":\"success\",\"message\":\"Configuration and sources reloaded.\",\"details\":{\"added_fetcher_jobs\":1,\"removed_fetcher_jobs\":0,\"source_pool_overrides\":{}}}' > \"$out\"\n",
+            encoding="utf-8",
+        )
+        curl.chmod(0o755)
+        self.env["PATH"] = f"{tools}:{self.env['PATH']}"
+        self.env["CURL_CAPTURE"] = str(capture)
+
+        completed = self._run("reload")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(capture.read_text(encoding="utf-8"), "http://localhost:7123/reload-sources")
+        self.assertIn("Reload successful", completed.stdout)
+        self.assertEqual(list((self.project / "tmp").iterdir()), [])
+
+    def test_help_lists_all_management_commands(self):
+        completed = self._run("help")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("reload", completed.stdout)
+        self.assertIn("./scripts/start_proxy.sh reload", completed.stdout)
+
     def test_stop_still_signals_the_service_when_the_backup_request_times_out(self):
         """
         A service that accepts the pre-stop backup request and never answers

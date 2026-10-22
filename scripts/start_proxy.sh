@@ -22,6 +22,8 @@ RESTORE_MODE="normal"
 # keep stop/restart from ever reaching the signal.
 BACKUP_CONNECT_TIMEOUT_SECONDS=5
 BACKUP_MAX_TIME_SECONDS=30
+RELOAD_CONNECT_TIMEOUT_SECONDS=5
+RELOAD_MAX_TIME_SECONDS=30
 
 load_runtime_config() {
     if [ ! -x "$PYTHON" ]; then
@@ -65,6 +67,68 @@ backup_stats() {
         echo "Backup request timed out after at most ${BACKUP_MAX_TIME_SECONDS}s"
     else
         echo "Could not connect to SmartProxy service"
+    fi
+    rm -f "$response_file"
+    trap - RETURN
+}
+
+reload_sources_cmd() {
+    # 热重载配置与代理源
+    echo "Triggering configuration and sources reload..."
+    load_runtime_config || return 1
+    local response_file
+    response_file=$(mktemp "${TMPDIR:-/tmp}/smartproxy-reload.XXXXXX") || return 1
+    trap 'rm -f "$response_file"' RETURN
+    curl -s -X POST \
+        --connect-timeout "$RELOAD_CONNECT_TIMEOUT_SECONDS" \
+        --max-time "$RELOAD_MAX_TIME_SECONDS" \
+        "http://localhost:$PORT/reload-sources" -o "$response_file" 2>/dev/null
+    local curl_status=$?
+    if [ "$curl_status" -eq 0 ]; then
+        if grep -E -q '"status"[[:space:]]*:[[:space:]]*"success"' "$response_file" 2>/dev/null; then
+            local details=""
+            if details=$("$PYTHON" -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    dt = d.get("details", {})
+    add = dt.get("added_fetcher_jobs", 0)
+    rem = dt.get("removed_fetcher_jobs", 0)
+    ov = dt.get("source_pool_overrides", {})
+    n_add = len(add) if isinstance(add, (list, dict)) else add
+    n_rem = len(rem) if isinstance(rem, (list, dict)) else rem
+    n_ov = len(ov) if isinstance(ov, (list, dict)) else ov
+    print(f" (jobs +{n_add}/-{n_rem}, {n_ov} source pool overrides)")
+except Exception:
+    pass
+' "$response_file" 2>/dev/null); then
+                case "$details" in
+                    \(*\))
+                        echo "Reload successful: Configuration and sources reloaded.${details}"
+                        ;;
+                    *)
+                        echo "Reload successful: Configuration and sources reloaded."
+                        ;;
+                esac
+            else
+                echo "Reload successful: Configuration and sources reloaded."
+            fi
+        else
+            echo "Reload failed or service returned an error"
+            rm -f "$response_file"
+            trap - RETURN
+            return 1
+        fi
+    elif [ "$curl_status" -eq 28 ]; then
+        echo "Reload request timed out after at most ${RELOAD_MAX_TIME_SECONDS}s"
+        rm -f "$response_file"
+        trap - RETURN
+        return 1
+    else
+        echo "Could not connect to SmartProxy service"
+        rm -f "$response_file"
+        trap - RETURN
+        return 1
     fi
     rm -f "$response_file"
     trap - RETURN
@@ -279,6 +343,7 @@ SmartProxy requires a running PostgreSQL database instance.
   status      Display server status, PID, port, log path, and uptime
   logs        Follow realtime server log output (tail -f)
   backup      Trigger an immediate in-memory statistics backup to disk
+  reload      Hot reload config and proxy sources (/reload-sources)
   help        Display this help message (also -h, --help)
 
 [FLAGS]
@@ -290,6 +355,7 @@ SmartProxy requires a running PostgreSQL database instance.
   ./scripts/start_proxy.sh start --debug    # Start in debug mode
   ./scripts/start_proxy.sh status           # Check server status
   ./scripts/start_proxy.sh logs             # View live logs
+  ./scripts/start_proxy.sh reload           # Hot reload config and sources
   ./scripts/start_proxy.sh stop             # Backup and stop server
   ./scripts/start_proxy.sh help             # Show this help
 ======================================================================
@@ -353,12 +419,15 @@ case "$COMMAND" in
     backup)
         backup_stats
         ;;
+    reload)
+        reload_sources_cmd
+        ;;
     help)
         show_help
         ;;
     *)
         echo "Unknown command: $COMMAND"
-        echo "Usage: $0 {start|stop|restart|status|logs|backup|help} [--debug] [--no-restore]"
+        echo "Usage: $0 {start|stop|restart|status|logs|backup|reload|help} [--debug] [--no-restore]"
         echo "Run '$0 help' for full documentation."
         exit 1
         ;;

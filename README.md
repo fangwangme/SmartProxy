@@ -180,6 +180,8 @@ and, unlike `/get-proxy`, filters by design.
 ./scripts/start_proxy.sh status
 ./scripts/start_proxy.sh logs
 ./scripts/start_proxy.sh backup     # write the score backup now
+./scripts/start_proxy.sh reload     # hot reload config and proxy sources
+./scripts/start_proxy.sh help       # display help, flags, and prerequisites
 ```
 
 `start --debug` runs Flask's development server. `start --no-restore` skips
@@ -199,7 +201,7 @@ directly on the service port, never through a reverse proxy.
 | `GET /ready` | `200` when the database, scheduler, latest validation batch, feedback flush and usable pool are all healthy, otherwise `503`. The usable pool counts everything `/get-proxy` can hand out, so a cold start with nothing validated is still usable. |
 | `GET /health` | `/ready` plus pool counts; `200` healthy or `503` degraded. |
 | `GET /metrics` | Prometheus text. See below. |
-| `POST /reload-sources` | Re-reads `config.ini` and applies it as a whole or not at all. Settings marked restart-only below are reported in `restart_required_for` instead of applied. |
+| `POST /reload-sources` | Re-reads `config.ini` and applies it atomically. Dynamic fetcher jobs and per-source pool overrides (`[source_pool.<source>]`) take effect immediately; candidate pools are rebuilt at once. Settings marked restart-only below are returned in `restart_required_for`. Triggerable via `./scripts/start_proxy.sh reload`. |
 | `POST /backup-stats` | Writes the score backup now. |
 
 Metrics: `smartproxy_feedback_accepted_total{outcome=success|failure|unscored}`,
@@ -266,6 +268,16 @@ reference: every key, its default, and a comment. The keys that matter most:
   proxies.
 - `max_pool_size`, `top_tier_size`, `stats_pool_max_multiplier`: bound the
   reported tier lists and the retained history of dead proxies.
+
+**`[source_pool.<source>]`: per-source overrides**
+- Overrides `candidate_pool_size`, `exploration_slots`, and `softmax_temperature`
+  for a specific target source (e.g. `[source_pool.example_source]`). Any
+  unspecified key and any source without an override section retains the global
+  defaults from `[source_pool]`.
+- `<source>` must be declared in `[sources] predefined_sources`; an unknown
+  source name, an unrecognized key, or an out-of-range value is treated as a
+  configuration error and rejected at load time (failing startup or rolling back
+  `/reload-sources`).
 
 **`[validator]`**
 - `validation_target` and `validation_targets`: URLs that must return JSON with
