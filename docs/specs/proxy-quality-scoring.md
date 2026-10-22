@@ -462,6 +462,8 @@ are not diffed by `check_config_drift()`.
 commits, the reserve is re-read and every pool is rebuilt from it, so a raised
 `candidate_pool_size` fills at once rather than at the next sync, and the
 reload result reports the effective per-source overrides.
+`./scripts/start_proxy.sh reload` provides the management CLI trigger for this
+endpoint, verifying connectivity and reporting the reload verdict.
 
 ## 8. Operational observation
 
